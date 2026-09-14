@@ -466,12 +466,11 @@ bool BuildInitialStack(GuestAddressSpace& space, const LoadedImage& image,
                               + auxv.size() * 2;
 
     uint64_t rsp = cursor - word_count * sizeof(uint64_t);
+    // The ABI is specific here: at the process entry point RSP is 16-byte aligned and
+    // argc sits at [RSP]. That is different from the alignment rule at a *function* entry
+    // (where RSP+8 is aligned because a return address was pushed), and conflating the two
+    // leaves the guest running with a permanently misaligned stack.
     rsp &= ~static_cast<uint64_t>(15);
-    // The ABI wants RSP 16-byte aligned at entry *with argc on top*, so an odd number of
-    // words before the first 16-byte boundary has to be corrected here, not after.
-    if (((word_count * sizeof(uint64_t)) % 16) != 0) {
-        rsp -= 8;
-    }
     if (rsp < base) {
         error = "guest stack is too small for the program's arguments and environment";
         return false;

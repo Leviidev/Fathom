@@ -74,6 +74,12 @@ resources_group = project.main_group.new_group('Resources', 'Resources')
 target.resources_build_phase.add_file_reference(
   resources_group.new_file(File.absolute_path(File.join(APP_DIR, 'Resources', 'Assets.xcassets')))
 )
+# StikDebug's Universal JIT Script, handed to StikDebug over its URL scheme when Fathom
+# asks for JIT. Shipped as a file so it can be replaced with a newer one by dropping it
+# in, rather than being re-encoded into a Swift literal.
+target.resources_build_phase.add_file_reference(
+  resources_group.new_file(File.absolute_path(File.join(APP_DIR, 'Resources', 'universal.js')))
+)
 project.main_group.new_file(File.absolute_path(File.join(APP_DIR, 'Info.plist')))
 project.main_group.new_file(File.absolute_path(File.join(APP_DIR, 'Fathom-Bridging-Header.h')))
 

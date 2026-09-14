@@ -38,6 +38,20 @@ ruby scripts/generate_project.rb # -> Fathom/Fathom.xcodeproj
 - **Exiting the guest is a `longjmp`.** `SYSCALL` is not a block-ending instruction on
   non-Windows, so `exit_group` cannot stop the guest by rewriting RIP. `fex_engine.cpp`
   uses `FEXCore::UncheckedLongJump`, the same mechanism FEX's own thread exit uses.
+- **Every signal costs ~90 seconds while StikDebug is attached.** This is the most
+  expensive trap in the project. JIT requires StikDebug to stay attached for the whole
+  session, and an attached debugger means every signal in the process round-trips through
+  the mach exception port to debugserver and into StikDebug's script loop — which is a
+  backgrounded app being throttled by iOS. One measured guest alignment fault took 89
+  seconds of wall time. So a fault that is "recoverable" is still ruinous: the fix is
+  always to stop generating the signal, not just to handle it. This is why TSO emulation
+  defaults to off (it makes every unaligned guest access fault), and why anything that
+  might raise signals per-operation needs thinking about before it ships.
+- **Guest alignment faults must be recovered, not just survived.** x86 allows unaligned
+  access; the ARM64 atomics FEXCore emits do not. `fex_engine.cpp`'s
+  `RecoverAlignmentFault` calls FEXCore's `HandleUnalignedAccess`, patching through the
+  *writable* alias of the JIT mapping and flushing the icache afterwards, because the
+  executing address is execute-only and the icache is tagged by virtual address.
 - **Linux is not Darwin.** `errno` values, `O_*` flags, and `struct stat` all differ.
   `linux_syscalls.cpp` translates every one of them by hand; do not pass a guest flag
   word or host struct straight through.

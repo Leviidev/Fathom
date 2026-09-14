@@ -7,7 +7,17 @@ import SwiftUI
 @MainActor
 final class EmulatorSettings: ObservableObject {
     @AppStorage("engine.multiblock") var multiblock = true
-    @AppStorage("engine.tso") var tsoEnabled = true
+    // Deliberately a new key rather than a changed default: anyone who already ran the
+    // old build has "true" written into UserDefaults, and a changed default would never
+    // reach them. Off, because of what a fault costs here -- see the note below.
+    //
+    // TSO emulation turns every guest load and store into an ARM64 acquire/release
+    // instruction, and those fault on an unaligned address where x86 would not care. The
+    // fault is recoverable, but recovering it means a signal -- and while StikDebug is
+    // attached as a debugger, every signal in this process round-trips through it. One
+    // measured fault cost 89 seconds of wall time. Guests are single-threaded here
+    // anyway (clone returns ENOSYS), so TSO emulation currently buys nothing at all.
+    @AppStorage("engine.tso.v2") var tsoEnabled = false
     @AppStorage("engine.x87Reduced") var reducedPrecisionX87 = false
     @AppStorage("engine.maxInst") var maxInstPerBlock = 0
     @AppStorage("engine.addressSpaceMB") var addressSpaceMB = 2048

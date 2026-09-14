@@ -153,6 +153,9 @@ final class EmulatorSession: ObservableObject {
         // this thread. 16MB keeps a deeply recursive guest from running the host thread
         // out of stack before the guest notices its own.
         thread.stackSize = 16 * 1024 * 1024
+        // The guest is the work the user is waiting on; leaving it at default priority
+        // lets the UI's own housekeeping compete with it.
+        thread.qualityOfService = .userInitiated
         runThread = thread
         thread.start()
 
@@ -252,13 +255,24 @@ final class EmulatorSession: ObservableObject {
         }
     }
 
+    /// Chunks are coalesced so the console is a handful of Text views rather than one
+    /// per write() -- but only up to a point. Appending to one ever-growing string meant
+    /// rebuilding the entire output every flush, which is quadratic in what the program
+    /// has printed and is exactly why a talkative guest made the UI crawl.
+    private static let maximumChunkBytes = 8 * 1024
+    private static let maximumChunks = 200
+
     private func append(_ text: String, isError: Bool) {
-        // Coalesced into the previous chunk when it came from the same stream, so the
-        // console is a handful of Text views rather than one per write().
-        if let last = output.last, last.isError == isError {
+        if let last = output.last, last.isError == isError, last.text.utf8.count < Self.maximumChunkBytes {
             output[output.count - 1] = OutputChunk(isError: isError, text: last.text + text)
         } else {
             output.append(OutputChunk(isError: isError, text: text))
+        }
+
+        // Keep the tail. A guest that prints megabytes should not be able to grow the
+        // view without limit; the interesting part is almost always the end.
+        if output.count > Self.maximumChunks {
+            output.removeFirst(output.count - Self.maximumChunks)
         }
     }
 

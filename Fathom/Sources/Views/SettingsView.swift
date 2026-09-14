@@ -69,7 +69,7 @@ struct SettingsView: View {
         } header: {
             Text("Emulation")
         } footer: {
-            Text("TSO emulation makes x86's stronger memory ordering hold on ARM. Turning it off is faster and is safe for a single-threaded program, but can break anything that relies on ordering between threads. Reduced-precision x87 trades exact 80-bit floating point for speed.")
+            Text("TSO emulation makes x86's stronger memory ordering hold on ARM. It is off by default and should stay off: it makes every unaligned guest access raise a signal, and while StikDebug is attached each signal round-trips through it — one such fault was measured at 89 seconds. It matters only for guests using threads, which Fathom does not support yet. Reduced-precision x87 trades exact 80-bit floating point for speed.")
         }
     }
 

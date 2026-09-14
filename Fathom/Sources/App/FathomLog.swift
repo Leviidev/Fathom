@@ -41,6 +41,18 @@ final class FathomLog: ObservableObject, @unchecked Sendable {
     private var handle: FileHandle?
     private let formatter: DateFormatter
 
+    /// Lines are batched rather than published individually.
+    ///
+    /// With syscall tracing on, a busy guest produces thousands of lines a second, and a
+    /// line at a time meant one hop to the main thread and one SwiftUI invalidation each
+    /// -- enough to make the whole app stutter while a program was running. They are
+    /// accumulated here instead and flushed ten times a second, as one array append and
+    /// one file write.
+    private let pending = NSLock()
+    private var pendingEntries: [Entry] = []
+    private var pendingText = ""
+    private var flushTimer: DispatchSourceTimer?
+
     var fileURL: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("fathom.log")
@@ -65,6 +77,7 @@ final class FathomLog: ObservableObject, @unchecked Sendable {
         formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss.SSS"
         openFile()
+        startFlushing()
     }
 
     private func openFile() {
@@ -118,20 +131,46 @@ final class FathomLog: ObservableObject, @unchecked Sendable {
         let entry = Entry(date: Date(), level: level, message: message)
         let line = "\(formatter.string(from: entry.date)) [\(level.label)] \(message)\n"
 
-        queue.async { [weak self] in
-            guard let self else { return }
-            if let data = line.data(using: .utf8) {
-                self.handle?.write(data)
-            }
+        pending.lock()
+        pendingEntries.append(entry)
+        pendingText += line
+        pending.unlock()
+    }
+
+    private func startFlushing() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100))
+        timer.setEventHandler { [weak self] in self?.flush() }
+        timer.resume()
+        flushTimer = timer
+    }
+
+    private func flush() {
+        pending.lock()
+        let entries = pendingEntries
+        let text = pendingText
+        pendingEntries.removeAll(keepingCapacity: true)
+        pendingText.removeAll(keepingCapacity: true)
+        pending.unlock()
+
+        guard !entries.isEmpty else { return }
+
+        if let data = text.data(using: .utf8) {
+            handle?.write(data)
         }
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.entries.append(entry)
+            self.entries.append(contentsOf: entries)
             if self.entries.count > self.maximumEntries {
                 self.entries.removeFirst(self.entries.count - self.maximumEntries)
             }
         }
+    }
+
+    /// Pushes everything out immediately, for the moment before a log is exported.
+    func flushNow() {
+        queue.sync { self.flush() }
     }
 
     func clear() {

@@ -72,6 +72,8 @@ struct LogView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button {
+                        // Lines are batched, so the newest few are still in memory.
+                        logStore.flushNow()
                         isSharing = true
                     } label: {
                         Label("Export diagnostics", systemImage: "square.and.arrow.up")

@@ -18,7 +18,9 @@
 #include "guest_memory.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <string>
@@ -61,6 +63,12 @@ public:
                     uint64_t arg5, uint64_t arg6);
 
     void SetOutputCallback(OutputCallback callback, void* context);
+
+    /// Queues bytes for the guest to read from fd 0. Safe from any thread.
+    void SendInput(const char* bytes, size_t length);
+
+    /// True once the guest has asked for raw (non-canonical) terminal mode.
+    bool WantsKeys() const { return raw_mode_.load(std::memory_order_relaxed); }
 
     /// Asks the guest to stop at the next syscall. Safe from any thread.
     void RequestStop();
@@ -134,6 +142,14 @@ private:
 
     /// Guest address passed to set_tid_address, cleared on exit the way Linux does.
     uint64_t clear_child_tid_ {};
+
+    // Standard input. A guest reading a terminal blocks until a key arrives, so this is a
+    // real queue with a real wait rather than an immediate end-of-input.
+    mutable std::mutex input_mutex_;
+    std::condition_variable input_ready_;
+    std::deque<char> input_;
+    std::atomic<bool> raw_mode_ {false};
+    std::atomic<bool> nonblocking_stdin_ {false};
 };
 
 } // namespace fathom

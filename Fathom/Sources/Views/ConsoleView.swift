@@ -40,10 +40,16 @@ struct ConsoleView: View {
                 }
             }
 
+            if session.isInteractive {
+                TerminalView(terminal: session.terminal) { key in
+                    session.sendKey(key)
+                }
+            }
+
             Card {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
-                        Text("Output")
+                        Text(session.isInteractive ? "Raw output" : "Output")
                             .font(.subheadline.weight(.semibold))
                         Spacer()
                         if !session.output.isEmpty {
@@ -56,7 +62,13 @@ struct ConsoleView: View {
                         }
                     }
 
-                    if session.output.isEmpty {
+                    if session.isInteractive {
+                        Text("The program is drawing to the screen above. Its raw byte stream is hidden here because it is mostly escape sequences.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 8)
+                    } else if session.output.isEmpty {
                         Text(session.state.isActive
                              ? "Waiting for the program to write something."
                              : "The program produced no output.")

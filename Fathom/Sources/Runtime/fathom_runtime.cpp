@@ -268,6 +268,17 @@ void fathom_session_set_output_sink(fathom_session* session, fathom_output_sink 
     session->syscalls->SetOutputCallback(reinterpret_cast<fathom::OutputCallback>(sink), context);
 }
 
+void fathom_session_send_input(fathom_session* session, const char* bytes, size_t length) {
+    if (session == nullptr || session->syscalls == nullptr) {
+        return;
+    }
+    session->syscalls->SendInput(bytes, length);
+}
+
+bool fathom_session_wants_keys(fathom_session* session) {
+    return session != nullptr && session->syscalls != nullptr && session->syscalls->WantsKeys();
+}
+
 int fathom_session_run(fathom_session* session) {
     if (session == nullptr || session->engine == nullptr) {
         return -1;

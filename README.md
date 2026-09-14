@@ -67,12 +67,22 @@ integer and x87 and vector maths through the JIT, `malloc` through `brk` and `mm
 argv/envp/auxv stack the loader builds, the clocks, and reading and writing a file in the
 guest root.
 
+There are also two games, because a PC emulator that cannot take input is only half of
+one. Both put the terminal into raw mode and read arrow keys as the escape sequences a
+real terminal sends:
+
+- **tictactoe** -- arrows move, Enter places, against a full-minimax bot that cannot be
+  beaten. The best available result is a draw.
+- **play2048** -- arrows slide the board.
+
 ```bash
-./testprograms/build.sh    # -> ~/Desktop/fathom-selftest
+./testprograms/build.sh    # -> ~/Desktop/{fathom-selftest,tictactoe,play2048}
 ```
 
-Copy it onto the device (AirDrop, or the Files app into Fathom's Programs folder), add it
-from the Library tab, and run it. Every line should say PASS.
+Copy them onto the device (AirDrop, or the Files app into Fathom's Programs folder), add
+them from the Library tab, and run. The self-test should report PASS on every line; the
+games get a terminal and an on-screen keypad, which Fathom shows as soon as the guest
+asks for raw mode.
 
 ## Layout
 

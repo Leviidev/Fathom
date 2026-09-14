@@ -32,6 +32,11 @@ final class EmulatorSession: ObservableObject {
     @Published private(set) var rip: UInt64 = 0
     @Published private(set) var elapsed: TimeInterval = 0
 
+    /// The guest's screen, for programs that draw one.
+    @Published private(set) var terminal = TerminalEmulator()
+    /// True once the guest is drawing a screen or asking for individual keypresses.
+    @Published private(set) var isInteractive = false
+
     /// Watchdog state. A guest that stops making syscalls has either wedged in a loop or
     /// died, and those two look identical from outside -- the log simply stops. Sampling
     /// RIP while nothing else is happening tells them apart, and an RIP that never moves
@@ -75,6 +80,8 @@ final class EmulatorSession: ObservableObject {
         guard !state.isActive else { return }
 
         output.removeAll()
+        terminal.reset()
+        isInteractive = false
         syscallCount = 0
         rip = 0
         elapsed = 0
@@ -248,11 +255,29 @@ final class EmulatorSession: ObservableObject {
         pendingLock.unlock()
 
         if !out.isEmpty {
+            terminal.feed(out)
             append(out, isError: false)
         }
         if !err.isEmpty {
+            terminal.feed(err)
             append(err, isError: true)
         }
+
+        if !isInteractive {
+            let wantsKeys = session.map { fathom_session_wants_keys($0) } ?? false
+            if wantsKeys || terminal.isFullScreen {
+                isInteractive = true
+                log("guest is drawing a screen; showing the terminal")
+            }
+        }
+    }
+
+    /// Sends a keystroke to the guest. `text` is the bytes a real terminal would send,
+    /// so an arrow key is its escape sequence rather than a character.
+    func sendKey(_ text: String) {
+        guard let session, state == .running else { return }
+        var bytes = Array(text.utf8).map { CChar(bitPattern: $0) }
+        fathom_session_send_input(session, &bytes, bytes.count)
     }
 
     /// Chunks are coalesced so the console is a handful of Text views rather than one

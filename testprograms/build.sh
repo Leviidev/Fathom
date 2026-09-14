@@ -14,15 +14,20 @@ docker run --rm --platform linux/amd64 -v "$HERE":/work -w /work alpine:3.20 sh 
     # Deliberately not stripped: when the guest stalls, Fathom logs the guest RIP, and
     # symbols are what turn that number into a function name. (RIP minus the load base
     # Fathom logs at startup gives the address to look up.)
-    gcc -static-pie -O2 -g -o fathom-selftest fathom-selftest.c
+    for program in fathom-selftest tictactoe play2048; do
+        gcc -static-pie -O2 -g -o "$program" "$program.c"
+        nm -n "$program" > "$program.symbols"
+    done
+    # Only the self-test can run unattended; the games want a terminal.
     ./fathom-selftest > /dev/null
-    nm -n fathom-selftest > fathom-selftest.symbols
 '
 
-echo "==> Built $HERE/fathom-selftest"
-file "$HERE/fathom-selftest"
+echo "==> Built"
+file "$HERE/fathom-selftest" "$HERE/tictactoe" "$HERE/play2048"
 
 mkdir -p "$DEST_DIR"
-cp -f "$HERE/fathom-selftest" "$DEST_DIR/fathom-selftest"
-echo "==> Copied to $DEST_DIR/fathom-selftest"
-echo "==> Symbols in $HERE/fathom-selftest.symbols (for resolving a logged guest RIP)"
+for program in fathom-selftest tictactoe play2048; do
+    cp -f "$HERE/$program" "$DEST_DIR/$program"
+    echo "==> Copied $DEST_DIR/$program"
+done
+echo "==> Symbols alongside each binary (for resolving a logged guest RIP)"

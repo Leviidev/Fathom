@@ -144,6 +144,18 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
 
 void fathom_session_set_output_sink(fathom_session* session, fathom_output_sink sink, void* context);
 
+/// Delivers keystrokes to the guest's standard input.
+///
+/// Bytes, not characters: an arrow key is the three-byte escape sequence a terminal
+/// would send (ESC [ A and friends), which is exactly what a program reading a terminal
+/// expects to find. Safe to call from any thread while the guest is running.
+void fathom_session_send_input(fathom_session* session, const char* bytes, size_t length);
+
+/// True once the guest has put its terminal into raw mode, which is what a program does
+/// when it wants individual keypresses rather than whole lines. The UI uses this to know
+/// an on-screen keypad is worth showing.
+bool fathom_session_wants_keys(fathom_session* session);
+
 /// Runs the guest until it exits, faults, or is stopped. Blocking.
 /// Returns the guest's exit code, or -1 if it did not exit normally.
 int fathom_session_run(fathom_session* session);

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <chrono>
 #include <ctime>
 #include <dirent.h>
 #include <fcntl.h>
@@ -58,6 +59,12 @@ constexpr uint64_t kArchGetFs = 0x1003;
 constexpr uint64_t kArchGetGs = 0x1004;
 
 constexpr uint64_t kTcgets = 0x5401;
+constexpr uint64_t kTcsets = 0x5402;
+constexpr uint64_t kTcsetsw = 0x5403;
+constexpr uint64_t kTcsetsf = 0x5404;
+
+// Linux termios lflag bits, read back to notice the guest leaving canonical mode.
+constexpr uint32_t kIcanon = 0x0002;
 constexpr uint64_t kTiocgwinsz = 0x5413;
 
 constexpr uint64_t kPageSize = 4096;
@@ -408,6 +415,20 @@ void LinuxSyscalls::SetOutputCallback(OutputCallback callback, void* context) {
 
 void LinuxSyscalls::RequestStop() {
     stop_requested_.store(true, std::memory_order_relaxed);
+    // A guest parked in read() is not at a syscall boundary and would otherwise wait for
+    // a keystroke that is never coming.
+    input_ready_.notify_all();
+}
+
+void LinuxSyscalls::SendInput(const char* bytes, size_t length) {
+    if (bytes == nullptr || length == 0) {
+        return;
+    }
+    {
+        std::scoped_lock lock {input_mutex_};
+        input_.insert(input_.end(), bytes, bytes + length);
+    }
+    input_ready_.notify_all();
 }
 
 void LinuxSyscalls::InitialiseHeap(uint64_t base, uint64_t reserved) {
@@ -610,7 +631,30 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
         return count == 0 ? 0 : FailLinux(14);
     }
     if (fd == 0) {
-        return 0; // The guest has no terminal to read from; report end of input.
+        std::unique_lock lock {input_mutex_};
+        while (input_.empty()) {
+            if (stop_requested_.load(std::memory_order_relaxed)) {
+                // Unlocked by hand: ExitGuest unwinds by long jump and no destructor
+                // between here and the run loop will ever run.
+                lock.unlock();
+                exit_status_ = -1;
+                control_.ExitGuest(-1);
+            }
+            if (nonblocking_stdin_.load(std::memory_order_relaxed)) {
+                return FailLinux(11); // EAGAIN
+            }
+            // Woken by SendInput; the timeout only exists so a stop request is noticed
+            // even if no key ever arrives.
+            input_ready_.wait_for(lock, std::chrono::milliseconds(100));
+        }
+
+        const auto available = std::min<uint64_t>(count, input_.size());
+        auto* out = static_cast<char*>(data);
+        for (uint64_t index = 0; index < available; ++index) {
+            out[index] = input_.front();
+            input_.pop_front();
+        }
+        return available;
     }
 
     std::scoped_lock lock {mutex_};
@@ -1081,6 +1125,23 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             *reinterpret_cast<uint32_t*>(termios_out + 12) = 0x8a3b; // ISIG | ICANON | ECHO ...
             return 0;
         }
+        if (fd >= 0 && fd <= 2 &&
+            (arg2 == guest::kTcsets || arg2 == guest::kTcsetsw || arg2 == guest::kTcsetsf)) {
+            // The guest is configuring the terminal. The only part that matters here is
+            // ICANON: with it cleared the program wants individual keypresses rather than
+            // whole lines, which is what every full-screen terminal program does on
+            // startup -- and what tells the UI to offer a keypad.
+            const auto* termios_in = static_cast<const uint8_t*>(GuestPointer(arg3, 36, false));
+            if (termios_in == nullptr) {
+                return FailLinux(14);
+            }
+            const uint32_t lflag = *reinterpret_cast<const uint32_t*>(termios_in + 12);
+            const bool raw = (lflag & guest::kIcanon) == 0;
+            if (raw != raw_mode_.exchange(raw, std::memory_order_relaxed)) {
+                FATHOM_INFO("guest terminal mode: %s", raw ? "raw (wants individual keys)" : "canonical");
+            }
+            return 0;
+        }
         if (fd >= 0 && fd <= 2 && arg2 == guest::kTiocgwinsz) {
             auto* window = static_cast<uint16_t*>(GuestPointer(arg3, 8, true));
             if (window == nullptr) {
@@ -1198,7 +1259,13 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         constexpr int kGuestFGetfd = 1;
         constexpr int kGuestFSetfd = 2;
         constexpr int kGuestFGetfl = 3;
+        constexpr int kGuestFSetfl = 4;
         const int command = static_cast<int>(arg2);
+        if (command == kGuestFSetfl && static_cast<int>(arg1) == 0) {
+            const bool nonblocking = (arg3 & guest::kONonBlock) != 0;
+            nonblocking_stdin_.store(nonblocking, std::memory_order_relaxed);
+            return 0;
+        }
         if (command == kGuestFGetfd || command == kGuestFSetfd) {
             return 0;
         }

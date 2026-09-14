@@ -84,10 +84,27 @@ final class FathomLog: ObservableObject, @unchecked Sendable {
         // recorded. It appends to this same file from inside the signal handler.
         url.path.withCString { fathom_install_crash_handler($0) }
 
+        reportPreviousCrash()
+
         let device = ProcessInfo.processInfo
         write(.info, "Fathom \(Bundle.main.shortVersion) (\(Bundle.main.buildVersion))")
         write(.info, "iOS \(device.operatingSystemVersionString), \(device.processorCount) cores")
         write(.info, "host page size \(fathom_host_page_size()) bytes")
+    }
+
+    /// If the previous run ended in a fatal signal, replay its crash record into this
+    /// run's log so it shows up in the viewer. The signal handler can only write raw
+    /// bytes to the file, so without this the record exists but is invisible in the app.
+    private func reportPreviousCrash() {
+        guard let text = try? String(contentsOf: previousFileURL, encoding: .utf8),
+              let range = text.range(of: "=== FATHOM CRASH ===") else {
+            return
+        }
+        let record = text[range.lowerBound...].prefix(2000)
+        write(.error, "the previous run ended in a crash:")
+        for line in record.split(separator: "\n") {
+            write(.error, "  " + line)
+        }
     }
 
     func write(_ level: Level, _ message: String) {

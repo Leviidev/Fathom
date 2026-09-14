@@ -11,8 +11,12 @@ DEST_DIR="${1:-$HOME/Desktop}"
 
 docker run --rm --platform linux/amd64 -v "$HERE":/work -w /work alpine:3.20 sh -c '
     apk add --no-cache gcc musl-dev >/dev/null 2>&1
-    gcc -static-pie -O2 -s -o fathom-selftest fathom-selftest.c
+    # Deliberately not stripped: when the guest stalls, Fathom logs the guest RIP, and
+    # symbols are what turn that number into a function name. (RIP minus the load base
+    # Fathom logs at startup gives the address to look up.)
+    gcc -static-pie -O2 -g -o fathom-selftest fathom-selftest.c
     ./fathom-selftest > /dev/null
+    nm -n fathom-selftest > fathom-selftest.symbols
 '
 
 echo "==> Built $HERE/fathom-selftest"
@@ -21,3 +25,4 @@ file "$HERE/fathom-selftest"
 mkdir -p "$DEST_DIR"
 cp -f "$HERE/fathom-selftest" "$DEST_DIR/fathom-selftest"
 echo "==> Copied to $DEST_DIR/fathom-selftest"
+echo "==> Symbols in $HERE/fathom-selftest.symbols (for resolving a logged guest RIP)"

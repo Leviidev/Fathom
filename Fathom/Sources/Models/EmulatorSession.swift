@@ -32,6 +32,16 @@ final class EmulatorSession: ObservableObject {
     @Published private(set) var rip: UInt64 = 0
     @Published private(set) var elapsed: TimeInterval = 0
 
+    /// Watchdog state. A guest that stops making syscalls has either wedged in a loop or
+    /// died, and those two look identical from outside -- the log simply stops. Sampling
+    /// RIP while nothing else is happening tells them apart, and an RIP that never moves
+    /// names the exact instruction to disassemble.
+    private var lastSyscallCount: UInt64 = 0
+    private var lastSyscallChangeAt = Date()
+    private var lastStallReportAt: Date?
+    private var stallSampleRip: UInt64 = 0
+    private var stallSampleRepeats = 0
+
     private var session: OpaquePointer?
     private var runThread: Thread?
     private var statusTimer: Timer?
@@ -185,10 +195,45 @@ final class EmulatorSession: ObservableObject {
             fathom_session_get_status(session, &status)
             syscallCount = status.syscall_count
             rip = status.rip
+            checkForStall()
         }
         if let startedAt {
             elapsed = Date().timeIntervalSince(startedAt)
         }
+    }
+
+    private func checkForStall() {
+        guard state == .running else { return }
+
+        if syscallCount != lastSyscallCount {
+            lastSyscallCount = syscallCount
+            lastSyscallChangeAt = Date()
+            lastStallReportAt = nil
+            stallSampleRepeats = 0
+            return
+        }
+
+        let stalledFor = Date().timeIntervalSince(lastSyscallChangeAt)
+        guard stalledFor >= 2 else { return }
+
+        // Report every two seconds rather than ten times a second.
+        if let last = lastStallReportAt, Date().timeIntervalSince(last) < 2 { return }
+        lastStallReportAt = Date()
+
+        if rip == stallSampleRip {
+            stallSampleRepeats += 1
+        } else {
+            stallSampleRip = rip
+            stallSampleRepeats = 0
+        }
+
+        // RIP only settles at syscall boundaries, so an unchanged value here means the
+        // guest has not reached one since -- it is running guest code, not wedged in a
+        // host call. Either way the address is the place to start disassembling.
+        log(String(format: "guest still running: no syscall for %.0fs, last rip=0x%llx, %llu syscalls%@",
+                   stalledFor, rip, syscallCount,
+                   stallSampleRepeats > 0 ? " (rip unchanged across \(stallSampleRepeats + 1) samples)" : ""),
+            level: .warn)
     }
 
     private func flushOutput() {

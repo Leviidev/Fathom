@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- get-task-allow lets a debugger attach, which is how JIT is granted on a
+	     sideloaded build: StikDebug attaches and services the traps FEXCore's
+	     allocator issues when it needs executable memory. -->
+	<key>get-task-allow</key>
+	<true/>
+	<!-- Honoured on builds signed with a provisioning profile that carries it; on a
+	     free/sideloaded signature it is ignored and the debugger route above is what
+	     actually grants JIT. -->
+	<key>dynamic-codesigning</key>
+	<true/>
+	<!-- A guest address space plus FEXCore's code buffers go well past the default
+	     per-app ceiling on smaller devices. -->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+</dict>
+</plist>

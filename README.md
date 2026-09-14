@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="Fathom/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png" width="128" alt="Fathom">
-</p>
-
 # Fathom
 
 An x86-64 PC emulator for iOS. Fathom runs x86-64 Linux programs on an iPhone or iPad by

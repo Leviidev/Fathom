@@ -100,10 +100,17 @@ final class FathomLog: ObservableObject, @unchecked Sendable {
               let range = text.range(of: "=== FATHOM CRASH ===") else {
             return
         }
+        // Shown in the viewer but deliberately not written to the file. Writing it back
+        // would make this run's log contain the previous run's replay, which the next
+        // launch would then replay in turn -- each log nesting every log before it.
         let record = text[range.lowerBound...].prefix(2000)
-        write(.error, "the previous run ended in a crash:")
+        var replayed: [Entry] = [Entry(date: Date(), level: .error, message: "the previous run ended in a crash:")]
         for line in record.split(separator: "\n") {
-            write(.error, "  " + line)
+            replayed.append(Entry(date: Date(), level: .error, message: "  " + line))
+        }
+        let lines = replayed
+        DispatchQueue.main.async { [weak self] in
+            self?.entries.append(contentsOf: lines)
         }
     }
 

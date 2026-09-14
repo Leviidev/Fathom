@@ -8,6 +8,7 @@
 // wrong, so it uses only async-signal-safe calls: a file descriptor opened ahead of
 // time, write(), and hand-rolled number formatting. No malloc, no stdio, no locks.
 
+#include "crash_handler.h"
 #include "fathom_api.h"
 
 #include <atomic>
@@ -21,6 +22,7 @@ namespace fathom {
 namespace {
 
 int g_crash_fd = -1;
+std::atomic<FaultRecovery> g_recovery {nullptr};
 
 // Updated on every guest syscall. Plain atomics, so reading them from a signal handler
 // is safe -- and the last syscall the guest made is usually the single most useful fact
@@ -85,7 +87,15 @@ const char* SignalName(int number) {
 }
 
 void Handle(int number, siginfo_t* info, void* context) {
-    (void)context;
+    // An unaligned guest access is a normal event, not a crash: x86 permits unaligned
+    // memory access and the ARM64 instructions FEXCore emits for it do not. The engine's
+    // recovery hook emulates the access and moves the PC past it, and execution carries
+    // on as if nothing happened. Only if nobody claims the fault is it really fatal.
+    if (const auto recovery = g_recovery.load(std::memory_order_acquire)) {
+        if (recovery(number, info, context)) {
+            return;
+        }
+    }
 
     WriteText("\n=== FATHOM CRASH ===\nsignal: ");
     WriteText(SignalName(number));
@@ -122,6 +132,10 @@ void Handle(int number, siginfo_t* info, void* context) {
 
 } // namespace
 
+void SetFaultRecovery(FaultRecovery recovery) {
+    g_recovery.store(recovery, std::memory_order_release);
+}
+
 void NoteSyscall(uint64_t number, uint64_t first_argument, uint64_t count) {
     g_last_syscall.store(number, std::memory_order_relaxed);
     g_last_syscall_arg.store(first_argument, std::memory_order_relaxed);
@@ -147,7 +161,7 @@ extern "C" void fathom_install_crash_handler(const char* log_path) {
 
     struct sigaction action {};
     action.sa_sigaction = fathom::Handle;
-    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    action.sa_flags = SA_SIGINFO;
     sigemptyset(&action.sa_mask);
 
     for (const int number : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP}) {

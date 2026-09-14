@@ -13,10 +13,21 @@
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
+#include <FEXCore/Utils/ArchHelpers/Arm64.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/LongJump.h>
 
+#ifdef __APPLE__
+// Darwin's <ucontext.h> hard-errors on the deprecated getcontext/setcontext declarations
+// without this. Only the ucontext_t/mcontext_t types are wanted here, never those calls.
+#define _XOPEN_SOURCE 1
+#include <mach/arm/thread_status.h>
+#include <ucontext.h>
+#endif
+
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <mutex>
@@ -160,6 +171,96 @@ private:
     std::array<FEXCore::Core::CPUState::gdt_segment, 32> gdt_ {};
 };
 
+/// The FEXCore thread executing on this host thread, if any.
+///
+/// The alignment-fault handler needs it, and a signal handler cannot be passed context
+/// any other way. Thread-local because FEXCore binds a guest thread to the host thread
+/// running it, so this is exactly as wide as it needs to be.
+struct ActiveExecution {
+    FEXCore::Context::Context* context {};
+    FEXCore::Core::InternalThreadState* thread {};
+};
+thread_local ActiveExecution g_active;
+
+/// Counted so the log can say whether this mechanism is doing anything at all. A run
+/// with thousands of these is working correctly; a run with zero means either the guest
+/// never touched an odd address or the handler is not being reached.
+std::atomic<uint64_t> g_alignment_fixups {0};
+
+/// Fixes up a guest alignment fault and resumes, rather than letting it kill the app.
+///
+/// x86 lets a program read or write at any address. ARM64 mostly does too -- but not for
+/// the acquire/release and atomic instructions FEXCore emits to reproduce x86's memory
+/// ordering, which fault unless the address is naturally aligned. So an ordinary
+/// unaligned store in ordinary guest code arrives here as SIGBUS, and this is the
+/// difference between "runs x86 programs" and "runs x86 programs that never touch an odd
+/// address". FEXCore provides the fixup; what is needed here is to recognise the fault,
+/// call it, and resume at the instruction it says to resume at.
+bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
+#if defined(__aarch64__) && defined(__APPLE__)
+    if (signal != SIGBUS || info == nullptr || raw_context == nullptr) {
+        return false;
+    }
+    if (g_active.context == nullptr || g_active.thread == nullptr) {
+        return false;
+    }
+    if (info->si_code != BUS_ADRALN) {
+        return false; // A real bad-address fault, not an alignment one.
+    }
+
+    auto* context = static_cast<ucontext_t*>(raw_context);
+    auto& state = context->uc_mcontext->__ss;
+    const auto pc = static_cast<uintptr_t>(arm_thread_state64_get_pc(state));
+
+    // Only faults inside FEXCore's own generated code are ours to fix. Anything else is
+    // a genuine bug in Fathom and must stay fatal.
+    if (!g_active.context->IsAddressInCodeBuffer(g_active.thread, pc)) {
+        return false;
+    }
+
+    // x0-x28 are plain integers in Darwin's thread state; fp and lr are separate
+    // pointer-authentication-opaque fields. FEXCore wants all 31 flat, indexed by the
+    // instruction's register field.
+    std::array<uint64_t, 31> registers;
+    std::memcpy(registers.data(), state.__x, sizeof(state.__x));
+    registers[29] = static_cast<uint64_t>(arm_thread_state64_get_fp(state));
+    registers[30] = static_cast<uint64_t>(arm_thread_state64_get_lr(state));
+
+    // The fixup rewrites the faulting instruction in place. On iOS the executing address
+    // is the execute-only half of a dual mapping and can never be written through, so the
+    // writable alias has to be found first -- writing through `pc` would fault inside the
+    // handler that exists to prevent exactly this, with the original signal still masked.
+    FEXCore::Allocator::ScopedJITWriteProtect write_guard;
+    const auto writable_pc =
+        reinterpret_cast<uintptr_t>(FEXCore::Allocator::GetWritableAddress(reinterpret_cast<void*>(pc)));
+
+    const auto adjustment = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
+        g_active.thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier,
+        writable_pc, registers.data());
+    if (!adjustment.has_value()) {
+        return false;
+    }
+
+    // The patch went in through the writable alias; execution resumes through the
+    // executable one. The instruction cache is tagged by virtual address, so invalidating
+    // one alias does not invalidate the other -- without this the CPU can re-fetch the
+    // pre-patch instruction and run off into whatever happens to be cached.
+    __builtin___clear_cache(reinterpret_cast<char*>(pc - 4), reinterpret_cast<char*>(pc + 8));
+
+    std::memcpy(state.__x, registers.data(), sizeof(state.__x));
+    arm_thread_state64_set_fp(state, registers[29]);
+    arm_thread_state64_set_lr_fptr(state, reinterpret_cast<void*>(registers[30]));
+    arm_thread_state64_set_pc_fptr(state, reinterpret_cast<void*>(pc + *adjustment));
+    g_alignment_fixups.fetch_add(1, std::memory_order_relaxed);
+    return true;
+#else
+    (void)signal;
+    (void)info;
+    (void)raw_context;
+    return false;
+#endif
+}
+
 class FathomSignalDelegator final : public FEXCore::SignalDelegator {
 public:
     uintptr_t GetThunkCallbackRET() const override {
@@ -297,6 +398,9 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, LinuxSysc
         return nullptr;
     }
 
+    // From here on, a guest alignment fault is recoverable rather than fatal.
+    SetFaultRecovery(RecoverAlignmentFault);
+
     FATHOM_INFO("FEXCore context ready (AVX=%d, SVE128=%d, cache line %u)",
                 impl->host_features.SupportsAVX ? 1 : 0, impl->host_features.SupportsSVE128 ? 1 : 0,
                 impl->host_features.DCacheLineSize);
@@ -350,13 +454,17 @@ RunResult FexEngine::Run() {
     // exit does exactly this, which is why FEXCore ships the jump buffer used here.
     if (FEXCore::UncheckedLongJump::SetJump(impl_->exit_jump) == 0) {
         impl_->exit_jump_armed = true;
+        g_active = ActiveExecution {impl_->context.get(), impl_->thread};
         impl_->context->ExecuteThread(impl_->thread);
+        g_active = ActiveExecution {};
         impl_->exit_jump_armed = false;
 
         result.outcome = RunOutcome::Halted;
         result.status = 0;
         result.message = "guest halted";
     } else {
+        // Reached by the long jump out of exit_group, which skips the clear above.
+        g_active = ActiveExecution {};
         impl_->exit_jump_armed = false;
         if (impl_->syscalls.StopRequested()) {
             result.outcome = RunOutcome::Stopped;
@@ -368,6 +476,9 @@ RunResult FexEngine::Run() {
             result.message = "guest exited";
         }
     }
+
+    FATHOM_INFO("run ended: %llu guest alignment faults recovered",
+                static_cast<unsigned long long>(g_alignment_fixups.load(std::memory_order_relaxed)));
 
     const auto& state = impl_->thread->CurrentFrame->State;
     result.rip = state.rip;

@@ -60,6 +60,20 @@ Set `FEXCORE_SRC` if the FEXCore tree lives somewhere other than
 which is much faster than a full app build when working on the emulator itself — and the
 link half is the part that actually proves the FEXCore integration.
 
+## Trying it
+
+`testprograms/` has a self-test that exercises one part of the emulator per section --
+integer and x87 and vector maths through the JIT, `malloc` through `brk` and `mmap`, the
+argv/envp/auxv stack the loader builds, the clocks, and reading and writing a file in the
+guest root.
+
+```bash
+./testprograms/build.sh    # -> ~/Desktop/fathom-selftest
+```
+
+Copy it onto the device (AirDrop, or the Files app into Fathom's Programs folder), add it
+from the Library tab, and run it. Every line should say PASS.
+
 ## Layout
 
 ```

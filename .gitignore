@@ -9,5 +9,8 @@ Fathom/Fathom.xcodeproj/
 Fathom/Libs/*.a
 
 .DS_Store
+# The built test binary; testprograms/build.sh reproduces it.
+testprograms/fathom-selftest
+
 *.xcuserstate
 xcuserdata/

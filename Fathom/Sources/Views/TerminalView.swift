@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Draws the terminal grid, and the controls a guest program needs to be played with.
 struct TerminalView: View {
@@ -14,29 +15,69 @@ struct TerminalView: View {
 
     private var screen: some View {
         GeometryReader { geometry in
-            // A monospaced face advances about 0.6 em per character, so the point size
-            // that makes exactly `columns` fit follows directly from the width. The grid
-            // is sized to the terminal rather than the terminal to the screen, because a
-            // program that asked for 80 columns has laid itself out for 80.
-            let pointSize = max(5, (geometry.size.width - 16) / (CGFloat(terminal.columns) * 0.6))
+            let metrics = Self.metrics(forWidth: geometry.size.width - 20, columns: terminal.columns)
 
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(0..<terminal.rows, id: \.self) { row in
-                    Text(line(row))
-                        .font(.system(size: pointSize, weight: .regular, design: .monospaced))
-                        .lineSpacing(0)
-                        .fixedSize()
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .padding(8)
-            .background(Color(white: 0.08), in: RoundedRectangle(cornerRadius: 10))
+            Text(screenText)
+                .font(.system(size: metrics.pointSize, design: .monospaced))
+                .lineSpacing(0)
+                // Every one of these matters. A terminal row is a fixed number of cells
+                // and must occupy exactly one line: allowed to wrap, an 80-column row
+                // becomes two visual lines, everything below it shifts, and the grid
+                // turns into the scrambled mess this replaced.
+                .lineLimit(terminal.rows)
+                .fixedSize(horizontal: true, vertical: true)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .padding(10)
+                .background(Color(white: 0.08), in: RoundedRectangle(cornerRadius: 10))
+                .clipped()
         }
-        .aspectRatio(CGFloat(terminal.columns) * 0.6 / CGFloat(terminal.rows) * 0.92, contentMode: .fit)
+        .frame(height: Self.height(forWidth: screenWidth, columns: terminal.columns, rows: terminal.rows))
     }
 
-    /// One row, built as a single attributed string so each line is one Text rather than
-    /// one per cell -- 80 views a row, 24 rows, ten times a second is not affordable.
+    /// Width available to the terminal. Read once here rather than threaded through the
+    /// GeometryReader, because the height has to be known before layout to avoid the
+    /// reader collapsing to zero.
+    private var screenWidth: CGFloat {
+        UIScreen.main.bounds.width - 32
+    }
+
+    /// The whole screen as one attributed string, rows separated by newlines.
+    ///
+    /// One Text rather than one per row: 24 separate views each measuring themselves
+    /// independently is both slower and the reason rows could drift out of alignment
+    /// with each other.
+    private var screenText: AttributedString {
+        var result = AttributedString()
+        for row in 0..<terminal.rows {
+            result.append(line(row))
+            if row < terminal.rows - 1 {
+                result.append(AttributedString("\n"))
+            }
+        }
+        return result
+    }
+
+    /// Measures the real advance width of the monospaced face instead of assuming a
+    /// ratio. The assumed 0.6 em was close enough to look right and wrong enough to make
+    /// rows overflow and wrap.
+    private static func metrics(forWidth width: CGFloat, columns: Int) -> (pointSize: CGFloat, advance: CGFloat) {
+        let reference: CGFloat = 20
+        let font = UIFont.monospacedSystemFont(ofSize: reference, weight: .regular)
+        let advance = ("0" as NSString).size(withAttributes: [.font: font]).width
+        guard advance > 0, width > 0 else { return (8, 5) }
+
+        let pointSize = max(4, floor((width / CGFloat(columns)) / advance * reference * 2) / 2)
+        return (pointSize, advance / reference * pointSize)
+    }
+
+    private static func height(forWidth width: CGFloat, columns: Int, rows: Int) -> CGFloat {
+        let metrics = metrics(forWidth: width - 20, columns: columns)
+        let font = UIFont.monospacedSystemFont(ofSize: metrics.pointSize, weight: .regular)
+        return ceil(font.lineHeight * CGFloat(rows)) + 20
+    }
+
+    /// One row, built as runs of identical styling so a line is a handful of attributed
+    /// spans rather than one per cell.
     private func line(_ row: Int) -> AttributedString {
         var result = AttributedString()
         var run = ""

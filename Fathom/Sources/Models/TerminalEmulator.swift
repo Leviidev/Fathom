@@ -106,6 +106,13 @@ struct TerminalEmulator {
             state = .escape
             isFullScreen = true
         case "\n":
+            // Carriage return as well as line feed. A program writing to a terminal gets
+            // ONLCR output processing, which turns its "\n" into CR+LF -- and the games
+            // that exposed this only clear ICANON and ECHO for raw mode, leaving OPOST
+            // alone. Treating this as a bare line feed leaves the column where it was, so
+            // every line starts further right than the one above it and the whole screen
+            // shears diagonally.
+            cursorColumn = 0
             newline()
         case "\r":
             cursorColumn = 0

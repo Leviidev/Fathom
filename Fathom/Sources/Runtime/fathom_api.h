@@ -55,6 +55,12 @@ void fathom_set_log_sink(fathom_log_sink sink, void* context);
 /// Minimum level that reaches the sink. Defaults to FATHOM_LOG_INFO.
 void fathom_set_log_level(fathom_log_level level);
 
+/// Installs fatal-signal handlers that append a final diagnostic record to the file at
+/// `log_path` before the process dies: which signal, the fault address, and the last
+/// guest syscall serviced. Without this a hard fault inside the JIT just ends the
+/// process and the log stops mid-line with no indication of why.
+void fathom_install_crash_handler(const char* log_path);
+
 // ---------------------------------------------------------------------------
 // Program inspection
 // ---------------------------------------------------------------------------

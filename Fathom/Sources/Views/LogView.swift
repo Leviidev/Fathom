@@ -20,6 +20,18 @@ struct LogView: View {
             .pickerStyle(.segmented)
             .padding()
 
+            if logStore.hasPreviousLog {
+                HStack(spacing: 8) {
+                    Image(systemName: "clock.arrow.circlepath")
+                    Text("A log from the previous run was kept. Export includes it.")
+                    Spacer()
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal)
+                .padding(.bottom, 8)
+            }
+
             if filtered.isEmpty {
                 EmptyState(title: "Nothing logged",
                            message: "Lines appear here as Fathom and the emulator core do work.",
@@ -62,7 +74,7 @@ struct LogView: View {
                     Button {
                         isSharing = true
                     } label: {
-                        Label("Export log file", systemImage: "square.and.arrow.up")
+                        Label("Export diagnostics", systemImage: "square.and.arrow.up")
                     }
                     Button {
                         UIPasteboard.general.string = filtered.map { "[\($0.level.label)] \($0.message)" }
@@ -81,7 +93,11 @@ struct LogView: View {
             }
         }
         .sheet(isPresented: $isSharing) {
-            ShareSheet(items: [logStore.fileURL])
+            // Both files go out together: after a crash the app has already relaunched
+            // and rotated the log, so the run that failed is the previous one.
+            ShareSheet(items: logStore.hasPreviousLog
+                       ? [logStore.fileURL, logStore.previousFileURL]
+                       : [logStore.fileURL])
         }
     }
 

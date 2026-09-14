@@ -106,6 +106,15 @@ struct SettingsView: View {
                     FathomLog.shared.setCoreLevel(verbose: value)
                 }
             Toggle("Trace guest syscalls", isOn: $settings.traceSyscalls)
+                .onChange(of: settings.traceSyscalls) { _, value in
+                    // Tracing without verbose logging produces a log with no trace in it,
+                    // which looks exactly like "the guest made no syscalls". Turning one on
+                    // turns the other on.
+                    if value {
+                        settings.verboseLogging = true
+                        FathomLog.shared.setCoreLevel(verbose: true)
+                    }
+                }
 
             NavigationLink {
                 LogView()

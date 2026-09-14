@@ -1,5 +1,6 @@
 #include "fex_engine.h"
 
+#include "crash_handler.h"
 #include "fathom_log.h"
 
 #include <Common/Config.h>
@@ -182,7 +183,12 @@ public:
     uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* frame, FEXCore::HLE::SyscallArguments* args) override {
         // Under OS_LINUX64 the argument array is {RAX, RDI, RSI, RDX, R10, R8, R9}:
         // the syscall number first, then x86-64 Linux's six argument registers in order.
-        (void)frame;
+        //
+        // A syscall is the one place the guest's RIP is reliably settled, so it is also
+        // the only honest place to record it for the crash handler.
+        if (frame != nullptr) {
+            NoteGuestRip(frame->State.rip);
+        }
         return syscalls_.Handle(args->Argument[0], args->Argument[1], args->Argument[2],
                                 args->Argument[3], args->Argument[4], args->Argument[5],
                                 args->Argument[6]);

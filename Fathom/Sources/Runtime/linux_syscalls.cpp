@@ -1,5 +1,6 @@
 #include "linux_syscalls.h"
 
+#include "crash_handler.h"
 #include "fathom_log.h"
 
 #include <algorithm>
@@ -928,12 +929,33 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
         control_.ExitGuest(-1);
     }
 
-    if (config_.trace && LogEnabled(FATHOM_LOG_DEBUG)) {
-        FATHOM_DEBUG("syscall %llu (%s) %#llx %#llx %#llx", static_cast<unsigned long long>(number),
-                     SyscallName(number), static_cast<unsigned long long>(arg1),
-                     static_cast<unsigned long long>(arg2), static_cast<unsigned long long>(arg3));
+    const auto count = syscall_count_.load(std::memory_order_relaxed);
+    NoteSyscall(number, arg1, count);
+
+    if (config_.trace) {
+        FATHOM_INFO("syscall %llu %s(%#llx, %#llx, %#llx)", static_cast<unsigned long long>(number),
+                    SyscallName(number), static_cast<unsigned long long>(arg1),
+                    static_cast<unsigned long long>(arg2), static_cast<unsigned long long>(arg3));
     }
 
+    const auto result = Dispatch(number, arg1, arg2, arg3, arg4, arg5, arg6);
+
+    if (config_.trace) {
+        // The return value is the half that actually explains a stall: a syscall that
+        // was reached and refused looks identical to one that was never reached unless
+        // the answer is logged too.
+        const auto signed_result = static_cast<int64_t>(result);
+        if (signed_result < 0 && signed_result > -4096) {
+            FATHOM_INFO("  -> error %lld", static_cast<long long>(-signed_result));
+        } else {
+            FATHOM_INFO("  -> %#llx", static_cast<unsigned long long>(result));
+        }
+    }
+    return result;
+}
+
+uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                                 uint64_t arg4, uint64_t arg5, uint64_t arg6) {
     switch (number) {
     case kSysRead:
         return DoRead(static_cast<int>(arg1), arg2, arg3);

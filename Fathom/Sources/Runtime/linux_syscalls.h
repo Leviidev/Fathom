@@ -89,6 +89,11 @@ private:
     bool ReadGuestString(uint64_t address, std::string* out, size_t limit = 4096) const;
     void* GuestPointer(uint64_t address, uint64_t size, bool writable) const;
 
+    /// The switch itself. Split out from Handle so tracing can wrap it and log what
+    /// each call actually returned.
+    uint64_t Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4,
+                      uint64_t arg5, uint64_t arg6);
+
     // Individual syscalls that are long enough to deserve a name.
     uint64_t DoOpenAt(int dirfd, uint64_t path_address, int flags, int mode);
     uint64_t DoRead(int fd, uint64_t buffer, uint64_t count);

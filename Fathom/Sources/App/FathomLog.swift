@@ -46,6 +46,21 @@ final class FathomLog: ObservableObject, @unchecked Sendable {
             .appendingPathComponent("fathom.log")
     }
 
+    /// The log from the run before this one.
+    ///
+    /// This exists because of the specific way an emulator fails: the guest faults, the
+    /// process dies, iOS relaunches the app, and a log that started fresh on launch has
+    /// already thrown away the only record of what happened. The interesting log is
+    /// frequently the previous one.
+    var previousFileURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("fathom-previous.log")
+    }
+
+    var hasPreviousLog: Bool {
+        FileManager.default.fileExists(atPath: previousFileURL.path)
+    }
+
     private init() {
         formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss.SSS"
@@ -55,11 +70,19 @@ final class FathomLog: ObservableObject, @unchecked Sendable {
     private func openFile() {
         let url = fileURL
         let manager = FileManager.default
-        // Start each launch with a fresh file: the interesting log is almost always the
-        // one from the run that just went wrong, and an ever-growing file buries it.
-        try? manager.removeItem(at: url)
+
+        // Rotate rather than delete. Each launch gets a clean file so one run is easy to
+        // read, but the run before it survives -- which is the one that matters when the
+        // app died rather than exited.
+        try? manager.removeItem(at: previousFileURL)
+        try? manager.moveItem(at: url, to: previousFileURL)
+
         manager.createFile(atPath: url.path, contents: nil)
         handle = try? FileHandle(forWritingTo: url)
+
+        // Installed before anything else runs, so a fault during startup is still
+        // recorded. It appends to this same file from inside the signal handler.
+        url.path.withCString { fathom_install_crash_handler($0) }
 
         let device = ProcessInfo.processInfo
         write(.info, "Fathom \(Bundle.main.shortVersion) (\(Bundle.main.buildVersion))")

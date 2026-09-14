@@ -1,5 +1,7 @@
 # Fathom
 
+![Fathom Downloads](https://img.shields.io/github/downloads/leviidev/fathom/total?style=for-the-badge&color=5865F2&labelColor=111111)
+
 An x86-64 PC emulator for iOS. Fathom runs x86-64 Linux programs on an iPhone or iPad by
 translating them to ARM64 as they execute, using [FEXCore](https://github.com/FEX-Emu/FEX)
 — the dynamic recompiler behind FEX-Emu — with a native SwiftUI front end.

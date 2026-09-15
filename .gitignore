@@ -14,3 +14,7 @@ testprograms/fathom-selftest
 
 *.xcuserstate
 xcuserdata/
+
+# Notes to self, kept local and out of the repo.
+CLAUDE.md
+NEXT.md

@@ -1,5 +1,7 @@
 #include "linux_syscalls.h"
 
+#include "guest_path.h"
+
 #include "crash_handler.h"
 #include "fathom_log.h"
 
@@ -548,10 +550,10 @@ std::string LinuxSyscalls::ResolveGuestPath(const std::string& path) const {
     if (config_.guest_root.empty()) {
         return guest_path;
     }
-    if (guest_path == "/") {
-        return config_.guest_root;
-    }
-    return config_.guest_root + guest_path;
+    // Not a plain concatenation: a symlink inside the root may point at an absolute
+    // path, which means absolute *in the guest*, and the host would resolve it against
+    // its own root and find nothing.
+    return ResolveGuestPathOnHost(config_.guest_root, guest_path);
 }
 
 std::string LinuxSyscalls::ResolveAt(int dirfd, const char* path, std::string* guest_path_out) {

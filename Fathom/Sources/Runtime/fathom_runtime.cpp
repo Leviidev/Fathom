@@ -7,6 +7,7 @@
 #include "fathom_log.h"
 #include "fex_engine.h"
 #include "guest_memory.h"
+#include "guest_path.h"
 #include "linux_syscalls.h"
 
 #include <algorithm>
@@ -84,36 +85,6 @@ constexpr unsigned int kCsOpsStatus = 0;
 constexpr uint32_t kCsDebugged = 0x10000000;
 
 } // namespace
-
-/// Resolves a guest-absolute path -- the interpreter named in PT_INTERP, say -- to a host
-/// path inside the guest root. ".." cannot climb past the root, so a binary naming
-/// "/../../../etc/passwd" as its loader still reaches nothing outside the sandbox.
-std::string ResolveInGuestRoot(const std::string& guest_root, const std::string& guest_path) {
-    std::vector<std::string> parts;
-    size_t index = 0;
-    while (index < guest_path.size()) {
-        const auto next = guest_path.find('/', index);
-        const auto piece = guest_path.substr(
-            index, next == std::string::npos ? std::string::npos : next - index);
-        if (piece == "..") {
-            if (!parts.empty()) {
-                parts.pop_back();
-            }
-        } else if (!piece.empty() && piece != ".") {
-            parts.push_back(piece);
-        }
-        if (next == std::string::npos) {
-            break;
-        }
-        index = next + 1;
-    }
-    std::string resolved = guest_root;
-    for (const auto& piece : parts) {
-        resolved += '/';
-        resolved += piece;
-    }
-    return resolved;
-}
 
 struct fathom_session {
     std::unique_ptr<fathom::GuestAddressSpace> space;
@@ -203,6 +174,17 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
 
     auto session = std::make_unique<fathom_session>();
     session->program_path = config->program_path;
+
+    // A program that lives inside the guest root is reached the way the guest would reach
+    // it. /bin/sh is a symlink to "/bin/busybox", and only the guest's root makes that
+    // mean anything.
+    {
+        const std::string guest_root = config->guest_root == nullptr ? "" : config->guest_root;
+        const std::string as_guest = fathom::GuestPathForHostPath(guest_root, session->program_path);
+        if (!as_guest.empty()) {
+            session->program_path = fathom::ResolveGuestPathOnHost(guest_root, as_guest);
+        }
+    }
     session->state.store(FATHOM_STATE_LOADING);
 
     const auto inspection = fathom::InspectElf(session->program_path);
@@ -231,7 +213,7 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
             return fail("this program is dynamically linked and needs " + inspection.interpreter +
                         ", but no guest root filesystem is configured.");
         }
-        const std::string loader = ResolveInGuestRoot(guest_root, inspection.interpreter);
+        const std::string loader = fathom::ResolveGuestPathOnHost(guest_root, inspection.interpreter);
         if (access(loader.c_str(), R_OK) != 0) {
             return fail("this program needs its dynamic loader, " + inspection.interpreter +
                         ", which the guest root filesystem does not provide. Install a root "

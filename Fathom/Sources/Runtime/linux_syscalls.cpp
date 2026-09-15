@@ -1,5 +1,6 @@
 #include "linux_syscalls.h"
 
+#include "guest_net.h"
 #include "guest_path.h"
 
 #include <poll.h>
@@ -171,6 +172,22 @@ enum : uint64_t {
     kSysExecve = 59,
     kSysExit = 60,
     kSysWait4 = 61,
+    kSysSocket = 41,
+    kSysConnect = 42,
+    kSysAccept = 43,
+    kSysSendto = 44,
+    kSysRecvfrom = 45,
+    kSysSendmsg = 46,
+    kSysRecvmsg = 47,
+    kSysShutdown = 48,
+    kSysBind = 49,
+    kSysListen = 50,
+    kSysGetsockname = 51,
+    kSysGetpeername = 52,
+    kSysSocketpair = 53,
+    kSysSetsockopt = 54,
+    kSysGetsockopt = 55,
+    kSysAccept4 = 288,
     kSysPipe = 22,
     kSysDup3 = 292,
     kSysKill = 62,
@@ -419,6 +436,22 @@ const char* SyscallName(uint64_t number) {
     case kSysVfork: return "vfork";
     case kSysExecve: return "execve";
     case kSysWait4: return "wait4";
+    case kSysSocket: return "socket";
+    case kSysConnect: return "connect";
+    case kSysAccept: return "accept";
+    case kSysAccept4: return "accept4";
+    case kSysSendto: return "sendto";
+    case kSysRecvfrom: return "recvfrom";
+    case kSysSendmsg: return "sendmsg";
+    case kSysRecvmsg: return "recvmsg";
+    case kSysShutdown: return "shutdown";
+    case kSysBind: return "bind";
+    case kSysListen: return "listen";
+    case kSysGetsockname: return "getsockname";
+    case kSysGetpeername: return "getpeername";
+    case kSysSocketpair: return "socketpair";
+    case kSysSetsockopt: return "setsockopt";
+    case kSysGetsockopt: return "getsockopt";
     case kSysPipe: return "pipe";
     case kSysPipe2: return "pipe2";
     case kSysDup3: return "dup3";
@@ -916,6 +949,131 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
         // Sleep until a key arrives, in slices so a stop request is still noticed.
         console_.WaitForInput(10);
     }
+}
+
+namespace {
+
+/// Linux and Darwin agree on MSG_OOB, MSG_PEEK and MSG_DONTROUTE and then part company:
+/// MSG_WAITALL is 0x100 on Linux and 0x40 on Darwin, and MSG_DONTWAIT is 0x40 on Linux
+/// and 0x80 on Darwin -- so passing Linux's MSG_DONTWAIT straight through asks Darwin to
+/// block until the whole buffer is full, which is the opposite of what was meant.
+int HostMessageFlags(int guest_flags) {
+    constexpr int kGuestMsgWaitall = 0x100;
+    constexpr int kGuestMsgDontwait = 0x40;
+    constexpr int kGuestMsgNosignal = 0x4000;
+
+    int host_flags = guest_flags & (MSG_OOB | MSG_PEEK | MSG_DONTROUTE);
+    if ((guest_flags & kGuestMsgWaitall) != 0) {
+        host_flags |= MSG_WAITALL;
+    }
+    if ((guest_flags & kGuestMsgDontwait) != 0) {
+        host_flags |= MSG_DONTWAIT;
+    }
+    // MSG_NOSIGNAL has no Darwin equivalent; SO_NOSIGPIPE is set on the socket instead.
+    (void)kGuestMsgNosignal;
+    return host_flags;
+}
+
+} // namespace
+
+/// sendmsg and recvmsg, which musl's DNS resolver uses rather than recvfrom -- leaving
+/// them unimplemented had it spin on ENOSYS several hundred thousand times per lookup.
+///
+/// The two systems lay struct msghdr out differently: Linux has a 4-byte pad after
+/// msg_namelen and 64-bit msg_iovlen and msg_controllen, where Darwin has neither pad nor
+/// the wider fields. The fields are therefore read out of the guest by offset rather than
+/// cast across. struct iovec happens to match on both, so the guest's array is handed
+/// over as-is once its buffers have been checked.
+uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bool sending) {
+    const int host_fd = HostFdFor(fd);
+    if (host_fd < 0) {
+        return FailLinux(9);
+    }
+
+    constexpr uint64_t kGuestMsghdrSize = 56;
+    auto* header = static_cast<uint8_t*>(GuestPointer(header_address, kGuestMsghdrSize, true));
+    if (header == nullptr) {
+        return FailLinux(14);
+    }
+
+    uint64_t name_address = 0;
+    uint32_t name_length = 0;
+    uint64_t iov_address = 0;
+    uint64_t iov_count = 0;
+    uint64_t control_length = 0;
+    std::memcpy(&name_address, header + 0, 8);
+    std::memcpy(&name_length, header + 8, 4);
+    std::memcpy(&iov_address, header + 16, 8);
+    std::memcpy(&iov_count, header + 24, 8);
+    std::memcpy(&control_length, header + 40, 8);
+
+    if (iov_count > 1024) {
+        return FailLinux(22); // EINVAL
+    }
+    auto* vectors = static_cast<LinuxIovec*>(
+        GuestPointer(iov_address, iov_count * sizeof(LinuxIovec), true));
+    if (vectors == nullptr && iov_count != 0) {
+        return FailLinux(14);
+    }
+    for (uint64_t index = 0; index < iov_count; ++index) {
+        if (vectors[index].length != 0 &&
+            GuestPointer(vectors[index].base, vectors[index].length, !sending) == nullptr) {
+            return FailLinux(14);
+        }
+    }
+    if (control_length != 0) {
+        // Ancillary data is laid out differently again, and nothing Fathom runs yet passes
+        // any. Dropping it is better than misreading it.
+        FATHOM_WARN("%s with %llu bytes of control data, which is being ignored",
+                    sending ? "sendmsg" : "recvmsg",
+                    static_cast<unsigned long long>(control_length));
+    }
+
+    sockaddr_storage address {};
+    msghdr host_header {};
+    host_header.msg_iov = reinterpret_cast<iovec*>(vectors);
+    host_header.msg_iovlen = static_cast<int>(iov_count);
+
+    if (sending) {
+        if (name_address != 0 && name_length != 0) {
+            const void* guest_name = GuestPointer(name_address, name_length, false);
+            if (guest_name != nullptr) {
+                const socklen_t length = fathom::net::ToHostAddress(guest_name, name_length, &address);
+                if (length != 0) {
+                    host_header.msg_name = &address;
+                    host_header.msg_namelen = length;
+                }
+            }
+        }
+        const ssize_t sent = sendmsg(host_fd, &host_header, HostMessageFlags(flags));
+        return sent < 0 ? Fail(errno) : static_cast<uint64_t>(sent);
+    }
+
+    if (name_address != 0 && name_length != 0) {
+        host_header.msg_name = &address;
+        host_header.msg_namelen = sizeof(address);
+    }
+    const ssize_t received = recvmsg(host_fd, &host_header, HostMessageFlags(flags));
+    if (received < 0) {
+        return Fail(errno);
+    }
+    if (host_header.msg_name != nullptr && host_header.msg_namelen != 0) {
+        void* guest_name = GuestPointer(name_address, name_length, true);
+        if (guest_name != nullptr) {
+            const socklen_t written =
+                fathom::net::ToGuestAddress(reinterpret_cast<sockaddr*>(&address), guest_name, name_length);
+            std::memcpy(header + 8, &written, 4);
+        }
+    }
+    const int32_t out_flags = host_header.msg_flags;
+    std::memcpy(header + 48, &out_flags, 4);
+    return static_cast<uint64_t>(received);
+}
+
+int LinuxSyscalls::HostFdFor(int guest_fd) {
+    std::scoped_lock lock {mutex_};
+    auto* file = FindFile(guest_fd);
+    return file == nullptr ? -1 : file->host_fd;
 }
 
 bool LinuxSyscalls::IsConsole(int fd) {
@@ -1962,6 +2120,251 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
 
     case kSysPoll:
         return DoPoll(arg1, arg2, static_cast<int>(arg3));
+
+    case kSysSocket: {
+        bool nonblocking = false;
+        bool cloexec = false;
+        const int domain = fathom::net::HostDomain(static_cast<int>(arg1));
+        const int type = fathom::net::HostType(static_cast<int>(arg2), &nonblocking, &cloexec);
+        if (domain < 0) {
+            FATHOM_WARN("guest asked for an address family this host has no answer for: %d",
+                        static_cast<int>(arg1));
+            return FailLinux(97); // EAFNOSUPPORT
+        }
+        const int host_fd = socket(domain, type, static_cast<int>(arg3));
+        if (host_fd < 0) {
+            return Fail(errno);
+        }
+        if (nonblocking) {
+            fcntl(host_fd, F_SETFL, fcntl(host_fd, F_GETFL, 0) | O_NONBLOCK);
+        }
+        if (cloexec) {
+            fcntl(host_fd, F_SETFD, FD_CLOEXEC);
+        }
+        // Darwin raises SIGPIPE where Linux callers expect EPIPE from send(); the guest
+        // never installed a handler for a signal its libc does not expect here.
+        int on = 1;
+        setsockopt(host_fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+
+        std::scoped_lock lock {mutex_};
+        return static_cast<uint64_t>(RegisterFile(host_fd, "socket"));
+    }
+
+    case kSysConnect:
+    case kSysBind: {
+        const int host_fd = HostFdFor(static_cast<int>(arg1));
+        if (host_fd < 0) {
+            return FailLinux(9);
+        }
+        const void* address = GuestPointer(arg2, arg3, false);
+        if (address == nullptr) {
+            return FailLinux(14);
+        }
+        sockaddr_storage host_address {};
+        const socklen_t length = fathom::net::ToHostAddress(address, arg3, &host_address);
+        if (length == 0) {
+            return FailLinux(97);
+        }
+        const int result = number == kSysConnect
+                               ? connect(host_fd, reinterpret_cast<sockaddr*>(&host_address), length)
+                               : bind(host_fd, reinterpret_cast<sockaddr*>(&host_address), length);
+        return result < 0 ? Fail(errno) : 0;
+    }
+
+    case kSysListen: {
+        const int host_fd = HostFdFor(static_cast<int>(arg1));
+        if (host_fd < 0) {
+            return FailLinux(9);
+        }
+        return listen(host_fd, static_cast<int>(arg2)) < 0 ? Fail(errno) : 0;
+    }
+
+    case kSysSendmsg:
+        return DoMessage(static_cast<int>(arg1), arg2, static_cast<int>(arg3), true);
+
+    case kSysRecvmsg:
+        return DoMessage(static_cast<int>(arg1), arg2, static_cast<int>(arg3), false);
+
+    case kSysShutdown: {
+        const int host_fd = HostFdFor(static_cast<int>(arg1));
+        if (host_fd < 0) {
+            return FailLinux(9);
+        }
+        return shutdown(host_fd, static_cast<int>(arg2)) < 0 ? Fail(errno) : 0;
+    }
+
+    case kSysSendto: {
+        const int host_fd = HostFdFor(static_cast<int>(arg1));
+        if (host_fd < 0) {
+            return FailLinux(9);
+        }
+        const void* buffer = GuestPointer(arg2, arg3, false);
+        if (buffer == nullptr && arg3 != 0) {
+            return FailLinux(14);
+        }
+        sockaddr_storage host_address {};
+        socklen_t length = 0;
+        if (arg5 != 0 && arg6 != 0) {
+            const void* address = GuestPointer(arg5, arg6, false);
+            if (address != nullptr) {
+                length = fathom::net::ToHostAddress(address, arg6, &host_address);
+            }
+        }
+        const ssize_t sent = sendto(host_fd, buffer, arg3, HostMessageFlags(static_cast<int>(arg4)),
+                                    length != 0 ? reinterpret_cast<sockaddr*>(&host_address) : nullptr,
+                                    length);
+        return sent < 0 ? Fail(errno) : static_cast<uint64_t>(sent);
+    }
+
+    case kSysRecvfrom: {
+        const int host_fd = HostFdFor(static_cast<int>(arg1));
+        if (host_fd < 0) {
+            return FailLinux(9);
+        }
+        void* buffer = GuestPointer(arg2, arg3, true);
+        if (buffer == nullptr && arg3 != 0) {
+            return FailLinux(14);
+        }
+        sockaddr_storage from {};
+        socklen_t from_length = sizeof(from);
+        const ssize_t received = recvfrom(host_fd, buffer, arg3, HostMessageFlags(static_cast<int>(arg4)),
+                                          reinterpret_cast<sockaddr*>(&from), &from_length);
+        if (received < 0) {
+            return Fail(errno);
+        }
+        if (arg5 != 0 && arg6 != 0) {
+            auto* out_length = static_cast<uint32_t*>(GuestPointer(arg6, sizeof(uint32_t), true));
+            if (out_length != nullptr) {
+                void* out = GuestPointer(arg5, *out_length, true);
+                if (out != nullptr) {
+                    *out_length = fathom::net::ToGuestAddress(reinterpret_cast<sockaddr*>(&from), out,
+                                                              *out_length);
+                }
+            }
+        }
+        return static_cast<uint64_t>(received);
+    }
+
+    case kSysGetsockname:
+    case kSysGetpeername: {
+        const int host_fd = HostFdFor(static_cast<int>(arg1));
+        if (host_fd < 0) {
+            return FailLinux(9);
+        }
+        auto* out_length = static_cast<uint32_t*>(GuestPointer(arg3, sizeof(uint32_t), true));
+        if (out_length == nullptr) {
+            return FailLinux(14);
+        }
+        void* out = GuestPointer(arg2, *out_length, true);
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        sockaddr_storage address {};
+        socklen_t length = sizeof(address);
+        const int result = number == kSysGetsockname
+                               ? getsockname(host_fd, reinterpret_cast<sockaddr*>(&address), &length)
+                               : getpeername(host_fd, reinterpret_cast<sockaddr*>(&address), &length);
+        if (result < 0) {
+            return Fail(errno);
+        }
+        *out_length = fathom::net::ToGuestAddress(reinterpret_cast<sockaddr*>(&address), out, *out_length);
+        return 0;
+    }
+
+    case kSysSetsockopt: {
+        const int host_fd = HostFdFor(static_cast<int>(arg1));
+        if (host_fd < 0) {
+            return FailLinux(9);
+        }
+        const int level = fathom::net::HostLevel(static_cast<int>(arg2));
+        const int option = fathom::net::HostOption(static_cast<int>(arg2), static_cast<int>(arg3));
+        if (option < 0) {
+            // Accepting an option we cannot express beats failing: a program that cannot
+            // set a hint usually carries on, and one that gets an error often gives up.
+            return 0;
+        }
+        const void* value = GuestPointer(arg4, arg5, false);
+        if (value == nullptr && arg5 != 0) {
+            return FailLinux(14);
+        }
+        return setsockopt(host_fd, level, option, value, static_cast<socklen_t>(arg5)) < 0 ? Fail(errno) : 0;
+    }
+
+    case kSysGetsockopt: {
+        const int host_fd = HostFdFor(static_cast<int>(arg1));
+        if (host_fd < 0) {
+            return FailLinux(9);
+        }
+        const int level = fathom::net::HostLevel(static_cast<int>(arg2));
+        const int option = fathom::net::HostOption(static_cast<int>(arg2), static_cast<int>(arg3));
+        auto* out_length = static_cast<uint32_t*>(GuestPointer(arg5, sizeof(uint32_t), true));
+        if (out_length == nullptr) {
+            return FailLinux(14);
+        }
+        void* value = GuestPointer(arg4, *out_length, true);
+        if (value == nullptr) {
+            return FailLinux(14);
+        }
+        if (option < 0) {
+            std::memset(value, 0, *out_length);
+            return 0;
+        }
+        socklen_t length = *out_length;
+        if (getsockopt(host_fd, level, option, value, &length) < 0) {
+            return Fail(errno);
+        }
+        *out_length = length;
+        return 0;
+    }
+
+    case kSysAccept:
+    case kSysAccept4: {
+        const int host_fd = HostFdFor(static_cast<int>(arg1));
+        if (host_fd < 0) {
+            return FailLinux(9);
+        }
+        sockaddr_storage address {};
+        socklen_t length = sizeof(address);
+        const int accepted = accept(host_fd, reinterpret_cast<sockaddr*>(&address), &length);
+        if (accepted < 0) {
+            return Fail(errno);
+        }
+        if (arg2 != 0 && arg3 != 0) {
+            auto* out_length = static_cast<uint32_t*>(GuestPointer(arg3, sizeof(uint32_t), true));
+            if (out_length != nullptr) {
+                void* out = GuestPointer(arg2, *out_length, true);
+                if (out != nullptr) {
+                    *out_length = fathom::net::ToGuestAddress(reinterpret_cast<sockaddr*>(&address), out,
+                                                              *out_length);
+                }
+            }
+        }
+        std::scoped_lock lock {mutex_};
+        return static_cast<uint64_t>(RegisterFile(accepted, "socket"));
+    }
+
+    case kSysSocketpair: {
+        bool nonblocking = false;
+        const int domain = fathom::net::HostDomain(static_cast<int>(arg1));
+        const int type = fathom::net::HostType(static_cast<int>(arg2), &nonblocking, nullptr);
+        if (domain < 0) {
+            return FailLinux(97);
+        }
+        int pair[2] = {-1, -1};
+        if (socketpair(domain, type, static_cast<int>(arg3), pair) < 0) {
+            return Fail(errno);
+        }
+        auto* out = static_cast<int32_t*>(GuestPointer(arg4, sizeof(int32_t) * 2, true));
+        if (out == nullptr) {
+            close(pair[0]);
+            close(pair[1]);
+            return FailLinux(14);
+        }
+        std::scoped_lock lock {mutex_};
+        out[0] = static_cast<int32_t>(RegisterFile(pair[0], "socketpair"));
+        out[1] = static_cast<int32_t>(RegisterFile(pair[1], "socketpair"));
+        return 0;
+    }
 
     case kSysSysinfo:
     case kSysStatfs:

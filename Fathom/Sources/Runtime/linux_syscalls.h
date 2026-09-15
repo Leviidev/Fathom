@@ -143,6 +143,9 @@ private:
     /// a shell closes fd 0 and opens a file precisely because it knows it gets fd 0 back.
     int AllocateFd();
     bool IsConsole(int fd);
+    /// The host descriptor behind a guest one, or -1.
+    int HostFdFor(int guest_fd);
+    uint64_t DoMessage(int fd, uint64_t header_address, int flags, bool sending);
     int DuplicateTo(const OpenFile& file, int target);
     void CloseFd(int fd);
 

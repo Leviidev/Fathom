@@ -40,6 +40,14 @@ mkdir -p "$WORK/root"
 tar -xzf "$WORK/$NAME" -C "$WORK/root" --no-same-owner --no-same-permissions
 # Alpine ships no /dev, /proc or /sys in the minirootfs; the guest expects them to exist.
 mkdir -p "$WORK/root/dev" "$WORK/root/proc" "$WORK/root/sys" "$WORK/root/tmp" "$WORK/root/root"
+# A resolver, because the minirootfs ships none and musl silently fails every lookup
+# without one. Public servers rather than the host's, which Fathom cannot read on iOS.
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$WORK/root/etc/resolv.conf"
+# Alpine's package indexes are signed, so plain HTTP is safe and works today; HTTPS needs
+# certificates the minirootfs does not carry.
+mkdir -p "$WORK/root/etc/apk"
+printf 'http://dl-cdn.alpinelinux.org/alpine/v%s/main\nhttp://dl-cdn.alpinelinux.org/alpine/v%s/community\n' \
+    "${VERSION%.*}" "${VERSION%.*}" > "$WORK/root/etc/apk/repositories"
 # COPYFILE_DISABLE stops macOS tar from writing an AppleDouble "._name" companion entry
 # for every file, which would otherwise double the entry count and litter the guest root
 # with 500-odd files Linux has no use for.

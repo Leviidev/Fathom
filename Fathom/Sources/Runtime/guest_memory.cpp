@@ -244,6 +244,23 @@ bool GuestAddressSpace::Protect(uint64_t address, uint64_t size, int protection)
     const uint64_t begin = AlignDown(address);
     const uint64_t end = AlignUp(address + size);
 
+    // The guest's pages are 4KB and this device's are 16KB, so a guest range rarely lands
+    // on a host page boundary. Rounding outward and applying the new protection to the
+    // whole of it would take access away from up to three neighbouring guest pages that
+    // were never mentioned -- which is exactly what happens when a dynamic loader marks
+    // its relocated data read-only and quietly strips write access from the start of the
+    // segment that follows.
+    //
+    // Only host pages lying wholly inside the request get the protection as asked. The
+    // partial pages at either end keep whatever they already allowed, widened by the new
+    // protection, because a page shared by two guest pages has to satisfy both.
+    const uint64_t strict_begin = AlignUp(address);
+    const uint64_t strict_end = AlignDown(address + size);
+    const auto protection_for = [&](uint64_t range_begin, uint64_t range_end, int existing) {
+        const bool wholly_inside = range_begin >= strict_begin && range_end <= strict_end;
+        return wholly_inside ? protection : (existing | protection);
+    };
+
     std::vector<GuestRange> updated;
     updated.reserve(committed_.size() + 2);
     bool touched = false;
@@ -258,7 +275,8 @@ bool GuestAddressSpace::Protect(uint64_t address, uint64_t size, int protection)
         }
         const uint64_t overlap_begin = std::max(range.begin, begin);
         const uint64_t overlap_end = std::min(range.end(), end);
-        updated.push_back(GuestRange {overlap_begin, overlap_end - overlap_begin, protection});
+        updated.push_back(GuestRange {overlap_begin, overlap_end - overlap_begin,
+                                      protection_for(overlap_begin, overlap_end, range.protection)});
         if (range.end() > end) {
             updated.push_back(GuestRange {end, range.end() - end, range.protection});
         }

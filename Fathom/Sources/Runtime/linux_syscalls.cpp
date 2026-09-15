@@ -28,6 +28,10 @@ namespace {
 // ---------------------------------------------------------------------------
 
 namespace guest {
+
+/// clone(2) sharing the address space is a thread, not a process.
+constexpr uint64_t kCloneVm = 0x00000100;
+
 constexpr int kOAccMode = 0x3;
 constexpr int kOCreat = 0x40;
 constexpr int kOExcl = 0x80;
@@ -163,6 +167,7 @@ enum : uint64_t {
     kSysGetpid = 39,
     kSysClone = 56,
     kSysFork = 57,
+    kSysVfork = 58,
     kSysExecve = 59,
     kSysExit = 60,
     kSysWait4 = 61,
@@ -408,6 +413,10 @@ const char* SyscallName(uint64_t number) {
     case kSysSchedYield: return "sched_yield";
     case kSysMremap: return "mremap";
     case kSysMadvise: return "madvise";
+    case kSysFork: return "fork";
+    case kSysVfork: return "vfork";
+    case kSysExecve: return "execve";
+    case kSysWait4: return "wait4";
     case kSysGetpid: return "getpid";
     case kSysClone: return "clone";
     case kSysExit: return "exit";
@@ -470,6 +479,44 @@ void LinuxSyscalls::CloseAll() {
         }
     }
     files_.clear();
+}
+
+void LinuxSyscalls::SetProcess(int pid, int ppid, ProcessHost* host) {
+    pid_ = pid;
+    ppid_ = ppid;
+    host_ = host;
+}
+
+void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
+    std::scoped_lock lock {mutex_};
+    // Every descriptor is dup'd rather than shared outright: the child must be able to
+    // close one, or point it somewhere else for a redirection, without the parent's
+    // table changing underneath it. dup keeps the underlying file description shared,
+    // which is exactly what fork promises.
+    for (const auto& [fd, file] : files_) {
+        if (file.is_framebuffer) {
+            child.files_[fd] = file;
+            continue;
+        }
+        const int copy = file.host_fd < 0 ? -1 : dup(file.host_fd);
+        if (copy < 0 && file.host_fd >= 0) {
+            continue;
+        }
+        OpenFile inherited;
+        inherited.host_fd = copy;
+        inherited.guest_path = file.guest_path;
+        child.files_[fd] = inherited;
+    }
+    child.cwd_ = cwd_;
+    child.heap_base_ = heap_base_;
+    child.heap_limit_ = heap_limit_;
+    child.heap_break_ = heap_break_;
+    child.config_.work_dir = config_.work_dir;
+}
+
+void LinuxSyscalls::AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const std::string& path) {
+    InitialiseHeap(heap_base, heap_reserved);
+    config_.work_dir = path;
 }
 
 void LinuxSyscalls::InitialiseHeap(uint64_t base, uint64_t reserved) {
@@ -569,6 +616,29 @@ void* LinuxSyscalls::GuestPointer(uint64_t address, uint64_t size, bool writable
         return nullptr;
     }
     return reinterpret_cast<void*>(address);
+}
+
+bool LinuxSyscalls::ReadGuestStringArray(uint64_t address, std::vector<std::string>* out) const {
+    out->clear();
+    if (address == 0) {
+        return true;  // A null argv is empty, not an error.
+    }
+    for (size_t index = 0; index < 4096; ++index) {
+        const auto* slot = static_cast<const uint64_t*>(
+            GuestPointer(address + index * sizeof(uint64_t), sizeof(uint64_t), false));
+        if (slot == nullptr) {
+            return false;
+        }
+        if (*slot == 0) {
+            return true;
+        }
+        std::string entry;
+        if (!ReadGuestString(*slot, &entry)) {
+            return false;
+        }
+        out->push_back(std::move(entry));
+    }
+    return true;
 }
 
 bool LinuxSyscalls::ReadGuestString(uint64_t address, std::string* out, size_t limit) const {
@@ -1596,10 +1666,10 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
 
     case kSysGetpid:
     case kSysGettid:
-        return 1000;
+        return static_cast<uint64_t>(pid_);
     case kSysGetppid:
     case kSysGetpgrp:
-        return 1;
+        return static_cast<uint64_t>(ppid_);
     case kSysGetuid:
     case kSysGeteuid:
     case kSysGetgid:
@@ -1701,11 +1771,55 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysClone:
     case kSysClone3:
     case kSysFork:
-        FATHOM_WARN("guest tried to create a thread or process; Fathom runs a single guest thread");
-        return FailLinux(38); // ENOSYS
+    case kSysVfork: {
+        if (host_ == nullptr) {
+            return FailLinux(38);
+        }
+        // Threads -- clone with a shared address space -- are a different thing and are
+        // not supported yet. A shell only ever asks for a process.
+        if (number == kSysClone && (arg1 & guest::kCloneVm) != 0) {
+            FATHOM_WARN("guest asked for a thread (clone flags %#llx), which Fathom cannot make yet",
+                        static_cast<unsigned long long>(arg1));
+            return FailLinux(38);
+        }
+        return static_cast<uint64_t>(host_->ForkProcess(pid_));
+    }
 
-    case kSysExecve:
-        return FailLinux(38);
+    case kSysExecve: {
+        if (host_ == nullptr) {
+            return FailLinux(38);
+        }
+        std::string path;
+        if (!ReadGuestString(arg1, &path)) {
+            return FailLinux(14);
+        }
+        std::vector<std::string> argv;
+        std::vector<std::string> envp;
+        if (!ReadGuestStringArray(arg2, &argv) || !ReadGuestStringArray(arg3, &envp)) {
+            return FailLinux(14);
+        }
+        // Returns only on failure: a successful exec unwinds out of the JIT and the
+        // process comes back to life running something else entirely.
+        return static_cast<uint64_t>(host_->ExecProcess(pid_, path, std::move(argv), std::move(envp)));
+    }
+
+    case kSysWait4: {
+        if (host_ == nullptr) {
+            return FailLinux(38);
+        }
+        int status = 0;
+        const int64_t reaped = host_->WaitForChild(pid_, static_cast<int>(static_cast<int32_t>(arg1)),
+                                                   &status, static_cast<int>(arg3));
+        if (reaped > 0 && arg2 != 0) {
+            auto* out = static_cast<int32_t*>(GuestPointer(arg2, sizeof(int32_t), true));
+            if (out != nullptr) {
+                // Linux packs a normal exit as the status in bits 8..15; the low byte
+                // being zero is what tells the shell it was not a signal.
+                *out = static_cast<int32_t>((status & 0xff) << 8);
+            }
+        }
+        return static_cast<uint64_t>(reaped);
+    }
 
     case kSysKill:
     case kSysTgkill:

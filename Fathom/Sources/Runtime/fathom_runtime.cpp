@@ -13,12 +13,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <condition_variable>
+#include <map>
+#include <thread>
 #include <mutex>
 #include <string>
 #include <sys/mman.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <vector>
 
@@ -26,7 +31,10 @@ namespace {
 
 constexpr uint64_t kDefaultAddressSpace = 2ULL * 1024 * 1024 * 1024; // 2 GB
 constexpr uint64_t kDefaultStack = 8ULL * 1024 * 1024;               // 8 MB
-constexpr uint64_t kHeapReservation = 512ULL * 1024 * 1024;          // brk headroom
+// Per process, and the arena is shared by all of them, so this is a budget rather than a
+// gift: 512MB each meant four processes exhausted a 2GB arena. Busybox and its applets
+// want a fraction of this.
+constexpr uint64_t kHeapReservation = 128ULL * 1024 * 1024;          // brk headroom
 
 void CopyString(char* destination, size_t capacity, const std::string& source) {
     if (destination == nullptr || capacity == 0) {
@@ -66,6 +74,14 @@ public:
         return target_ != nullptr ? target_->GetFsBase() : pending_fs_base_;
     }
 
+    [[noreturn]] void ExecGuest() override {
+        if (target_ != nullptr) {
+            target_->ExecGuest();
+        }
+        FATHOM_ERROR("execve with no engine bound");
+        std::abort();
+    }
+
     [[noreturn]] void ExitGuest(int status) override {
         if (target_ != nullptr) {
             target_->ExitGuest(status);
@@ -87,21 +103,157 @@ constexpr uint32_t kCsDebugged = 0x10000000;
 
 } // namespace
 
-struct fathom_session {
+/// Everything loading a program produces: where it landed, the stack it starts on, and
+/// the entry point to entering it. Shared by session startup and by execve, which differ
+/// only in which process ends up running the result.
+struct LoadedProgram {
+    fathom::LoadedImage image {};
+    fathom::LoadedImage interpreter {};
+    fathom::StackImage stack {};
+    bool dynamic {};
+    uint64_t heap {};
+    uint64_t entry {};
+};
+
+bool LoadProgram(fathom::GuestAddressSpace& space, const std::string& guest_root,
+                 const std::string& host_path, const std::vector<std::string>& argv,
+                 const std::vector<std::string>& envp, uint64_t stack_size, LoadedProgram* out,
+                 std::string& error) {
+    const auto inspection = fathom::InspectElf(host_path);
+    if (!inspection.ok) {
+        error = inspection.error;
+        return false;
+    }
+
+    if (!fathom::LoadElf(host_path, space, 0, &out->image, error)) {
+        return false;
+    }
+
+    // A dynamically linked program does not begin at its own entry point. The kernel maps
+    // its interpreter -- ld.so -- alongside it and enters *that*; ld.so then loads the
+    // shared libraries the program needs and jumps to the program itself. AT_BASE on the
+    // initial stack is how ld.so discovers where it was placed.
+    if (inspection.kind == fathom::ProgramKind::Dynamic) {
+        if (guest_root.empty()) {
+            error = "this program is dynamically linked and needs " + inspection.interpreter +
+                    ", but no guest root filesystem is configured.";
+            return false;
+        }
+        const std::string loader = fathom::ResolveGuestPathOnHost(guest_root, inspection.interpreter);
+        if (access(loader.c_str(), R_OK) != 0) {
+            error = "this program needs its dynamic loader, " + inspection.interpreter +
+                    ", which the guest root filesystem does not provide.";
+            return false;
+        }
+        if (!fathom::LoadElf(loader, space, out->image.image_end, &out->interpreter, error)) {
+            error = "could not load the dynamic loader " + inspection.interpreter + ": " + error;
+            return false;
+        }
+        out->dynamic = true;
+    }
+
+    if (!fathom::BuildInitialStack(space, out->image, argv, envp, host_path,
+                                   out->dynamic ? out->interpreter.load_base : 0, stack_size,
+                                   &out->stack, error)) {
+        return false;
+    }
+
+    // The heap goes right after the image so a guest malloc that walks up from brk sees
+    // the layout it expects. Reserved, not touched: nothing is paged in until the guest
+    // actually writes to it.
+    const uint64_t images_end = std::max(out->image.image_end, out->interpreter.image_end);
+    out->heap = space.Allocate(kHeapReservation, images_end,
+                               fathom::kGuestProtRead | fathom::kGuestProtWrite);
+    if (out->heap == 0) {
+        error = "could not reserve the guest heap";
+        return false;
+    }
+
+    out->entry = out->dynamic ? out->interpreter.entry : out->image.entry;
+    return true;
+}
+
+/// Hands back the regions a program used that are only ever data. Its image is
+/// deliberately kept: FEXCore caches translations by guest address, and returning code
+/// addresses to the pool for reuse risks running a stale one. Images are about a
+/// megabyte, so leaking them costs far less than getting that wrong.
+void ReleaseProgramData(fathom::GuestAddressSpace& space, const LoadedProgram& program) {
+    if (program.stack.stack_base != 0 && program.stack.stack_size != 0) {
+        space.Release(program.stack.stack_base, program.stack.stack_size);
+    }
+    if (program.heap != 0) {
+        space.Release(program.heap, kHeapReservation);
+    }
+}
+
+/// One guest process: its own registers, its own file descriptors, its own heap. Fathom's
+/// processes share one address space -- see guest_console.h -- so what distinguishes them
+/// is exactly this, not the memory they can reach.
+struct GuestProcess {
+    int pid {};
+    int ppid {};
+    std::string path;
+
+    std::unique_ptr<DeferredThreadControl> control;
+    std::unique_ptr<fathom::LinuxSyscalls> syscalls;
+    std::unique_ptr<fathom::GuestThread> thread;
+    LoadedProgram program;
+    /// What this process was running before an execve replaced it, kept only so its
+    /// stack and heap can be given back once the switch is complete.
+    LoadedProgram previous_program;
+    bool has_previous {};
+
+    /// A pthread rather than a std::thread, purely so its stack can be sized. FEXCore's
+    /// dispatcher and the JIT's own frames live on it, and the default 512KB is nowhere
+    /// near enough -- the same reason the first guest thread is given 16MB by the caller.
+    pthread_t host_thread {};
+    bool thread_started {};
+
+    /// Where execve left the replacement image for this process's run loop to pick up.
+    uint64_t exec_entry {};
+    uint64_t exec_rsp {};
+
+    bool finished {};
+    int exit_status {};
+    /// A vforked parent waits for this: set when the child execs or exits, whichever
+    /// comes first, because either one means it is no longer using the parent's stack.
+    bool released {};
+};
+
+struct fathom_session final : fathom::ProcessHost {
     /// Shared by every guest process: one keyboard, one screen, one stop.
     fathom::GuestConsole console;
 
     std::unique_ptr<fathom::GuestAddressSpace> space;
-    std::unique_ptr<DeferredThreadControl> control;
-    std::unique_ptr<fathom::LinuxSyscalls> syscalls;
     std::unique_ptr<fathom::FexEngine> engine;
-    std::unique_ptr<fathom::GuestThread> thread;
 
     std::string program_path;
-    fathom::LoadedImage image {};
-    fathom::LoadedImage interpreter {};  ///< The dynamic loader, when the program needs one.
-    bool dynamic {};
-    fathom::StackImage stack {};
+    std::string guest_root;
+    uint64_t stack_size {};
+
+    // The process table. pid 1 is the program the session was created for; everything
+    // else got here through a fork.
+    mutable std::mutex process_mutex;
+    std::condition_variable process_changed;
+    std::map<int, std::unique_ptr<GuestProcess>> processes;
+    int next_pid {2};
+
+    /// pid 1's syscall layer, which is what the C API's console entry points talk to.
+    fathom::LinuxSyscalls* syscalls {};
+
+    GuestProcess* Find(int pid) {
+        const auto entry = processes.find(pid);
+        return entry == processes.end() ? nullptr : entry->second.get();
+    }
+
+    fathom::RunResult RunProcess(GuestProcess* process);
+    void ReleaseParent(GuestProcess* process);
+
+    // ProcessHost
+    int64_t ForkProcess(int caller_pid) override;
+    int64_t ExecProcess(int caller_pid, const std::string& path, std::vector<std::string> argv,
+                        std::vector<std::string> envp) override;
+    int64_t WaitForChild(int caller_pid, int wanted_pid, int* exit_status, int options) override;
 
     std::atomic<int> state {FATHOM_STATE_IDLE};
     std::atomic<int> exit_code {0};
@@ -118,6 +270,252 @@ struct fathom_session {
         return message;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Processes
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Matches the stack the first guest thread is given on the Swift side.
+constexpr size_t kGuestThreadStack = 16 * 1024 * 1024;
+
+struct ChildStart {
+    fathom_session* session;
+    GuestProcess* process;
+};
+
+void* RunChildThread(void* raw);
+
+} // namespace
+
+fathom::RunResult fathom_session::RunProcess(GuestProcess* process) {
+    fathom::RunResult result;
+    for (;;) {
+        result = process->thread->Run();
+        if (result.outcome != fathom::RunOutcome::Execed) {
+            break;
+        }
+
+        // execve unwound out of the JIT rather than returning, and left a freshly loaded
+        // image behind. The thread is replaced only now, once Run() has returned and the
+        // old thread's frames are gone from this host stack.
+        std::string reason;
+        auto fresh = engine->StartThread(process->exec_entry, process->exec_rsp, *process->syscalls,
+                                         reason);
+        if (fresh == nullptr) {
+            FATHOM_ERROR("execve could not start the new image: %s", reason.c_str());
+            result.outcome = fathom::RunOutcome::Faulted;
+            result.message = reason;
+            break;
+        }
+        process->thread = std::move(fresh);
+        process->control->Bind(process->thread.get());
+
+        // Safe only here: the replaced program's stack is no longer under any guest
+        // register, and its heap is unreachable.
+        if (process->has_previous) {
+            ReleaseProgramData(*space, process->previous_program);
+            process->has_previous = false;
+        }
+    }
+    return result;
+}
+
+void fathom_session::ReleaseParent(GuestProcess* process) {
+    {
+        std::scoped_lock lock {process_mutex};
+        process->released = true;
+    }
+    process_changed.notify_all();
+}
+
+int64_t fathom_session::ForkProcess(int caller_pid) {
+    GuestProcess* child_raw = nullptr;
+    int child_pid = 0;
+
+    {
+        std::scoped_lock lock {process_mutex};
+        auto* parent = Find(caller_pid);
+        if (parent == nullptr) {
+            return -1; // -EPERM
+        }
+        child_pid = next_pid++;
+
+        auto child = std::make_unique<GuestProcess>();
+        child->pid = child_pid;
+        child->ppid = caller_pid;
+        child->path = parent->path;
+        child->program = parent->program;
+        child->control = std::make_unique<DeferredThreadControl>();
+
+        fathom::SyscallConfig child_config;
+        child_config.guest_root = guest_root;
+        child_config.work_dir = "/";
+        child->syscalls = std::make_unique<fathom::LinuxSyscalls>(*space, *child->control, console,
+                                                                  child_config);
+        parent->syscalls->CloneInto(*child->syscalls);
+        child->syscalls->SetProcess(child_pid, caller_pid, this);
+
+        std::string reason;
+        child->thread = engine->ForkThread(*parent->thread, *child->syscalls, reason);
+        if (child->thread == nullptr) {
+            FATHOM_ERROR("fork failed: %s", reason.c_str());
+            return -11; // -EAGAIN
+        }
+        child->control->Bind(child->thread.get());
+
+        child_raw = child.get();
+        processes[child_pid] = std::move(child);
+    }
+
+    {
+        auto* start = new ChildStart {this, child_raw};
+        pthread_attr_t attributes;
+        pthread_attr_init(&attributes);
+        pthread_attr_setstacksize(&attributes, kGuestThreadStack);
+        const int created = pthread_create(&child_raw->host_thread, &attributes, &RunChildThread, start);
+        pthread_attr_destroy(&attributes);
+        if (created != 0) {
+            delete start;
+            FATHOM_ERROR("could not start a host thread for pid %d: %s", child_pid,
+                         std::strerror(created));
+            std::scoped_lock lock {process_mutex};
+            processes.erase(child_pid);
+            return -11; // -EAGAIN
+        }
+        child_raw->thread_started = true;
+    }
+
+    // The vfork bargain: the parent does not run again until the child has stopped using
+    // its memory, which happens at the child's execve or at its exit, whichever is first.
+    {
+        std::unique_lock lock {process_mutex};
+        process_changed.wait(lock, [&] { return child_raw->released || console.StopRequested(); });
+    }
+
+    FATHOM_INFO("fork: pid %d created pid %d", caller_pid, child_pid);
+    return child_pid;
+}
+
+int64_t fathom_session::ExecProcess(int caller_pid, const std::string& path,
+                                    std::vector<std::string> argv, std::vector<std::string> envp) {
+    GuestProcess* process = nullptr;
+    {
+        std::scoped_lock lock {process_mutex};
+        process = Find(caller_pid);
+    }
+    if (process == nullptr) {
+        return -1; // -EPERM
+    }
+
+    const std::string host_path = fathom::ResolveGuestPathOnHost(guest_root, path);
+    if (access(host_path.c_str(), R_OK) != 0) {
+        return -2; // -ENOENT
+    }
+    if (argv.empty()) {
+        argv.push_back(path);
+    }
+
+    LoadedProgram loaded;
+    std::string reason;
+    if (!LoadProgram(*space, guest_root, host_path, argv, envp, stack_size, &loaded, reason)) {
+        FATHOM_WARN("execve %s: %s", path.c_str(), reason.c_str());
+        return -8; // -ENOEXEC
+    }
+
+    process->previous_program = process->program;
+    process->has_previous = true;
+    process->program = loaded;
+    process->path = path;
+    process->exec_entry = loaded.entry;
+    process->exec_rsp = loaded.stack.rsp;
+    process->syscalls->AdoptImage(loaded.heap, kHeapReservation, path);
+
+    FATHOM_INFO("execve: pid %d is now %s (entry %#llx)", caller_pid, path.c_str(),
+                static_cast<unsigned long long>(loaded.entry));
+
+    // The child is done with its parent's stack, so a vforked parent may run again.
+    ReleaseParent(process);
+
+    // Never returns: unwinds out of the JIT, and this process's run loop restarts it on
+    // the image just loaded.
+    process->control->ExecGuest();
+}
+
+namespace {
+
+void* RunChildThread(void* raw) {
+    std::unique_ptr<ChildStart> start {static_cast<ChildStart*>(raw)};
+    auto* session = start->session;
+    auto* process = start->process;
+
+    const auto result = session->RunProcess(process);
+    ReleaseProgramData(*session->space, process->program);
+    {
+        std::scoped_lock lock {session->process_mutex};
+        process->finished = true;
+        process->exit_status = result.status;
+        process->released = true;
+    }
+    session->process_changed.notify_all();
+    return nullptr;
+}
+
+} // namespace
+
+int64_t fathom_session::WaitForChild(int caller_pid, int wanted_pid, int* exit_status, int options) {
+    constexpr int kWNoHang = 1;
+
+    std::unique_lock lock {process_mutex};
+    for (;;) {
+        bool any_children = false;
+        int reaped = 0;
+        for (const auto& [pid, candidate] : processes) {
+            if (candidate->ppid != caller_pid) {
+                continue;
+            }
+            if (wanted_pid > 0 && pid != wanted_pid) {
+                continue;
+            }
+            any_children = true;
+            if (candidate->finished) {
+                reaped = pid;
+                break;
+            }
+        }
+
+        if (reaped != 0) {
+            // Lifted out of the table before the lock is dropped, so nothing can reach a
+            // process that is about to be destroyed. The join has to happen outside the
+            // lock, and before the process it belongs to goes away.
+            auto node = processes.extract(reaped);
+            lock.unlock();
+            if (exit_status != nullptr) {
+                *exit_status = node.mapped()->exit_status;
+            }
+            if (node.mapped()->thread_started) {
+                pthread_join(node.mapped()->host_thread, nullptr);
+                node.mapped()->thread_started = false;
+            }
+            FATHOM_INFO("wait4: pid %d reaped pid %d (status %d)", caller_pid, reaped,
+                        node.mapped()->exit_status);
+            return reaped;
+        }
+
+        if (!any_children) {
+            return -10; // -ECHILD
+        }
+        if ((options & kWNoHang) != 0) {
+            return 0;
+        }
+        if (console.StopRequested()) {
+            return -4; // -EINTR
+        }
+        process_changed.wait_for(lock, std::chrono::milliseconds(100));
+    }
+}
+
 
 extern "C" {
 
@@ -192,10 +590,6 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     }
     session->state.store(FATHOM_STATE_LOADING);
 
-    const auto inspection = fathom::InspectElf(session->program_path);
-    if (!inspection.ok) {
-        return fail(inspection.error);
-    }
     std::string reason;
     const uint64_t arena_size =
         config->address_space_size != 0 ? config->address_space_size : kDefaultAddressSpace;
@@ -204,36 +598,8 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
         return fail(reason);
     }
 
-    if (!fathom::LoadElf(session->program_path, *session->space, 0, &session->image, reason)) {
-        return fail(reason);
-    }
-
-    // A dynamically linked program does not begin at its own entry point. The kernel maps
-    // its interpreter -- ld.so -- alongside it and enters *that*; ld.so then loads the
-    // shared libraries the program needs and jumps to the program itself. AT_BASE on the
-    // initial stack is how ld.so discovers where it was placed.
-    if (inspection.kind == fathom::ProgramKind::Dynamic) {
-        const std::string guest_root = config->guest_root == nullptr ? "" : config->guest_root;
-        if (guest_root.empty()) {
-            return fail("this program is dynamically linked and needs " + inspection.interpreter +
-                        ", but no guest root filesystem is configured.");
-        }
-        const std::string loader = fathom::ResolveGuestPathOnHost(guest_root, inspection.interpreter);
-        if (access(loader.c_str(), R_OK) != 0) {
-            return fail("this program needs its dynamic loader, " + inspection.interpreter +
-                        ", which the guest root filesystem does not provide. Install a root "
-                        "filesystem that contains it.");
-        }
-        if (!fathom::LoadElf(loader, *session->space, session->image.image_end,
-                             &session->interpreter, reason)) {
-            return fail("could not load the dynamic loader " + inspection.interpreter + ": " + reason);
-        }
-        session->dynamic = true;
-        FATHOM_INFO("dynamic: loader %s based at %#llx, program entry %#llx",
-                    inspection.interpreter.c_str(),
-                    static_cast<unsigned long long>(session->interpreter.load_base),
-                    static_cast<unsigned long long>(session->image.entry));
-    }
+    session->guest_root = config->guest_root == nullptr ? "" : config->guest_root;
+    session->stack_size = config->stack_size != 0 ? config->stack_size : kDefaultStack;
 
     std::vector<std::string> argv;
     if (config->argv != nullptr && config->argc > 0) {
@@ -253,33 +619,31 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
         }
     }
 
-    const uint64_t stack_size = config->stack_size != 0 ? config->stack_size : kDefaultStack;
-    if (!fathom::BuildInitialStack(*session->space, session->image, argv, envp, session->program_path,
-                                   session->dynamic ? session->interpreter.load_base : 0,
-                                   stack_size, &session->stack, reason)) {
+    auto process = std::make_unique<GuestProcess>();
+    process->pid = 1;
+    process->ppid = 0;
+    process->path = session->program_path;
+
+    if (!LoadProgram(*session->space, session->guest_root, session->program_path, argv, envp,
+                     session->stack_size, &process->program, reason)) {
         return fail(reason);
+    }
+    if (process->program.dynamic) {
+        FATHOM_INFO("dynamic: loader based at %#llx, program entry %#llx",
+                    static_cast<unsigned long long>(process->program.interpreter.load_base),
+                    static_cast<unsigned long long>(process->program.image.entry));
     }
 
     fathom::SyscallConfig syscall_config;
-    syscall_config.guest_root = config->guest_root == nullptr ? "" : config->guest_root;
+    syscall_config.guest_root = session->guest_root;
     syscall_config.work_dir = config->work_dir == nullptr ? "/" : config->work_dir;
     syscall_config.trace = config->trace_syscalls;
 
-    session->control = std::make_unique<DeferredThreadControl>();
-    session->syscalls =
-        std::make_unique<fathom::LinuxSyscalls>(*session->space, *session->control, session->console,
-                                                syscall_config);
-
-    // The heap is placed right after the image so a guest malloc that walks up from brk
-    // sees the layout it expects. It is reserved, not touched -- nothing is paged in
-    // until the guest actually writes.
-    const uint64_t images_end = std::max(session->image.image_end, session->interpreter.image_end);
-    const uint64_t heap = session->space->Allocate(kHeapReservation, images_end,
-                                                  fathom::kGuestProtRead | fathom::kGuestProtWrite);
-    if (heap == 0) {
-        return fail("could not reserve the guest heap");
-    }
-    session->syscalls->InitialiseHeap(heap, kHeapReservation);
+    process->control = std::make_unique<DeferredThreadControl>();
+    process->syscalls = std::make_unique<fathom::LinuxSyscalls>(*session->space, *process->control,
+                                                                session->console, syscall_config);
+    process->syscalls->InitialiseHeap(process->program.heap, kHeapReservation);
+    process->syscalls->SetProcess(1, 0, session.get());
 
     fathom::EngineOptions options;
     options.max_inst_per_block = config->max_inst_per_block;
@@ -293,12 +657,15 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
         return fail(reason);
     }
 
-    const uint64_t start = session->dynamic ? session->interpreter.entry : session->image.entry;
-    session->thread = session->engine->StartThread(start, session->stack.rsp, *session->syscalls, reason);
-    if (session->thread == nullptr) {
+    process->thread = session->engine->StartThread(process->program.entry, process->program.stack.rsp,
+                                                   *process->syscalls, reason);
+    if (process->thread == nullptr) {
         return fail(reason);
     }
-    session->control->Bind(session->thread.get());
+    process->control->Bind(process->thread.get());
+
+    session->syscalls = process->syscalls.get();
+    session->processes[1] = std::move(process);
 
     session->state.store(FATHOM_STATE_IDLE);
     session->SetMessage("ready");
@@ -348,14 +715,18 @@ bool fathom_session_wants_keys(fathom_session* session) {
 }
 
 int fathom_session_run(fathom_session* session) {
-    if (session == nullptr || session->thread == nullptr) {
+    if (session == nullptr || session->processes.empty()) {
+        return -1;
+    }
+    auto* init = session->Find(1);
+    if (init == nullptr) {
         return -1;
     }
 
     session->state.store(FATHOM_STATE_RUNNING);
     session->SetMessage("running");
 
-    const auto result = session->thread->Run();
+    const auto result = session->RunProcess(init);
 
     switch (result.outcome) {
     case fathom::RunOutcome::Exited:
@@ -402,8 +773,9 @@ void fathom_session_get_status(fathom_session* session, fathom_session_status* o
     out_status->state = static_cast<fathom_session_state>(session->state.load());
     out_status->exit_code = session->exit_code.load();
     if (session->engine != nullptr) {
-        out_status->rip = session->thread->Rip();
-        out_status->rsp = session->thread->Rsp();
+        auto* init = const_cast<fathom_session*>(session)->Find(1);
+        out_status->rip = init == nullptr ? 0 : init->thread->Rip();
+        out_status->rsp = init == nullptr ? 0 : init->thread->Rsp();
     }
     if (session->syscalls != nullptr) {
         out_status->syscall_count = session->syscalls->SyscallCount();
@@ -415,11 +787,30 @@ void fathom_session_destroy(fathom_session* session) {
     if (session == nullptr) {
         return;
     }
-    // Ordering matters: the engine holds the FEXCore thread that can still call into the
-    // syscall layer, and the syscall layer holds descriptors into the address space.
+    // Ordering matters. Every process holds a FEXCore thread that can still call into
+    // its syscall layer, and those hold descriptors into the address space, so the
+    // processes go first -- and any still running are stopped and joined before their
+    // state is torn out from under them.
+    session->console.RequestStop();
+    {
+        std::vector<pthread_t> running;
+        {
+            std::scoped_lock lock {session->process_mutex};
+            for (auto& [pid, process] : session->processes) {
+                if (process->thread_started) {
+                    running.push_back(process->host_thread);
+                    process->thread_started = false;
+                }
+            }
+        }
+        session->process_changed.notify_all();
+        for (auto thread : running) {
+            pthread_join(thread, nullptr);
+        }
+    }
+    session->processes.clear();
+    session->syscalls = nullptr;
     session->engine.reset();
-    session->syscalls.reset();
-    session->control.reset();
     session->space.reset();
     delete session;
 }

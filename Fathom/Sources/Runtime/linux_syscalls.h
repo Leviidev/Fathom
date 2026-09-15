@@ -41,6 +41,34 @@ public:
 
     /// Unwinds out of the JIT and ends the run. Never returns.
     [[noreturn]] virtual void ExitGuest(int status) = 0;
+
+    /// Unwinds out of the JIT so the process can restart on a newly loaded image.
+    [[noreturn]] virtual void ExecGuest() = 0;
+};
+
+class LinuxSyscalls;
+
+/// What the syscall layer needs from whatever owns the process table.
+///
+/// fork, execve and wait4 are the three syscalls a process cannot answer by itself: they
+/// are about the set of processes, not about this one. Everything to do with creating
+/// threads, loading images and reaping children lives on the other side of this.
+class ProcessHost {
+public:
+    virtual ~ProcessHost() = default;
+
+    /// Creates a child sharing this process's memory, and blocks the caller until that
+    /// child execs or exits -- vfork's bargain, and what makes sharing memory safe.
+    /// Returns the child's pid, or a negated errno.
+    virtual int64_t ForkProcess(int caller_pid) = 0;
+
+    /// Loads `path` for the calling process. On success the caller does not return here:
+    /// it unwinds out of the JIT and is restarted on the new image.
+    virtual int64_t ExecProcess(int caller_pid, const std::string& path,
+                                std::vector<std::string> argv, std::vector<std::string> envp) = 0;
+
+    /// Blocks until a child exits. Returns the reaped pid, or a negated errno.
+    virtual int64_t WaitForChild(int caller_pid, int wanted_pid, int* exit_status, int options) = 0;
 };
 
 struct SyscallConfig {
@@ -53,6 +81,17 @@ class LinuxSyscalls {
 public:
     LinuxSyscalls(GuestAddressSpace& space, GuestThreadControl& control, GuestConsole& console,
                   SyscallConfig config);
+
+    /// Who this process is, and who owns the table it belongs to. Set once, before it runs.
+    void SetProcess(int pid, int ppid, ProcessHost* host);
+    int Pid() const { return pid_; }
+
+    /// Duplicates this process's open files, working directory and heap into `child`,
+    /// which is what a fork inherits.
+    void CloneInto(LinuxSyscalls& child) const;
+
+    /// Points the process at a new program image after an execve.
+    void AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const std::string& path);
     ~LinuxSyscalls();
 
     /// Entry point from FEXCore. `number` is RAX; the arguments are RDI, RSI, RDX, R10,
@@ -101,6 +140,7 @@ private:
     // Guest memory helpers. Every pointer a guest hands over is checked before use --
     // a wild guest pointer must fail the syscall, not fault the whole app.
     bool ReadGuestString(uint64_t address, std::string* out, size_t limit = 4096) const;
+    bool ReadGuestStringArray(uint64_t address, std::vector<std::string>* out) const;
     void* GuestPointer(uint64_t address, uint64_t size, bool writable) const;
 
     /// The switch itself. Split out from Handle so tracing can wrap it and log what
@@ -134,6 +174,10 @@ private:
     GuestThreadControl& control_;
     GuestConsole& console_;
     SyscallConfig config_;
+
+    int pid_ {1};
+    int ppid_ {0};
+    ProcessHost* host_ {};
 
     mutable std::mutex mutex_;
     std::map<int, OpenFile> files_;

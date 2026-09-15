@@ -32,6 +32,7 @@ enum class RunOutcome {
     Exited,   ///< The guest called exit/exit_group.
     Halted,   ///< The guest executed HLT, or ran off the end of its code.
     Stopped,  ///< fathom_session_request_stop unwound it.
+    Execed,   ///< The guest called execve; the caller runs the new image on a new thread.
     Faulted,
 };
 
@@ -65,6 +66,12 @@ public:
     /// Points this thread at a freshly loaded program image, which is what execve does:
     /// same thread, same pid, entirely different program.
     void ResetTo(uint64_t rip, uint64_t rsp);
+
+    /// Unwinds out of the JIT so the process can be restarted on a freshly loaded image.
+    /// execve cannot simply rewrite this thread's registers: the syscall that asked for it
+    /// is still several JIT frames deep, and the only way out of there is the same unwind
+    /// that exit uses.
+    [[noreturn]] void ExecGuest() override;
 
     // GuestThreadControl
     void SetFsBase(uint64_t base) override;

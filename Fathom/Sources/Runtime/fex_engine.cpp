@@ -380,6 +380,7 @@ public:
     FEXCore::UncheckedLongJump::JumpBuf exit_jump {};
     bool exit_jump_armed {};
     int exit_status {};
+    bool exec_requested {};
 };
 
 GuestThread::GuestThread(std::unique_ptr<Impl> impl)
@@ -416,7 +417,12 @@ RunResult GuestThread::Run() {
         // Reached by the long jump out of exit_group, which skips the clear above.
         g_active = ActiveExecution {};
         impl_->exit_jump_armed = false;
-        if (impl_->syscalls.StopRequested()) {
+        if (impl_->exec_requested) {
+            impl_->exec_requested = false;
+            result.outcome = RunOutcome::Execed;
+            result.status = 0;
+            result.message = "execve";
+        } else if (impl_->syscalls.StopRequested()) {
             result.outcome = RunOutcome::Stopped;
             result.status = -1;
             result.message = "stopped";
@@ -464,6 +470,15 @@ void GuestThread::SetFsBase(uint64_t base) {
 
 uint64_t GuestThread::GetFsBase() const {
     return impl_->thread == nullptr ? 0 : impl_->thread->CurrentFrame->State.fs_cached;
+}
+
+void GuestThread::ExecGuest() {
+    impl_->exec_requested = true;
+    if (impl_->exit_jump_armed) {
+        FEXCore::UncheckedLongJump::LongJump(impl_->exit_jump, 1);
+    }
+    FATHOM_ERROR("execve requested with no unwind point; aborting");
+    std::abort();
 }
 
 void GuestThread::ExitGuest(int status) {

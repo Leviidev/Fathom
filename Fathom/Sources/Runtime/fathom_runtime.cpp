@@ -95,6 +95,7 @@ struct fathom_session {
     std::unique_ptr<DeferredThreadControl> control;
     std::unique_ptr<fathom::LinuxSyscalls> syscalls;
     std::unique_ptr<fathom::FexEngine> engine;
+    std::unique_ptr<fathom::GuestThread> thread;
 
     std::string program_path;
     fathom::LoadedImage image {};
@@ -287,16 +288,17 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     options.reduced_precision_x87 = config->reduced_precision_x87;
     options.disassemble = false;
 
-    session->engine = fathom::FexEngine::Create(*session->space, *session->syscalls, options, reason);
+    session->engine = fathom::FexEngine::Create(*session->space, options, reason);
     if (session->engine == nullptr) {
         return fail(reason);
     }
-    session->control->Bind(session->engine.get());
 
     const uint64_t start = session->dynamic ? session->interpreter.entry : session->image.entry;
-    if (!session->engine->Prepare(start, session->stack.rsp, reason)) {
+    session->thread = session->engine->StartThread(start, session->stack.rsp, *session->syscalls, reason);
+    if (session->thread == nullptr) {
         return fail(reason);
     }
+    session->control->Bind(session->thread.get());
 
     session->state.store(FATHOM_STATE_IDLE);
     session->SetMessage("ready");
@@ -346,14 +348,14 @@ bool fathom_session_wants_keys(fathom_session* session) {
 }
 
 int fathom_session_run(fathom_session* session) {
-    if (session == nullptr || session->engine == nullptr) {
+    if (session == nullptr || session->thread == nullptr) {
         return -1;
     }
 
     session->state.store(FATHOM_STATE_RUNNING);
     session->SetMessage("running");
 
-    const auto result = session->engine->Run();
+    const auto result = session->thread->Run();
 
     switch (result.outcome) {
     case fathom::RunOutcome::Exited:
@@ -400,8 +402,8 @@ void fathom_session_get_status(fathom_session* session, fathom_session_status* o
     out_status->state = static_cast<fathom_session_state>(session->state.load());
     out_status->exit_code = session->exit_code.load();
     if (session->engine != nullptr) {
-        out_status->rip = session->engine->Rip();
-        out_status->rsp = session->engine->Rsp();
+        out_status->rip = session->thread->Rip();
+        out_status->rsp = session->thread->Rsp();
     }
     if (session->syscalls != nullptr) {
         out_status->syscall_count = session->syscalls->SyscallCount();

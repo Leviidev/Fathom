@@ -1,8 +1,14 @@
 // fex_engine.h -- the FEXCore embedding.
 //
 // This is the only file that knows FEXCore exists. It owns the context, the guest
-// thread, the syscall handler FEXCore calls into, and the mechanism that unwinds out of
-// the JIT when the guest exits.
+// threads, the syscall handler FEXCore calls into, and the mechanism that unwinds out of
+// the JIT when a guest thread exits.
+//
+// The split between the two classes here is the process model. FEXCore's *context* is the
+// JIT and its code cache, and there is one of those. A *guest thread* is a register file,
+// a stack and an unwind point, and there is one per thread of guest execution -- which,
+// in Fathom, is also one per guest process, because processes are guest threads that do
+// not share a file descriptor table.
 #pragma once
 
 #include "guest_memory.h"
@@ -37,29 +43,59 @@ struct RunResult {
     std::string message;
 };
 
-class FexEngine : public GuestThreadControl {
+class FexEngine;
+
+/// One thread of guest execution, with its own registers, call/return stack and unwind
+/// point. Its syscalls are answered by the LinuxSyscalls it was created with, which is
+/// what gives a forked child its own file descriptor table.
+class GuestThread final : public GuestThreadControl {
 public:
-    static std::unique_ptr<FexEngine> Create(GuestAddressSpace& space, LinuxSyscalls& syscalls,
-                                             const EngineOptions& options, std::string& error);
-    ~FexEngine() override;
+    ~GuestThread() override;
 
-    FexEngine(const FexEngine&) = delete;
-    FexEngine& operator=(const FexEngine&) = delete;
+    GuestThread(const GuestThread&) = delete;
+    GuestThread& operator=(const GuestThread&) = delete;
 
-    /// Creates the guest thread at the program's entry point.
-    bool Prepare(uint64_t rip, uint64_t rsp, std::string& error);
-
-    /// Runs until the guest stops. Blocking, and only valid on the thread that called
-    /// Prepare -- FEXCore binds a guest thread to the host thread executing it.
+    /// Runs until this thread stops. Blocking, and valid only on the host thread that
+    /// owns it -- FEXCore binds a guest thread to the host thread executing it.
     RunResult Run();
 
     uint64_t Rip() const;
     uint64_t Rsp() const;
 
+    /// Points this thread at a freshly loaded program image, which is what execve does:
+    /// same thread, same pid, entirely different program.
+    void ResetTo(uint64_t rip, uint64_t rsp);
+
     // GuestThreadControl
     void SetFsBase(uint64_t base) override;
     uint64_t GetFsBase() const override;
     [[noreturn]] void ExitGuest(int status) override;
+
+private:
+    friend class FexEngine;
+    class Impl;
+    explicit GuestThread(std::unique_ptr<Impl> impl);
+
+    std::unique_ptr<Impl> impl_;
+};
+
+class FexEngine {
+public:
+    static std::unique_ptr<FexEngine> Create(GuestAddressSpace& space, const EngineOptions& options,
+                                             std::string& error);
+    ~FexEngine();
+
+    FexEngine(const FexEngine&) = delete;
+    FexEngine& operator=(const FexEngine&) = delete;
+
+    /// A program's first thread, entering at its entry point with a defined register file.
+    std::unique_ptr<GuestThread> StartThread(uint64_t rip, uint64_t rsp, LinuxSyscalls& syscalls,
+                                             std::string& error);
+
+    /// A thread whose registers are a copy of `parent`'s, except that RAX is zero: that
+    /// difference is the whole of what fork returns to a child.
+    std::unique_ptr<GuestThread> ForkThread(const GuestThread& parent, LinuxSyscalls& syscalls,
+                                            std::string& error);
 
     static const char* FexRevision();
 

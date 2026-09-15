@@ -271,11 +271,15 @@ public:
     }
 };
 
+/// Whose syscalls to answer. FEXCore has one syscall handler per context, but Fathom has
+/// one LinuxSyscalls per process, so the handler has to route to whichever guest thread
+/// is currently executing on this host thread.
+thread_local LinuxSyscalls* g_current_syscalls = nullptr;
+
 class FathomSyscallHandler final : public FEXCore::HLE::SyscallHandler {
 public:
-    FathomSyscallHandler(LinuxSyscalls& syscalls, GuestAddressSpace& space)
-        : syscalls_ {syscalls}
-        , space_ {space} {
+    explicit FathomSyscallHandler(GuestAddressSpace& space)
+        : space_ {space} {
         // OS_LINUX64 tells the JIT the guest's syscall ABI, so it hands the arguments
         // over in registers rather than spilling the entire CPU state on every call.
         OSABI = FEXCore::HLE::SyscallOSABI::OS_LINUX64;
@@ -290,7 +294,12 @@ public:
         if (frame != nullptr) {
             NoteGuestRip(frame->State.rip);
         }
-        return syscalls_.Handle(args->Argument[0], args->Argument[1], args->Argument[2],
+        auto* syscalls = g_current_syscalls;
+        if (syscalls == nullptr) {
+            FATHOM_ERROR("syscall on a host thread with no guest thread bound");
+            return static_cast<uint64_t>(-38); // -ENOSYS
+        }
+        return syscalls->Handle(args->Argument[0], args->Argument[1], args->Argument[2],
                                 args->Argument[3], args->Argument[4], args->Argument[5],
                                 args->Argument[6]);
     }
@@ -311,23 +320,21 @@ public:
     }
 
 private:
-    LinuxSyscalls& syscalls_;
     GuestAddressSpace& space_;
 };
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// The context
+// ---------------------------------------------------------------------------
+
 class FexEngine::Impl {
 public:
-    Impl(GuestAddressSpace& space, LinuxSyscalls& syscalls)
-        : space {space}
-        , syscalls {syscalls} {}
+    explicit Impl(GuestAddressSpace& space)
+        : space {space} {}
 
     ~Impl() {
-        if (context != nullptr && thread != nullptr) {
-            context->DestroyThread(thread);
-            thread = nullptr;
-        }
         context.reset();
         if (config_held) {
             ConfigLease::Release();
@@ -335,12 +342,37 @@ public:
     }
 
     GuestAddressSpace& space;
-    LinuxSyscalls& syscalls;
 
     FEXCore::HostFeatures host_features {};
     fextl::unique_ptr<FEXCore::Context::Context> context;
     std::unique_ptr<FathomSignalDelegator> signals;
     std::unique_ptr<FathomSyscallHandler> handler;
+    bool config_held {};
+};
+
+// ---------------------------------------------------------------------------
+// A thread
+// ---------------------------------------------------------------------------
+
+class GuestThread::Impl {
+public:
+    Impl(FEXCore::Context::Context* context, LinuxSyscalls& syscalls)
+        : context {context}
+        , syscalls {syscalls} {}
+
+    ~Impl() {
+        if (context != nullptr && thread != nullptr) {
+            context->DestroyThread(thread);
+            thread = nullptr;
+        }
+    }
+
+    FEXCore::Context::Context* context {};
+    LinuxSyscalls& syscalls;
+
+    // Per thread, all of it. The call/return stack and the segment table are pointed at
+    // from the register file, so a forked child needs its own rather than the copies it
+    // would otherwise inherit from its parent.
     std::unique_ptr<CallRetStack> callret;
     GuestSegments segments;
     FEXCore::Core::InternalThreadState* thread {};
@@ -348,105 +380,23 @@ public:
     FEXCore::UncheckedLongJump::JumpBuf exit_jump {};
     bool exit_jump_armed {};
     int exit_status {};
-    bool exit_requested {};
-    bool config_held {};
 };
 
-FexEngine::FexEngine(std::unique_ptr<Impl> impl)
+GuestThread::GuestThread(std::unique_ptr<Impl> impl)
     : impl_ {std::move(impl)} {}
 
-FexEngine::~FexEngine() = default;
+GuestThread::~GuestThread() = default;
 
-const char* FexEngine::FexRevision() {
-#ifdef GIT_DESCRIBE_STRING
-    return GIT_DESCRIBE_STRING;
-#else
-    return "unknown";
-#endif
-}
-
-std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, LinuxSyscalls& syscalls,
-                                             const EngineOptions& options, std::string& error) {
-    auto impl = std::make_unique<Impl>(space, syscalls);
-
-    ConfigLease::Acquire(options);
-    impl->config_held = true;
-
-    // Reads the real CPU through sysctl rather than the ID_AA64* system registers Linux
-    // exposes -- those fault on Darwin, which is one of the fixes that made this FEXCore
-    // tree work on Apple hardware at all.
-    impl->host_features = FEX::FetchHostFeatures();
-
-    impl->context = FEXCore::Context::Context::CreateNewContext(impl->host_features);
-    if (impl->context == nullptr) {
-        error = "FEXCore refused to create a context";
-        return nullptr;
-    }
-
-    impl->signals = std::make_unique<FathomSignalDelegator>();
-    impl->handler = std::make_unique<FathomSyscallHandler>(syscalls, space);
-    impl->context->SetSignalDelegator(impl->signals.get());
-    impl->context->SetSyscallHandler(impl->handler.get());
-
-    // A guest that executes HLT should stop the run, not trap. Normal exits come through
-    // exit_group instead, but a jump into unmapped-but-zeroed memory tends to land here.
-    impl->context->EnableExitOnHLT();
-
-    if (!impl->context->InitCore()) {
-        error = "FEXCore could not initialise its JIT. On iOS this is what a missing JIT "
-                "permission looks like: the code buffers cannot be made executable.";
-        return nullptr;
-    }
-
-    // From here on, a guest alignment fault is recoverable rather than fatal.
-    SetFaultRecovery(RecoverAlignmentFault);
-
-    FATHOM_INFO("FEXCore context ready (AVX=%d, SVE128=%d, cache line %u)",
-                impl->host_features.SupportsAVX ? 1 : 0, impl->host_features.SupportsSVE128 ? 1 : 0,
-                impl->host_features.DCacheLineSize);
-    return std::unique_ptr<FexEngine> {new FexEngine {std::move(impl)}};
-}
-
-bool FexEngine::Prepare(uint64_t rip, uint64_t rsp, std::string& error) {
-    impl_->callret = std::make_unique<CallRetStack>();
-    if (!impl_->callret->valid()) {
-        error = std::string {"could not reserve the call/return stack: "} +
-                std::strerror(impl_->callret->error());
-        return false;
-    }
-
-    impl_->thread = impl_->context->CreateThread(rip, rsp);
-    if (impl_->thread == nullptr) {
-        error = "FEXCore could not create the guest thread";
-        return false;
-    }
-
-    auto& state = impl_->thread->CurrentFrame->State;
-    impl_->segments.Initialise(state);
-    impl_->callret->Attach(impl_->thread);
-    state.rip = rip;
-    state.gregs[FEXCore::X86State::REG_RSP] = rsp;
-
-    // A freshly executed Linux program starts with a defined flag state: bit 1 is
-    // reserved and always set, everything else clear.
-    impl_->context->SetFlagsFromCompactedEFLAGS(impl_->thread, 1U << 1);
-
-    std::array<__uint128_t, FEXCore::Core::CPUState::NUM_XMMS> xmm {};
-    std::array<__uint128_t, FEXCore::Core::CPUState::NUM_XMMS> ymm_high {};
-    impl_->context->SetXMMRegistersFromState(impl_->thread, xmm.data(),
-                                             impl_->host_features.SupportsAVX ? ymm_high.data() : nullptr);
-
-    FATHOM_INFO("guest thread ready: rip=%#llx rsp=%#llx", static_cast<unsigned long long>(rip),
-                static_cast<unsigned long long>(rsp));
-    return true;
-}
-
-RunResult FexEngine::Run() {
+RunResult GuestThread::Run() {
     RunResult result;
     if (impl_->thread == nullptr) {
         result.message = "no guest thread";
         return result;
     }
+
+    // Bound for the duration of the run: the syscall handler is shared by every thread in
+    // the context and finds this thread's syscall state through it.
+    g_current_syscalls = &impl_->syscalls;
 
     // The guest leaves the JIT one of two ways. A clean HLT returns from ExecuteThread
     // normally; exit_group happens deep inside a syscall with JIT frames still on the
@@ -454,7 +404,7 @@ RunResult FexEngine::Run() {
     // exit does exactly this, which is why FEXCore ships the jump buffer used here.
     if (FEXCore::UncheckedLongJump::SetJump(impl_->exit_jump) == 0) {
         impl_->exit_jump_armed = true;
-        g_active = ActiveExecution {impl_->context.get(), impl_->thread};
+        g_active = ActiveExecution {impl_->context, impl_->thread};
         impl_->context->ExecuteThread(impl_->thread);
         g_active = ActiveExecution {};
         impl_->exit_jump_armed = false;
@@ -477,8 +427,7 @@ RunResult FexEngine::Run() {
         }
     }
 
-    FATHOM_INFO("run ended: %llu guest alignment faults recovered",
-                static_cast<unsigned long long>(g_alignment_fixups.load(std::memory_order_relaxed)));
+    g_current_syscalls = nullptr;
 
     const auto& state = impl_->thread->CurrentFrame->State;
     result.rip = state.rip;
@@ -486,28 +435,39 @@ RunResult FexEngine::Run() {
     return result;
 }
 
-uint64_t FexEngine::Rip() const {
+void GuestThread::ResetTo(uint64_t rip, uint64_t rsp) {
+    // A register file, cleared wholesale: CPUState has no copy assignment, and byte-wise
+    // is what "a fresh set of registers" actually means here.
+    auto& state = impl_->thread->CurrentFrame->State;
+    std::memset(&state, 0, sizeof(state));
+    impl_->segments.Initialise(state);
+    impl_->callret->Attach(impl_->thread);
+    state.rip = rip;
+    state.gregs[FEXCore::X86State::REG_RSP] = rsp;
+    impl_->context->SetFlagsFromCompactedEFLAGS(impl_->thread, 1U << 1);
+}
+
+uint64_t GuestThread::Rip() const {
     return impl_->thread == nullptr ? 0 : impl_->thread->CurrentFrame->State.rip;
 }
 
-uint64_t FexEngine::Rsp() const {
+uint64_t GuestThread::Rsp() const {
     return impl_->thread == nullptr ? 0
                                     : impl_->thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP];
 }
 
-void FexEngine::SetFsBase(uint64_t base) {
+void GuestThread::SetFsBase(uint64_t base) {
     if (impl_->thread != nullptr) {
         impl_->thread->CurrentFrame->State.fs_cached = base;
     }
 }
 
-uint64_t FexEngine::GetFsBase() const {
+uint64_t GuestThread::GetFsBase() const {
     return impl_->thread == nullptr ? 0 : impl_->thread->CurrentFrame->State.fs_cached;
 }
 
-void FexEngine::ExitGuest(int status) {
+void GuestThread::ExitGuest(int status) {
     impl_->exit_status = status;
-    impl_->exit_requested = true;
     if (impl_->exit_jump_armed) {
         FEXCore::UncheckedLongJump::LongJump(impl_->exit_jump, 1);
     }
@@ -515,6 +475,138 @@ void FexEngine::ExitGuest(int status) {
     // instruction, so there is no window where a guest syscall arrives without it.
     FATHOM_ERROR("guest exit requested with no unwind point; aborting");
     std::abort();
+}
+
+// ---------------------------------------------------------------------------
+// Creating them
+// ---------------------------------------------------------------------------
+
+FexEngine::FexEngine(std::unique_ptr<Impl> impl)
+    : impl_ {std::move(impl)} {}
+
+FexEngine::~FexEngine() = default;
+
+const char* FexEngine::FexRevision() {
+#ifdef GIT_DESCRIBE_STRING
+    return GIT_DESCRIBE_STRING;
+#else
+    return "unknown";
+#endif
+}
+
+std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const EngineOptions& options,
+                                             std::string& error) {
+    auto impl = std::make_unique<Impl>(space);
+
+    ConfigLease::Acquire(options);
+    impl->config_held = true;
+
+    // Reads the real CPU through sysctl rather than the ID_AA64* system registers Linux
+    // exposes -- those fault on Darwin, which is one of the fixes that made this FEXCore
+    // tree work on Apple hardware at all.
+    impl->host_features = FEX::FetchHostFeatures();
+
+    impl->context = FEXCore::Context::Context::CreateNewContext(impl->host_features);
+    if (impl->context == nullptr) {
+        error = "FEXCore refused to create a context";
+        return nullptr;
+    }
+
+    impl->signals = std::make_unique<FathomSignalDelegator>();
+    impl->handler = std::make_unique<FathomSyscallHandler>(space);
+    impl->context->SetSignalDelegator(impl->signals.get());
+    impl->context->SetSyscallHandler(impl->handler.get());
+
+    // A guest that executes HLT should stop the run, not trap. Normal exits come through
+    // exit_group instead, but a jump into unmapped-but-zeroed memory tends to land here.
+    impl->context->EnableExitOnHLT();
+
+    if (!impl->context->InitCore()) {
+        error = "FEXCore could not initialise its JIT. On iOS this is what a missing JIT "
+                "permission looks like: the code buffers cannot be made executable.";
+        return nullptr;
+    }
+
+    // From here on, a guest alignment fault is recoverable rather than fatal.
+    SetFaultRecovery(RecoverAlignmentFault);
+
+    FATHOM_INFO("FEXCore context ready (AVX=%d, SVE128=%d, cache line %u)",
+                impl->host_features.SupportsAVX ? 1 : 0, impl->host_features.SupportsSVE128 ? 1 : 0,
+                impl->host_features.DCacheLineSize);
+    return std::unique_ptr<FexEngine> {new FexEngine {std::move(impl)}};
+}
+
+std::unique_ptr<GuestThread> FexEngine::StartThread(uint64_t rip, uint64_t rsp, LinuxSyscalls& syscalls,
+                                                    std::string& error) {
+    auto impl = std::make_unique<GuestThread::Impl>(impl_->context.get(), syscalls);
+
+    impl->callret = std::make_unique<CallRetStack>();
+    if (!impl->callret->valid()) {
+        error = std::string {"could not reserve the call/return stack: "} +
+                std::strerror(impl->callret->error());
+        return nullptr;
+    }
+
+    impl->thread = impl_->context->CreateThread(rip, rsp);
+    if (impl->thread == nullptr) {
+        error = "FEXCore could not create the guest thread";
+        return nullptr;
+    }
+
+    auto& state = impl->thread->CurrentFrame->State;
+    impl->segments.Initialise(state);
+    impl->callret->Attach(impl->thread);
+    state.rip = rip;
+    state.gregs[FEXCore::X86State::REG_RSP] = rsp;
+
+    // A freshly executed Linux program starts with a defined flag state: bit 1 is
+    // reserved and always set, everything else clear.
+    impl_->context->SetFlagsFromCompactedEFLAGS(impl->thread, 1U << 1);
+
+    std::array<__uint128_t, FEXCore::Core::CPUState::NUM_XMMS> xmm {};
+    std::array<__uint128_t, FEXCore::Core::CPUState::NUM_XMMS> ymm_high {};
+    impl_->context->SetXMMRegistersFromState(impl->thread, xmm.data(),
+                                             impl_->host_features.SupportsAVX ? ymm_high.data() : nullptr);
+
+    FATHOM_INFO("guest thread ready: rip=%#llx rsp=%#llx", static_cast<unsigned long long>(rip),
+                static_cast<unsigned long long>(rsp));
+    return std::unique_ptr<GuestThread> {new GuestThread {std::move(impl)}};
+}
+
+std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, LinuxSyscalls& syscalls,
+                                                   std::string& error) {
+    const auto& parent_state = parent.impl_->thread->CurrentFrame->State;
+
+    auto impl = std::make_unique<GuestThread::Impl>(impl_->context.get(), syscalls);
+    impl->callret = std::make_unique<CallRetStack>();
+    if (!impl->callret->valid()) {
+        error = std::string {"could not reserve the child's call/return stack: "} +
+                std::strerror(impl->callret->error());
+        return nullptr;
+    }
+
+    impl->thread = impl_->context->CreateThread(parent_state.rip,
+                                                parent_state.gregs[FEXCore::X86State::REG_RSP]);
+    if (impl->thread == nullptr) {
+        error = "FEXCore could not create the child guest thread";
+        return nullptr;
+    }
+
+    // The child is its parent, register for register, except for RAX. That single
+    // difference is how a program knows which side of a fork it is on.
+    auto& state = impl->thread->CurrentFrame->State;
+    std::memcpy(&state, &parent_state, sizeof(state));
+    state.gregs[FEXCore::X86State::REG_RAX] = 0;
+
+    // The copy above brought the parent's pointers to its own call/return stack and
+    // segment table with it, and those must not be shared.
+    impl->segments.Initialise(state);
+    impl->callret->Attach(impl->thread);
+
+    FATHOM_INFO("forked guest thread: rip=%#llx rsp=%#llx",
+                static_cast<unsigned long long>(state.rip),
+                static_cast<unsigned long long>(state.gregs[FEXCore::X86State::REG_RSP]));
+    return std::unique_ptr<GuestThread> {new GuestThread {std::move(impl)}};
 }
 
 } // namespace fathom

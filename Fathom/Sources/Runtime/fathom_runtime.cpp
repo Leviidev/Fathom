@@ -230,6 +230,7 @@ struct fathom_session final : fathom::ProcessHost {
     std::string program_path;
     std::string guest_root;
     uint64_t stack_size {};
+    bool trace {};
 
     // The process table. pid 1 is the program the session was created for; everything
     // else got here through a fork.
@@ -352,6 +353,9 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         fathom::SyscallConfig child_config;
         child_config.guest_root = guest_root;
         child_config.work_dir = "/";
+        // Inherited, or a forked child's syscalls are invisible in the log exactly when
+        // the interesting thing is what the child did.
+        child_config.trace = trace;
         child->syscalls = std::make_unique<fathom::LinuxSyscalls>(*space, *child->control, console,
                                                                   child_config);
         parent->syscalls->CloneInto(*child->syscalls);
@@ -364,6 +368,10 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
             return -11; // -EAGAIN
         }
         child->control->Bind(child->thread.get());
+        FATHOM_INFO("fork: child pid %d starts at rip=%#llx rsp=%#llx rax=%#llx", child_pid,
+                    static_cast<unsigned long long>(child->thread->Rip()),
+                    static_cast<unsigned long long>(child->thread->Rsp()),
+                    static_cast<unsigned long long>(child->thread->Rax()));
 
         child_raw = child.get();
         processes[child_pid] = std::move(child);
@@ -411,8 +419,11 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& path,
 
     const std::string host_path = fathom::ResolveGuestPathOnHost(guest_root, path);
     if (access(host_path.c_str(), R_OK) != 0) {
+        FATHOM_WARN("execve: pid %d asked for %s, which resolves to %s and is not readable",
+                    caller_pid, path.c_str(), host_path.c_str());
         return -2; // -ENOENT
     }
+    FATHOM_INFO("execve: pid %d loading %s", caller_pid, path.c_str());
     if (argv.empty()) {
         argv.push_back(path);
     }
@@ -450,7 +461,10 @@ void* RunChildThread(void* raw) {
     auto* session = start->session;
     auto* process = start->process;
 
+    FATHOM_INFO("pid %d: running", process->pid);
     const auto result = session->RunProcess(process);
+    FATHOM_INFO("pid %d: finished (%s, status %d, rip=%#llx)", process->pid, result.message.c_str(),
+                result.status, static_cast<unsigned long long>(result.rip));
     ReleaseProgramData(*session->space, process->program);
     {
         std::scoped_lock lock {session->process_mutex};
@@ -600,6 +614,7 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
 
     session->guest_root = config->guest_root == nullptr ? "" : config->guest_root;
     session->stack_size = config->stack_size != 0 ? config->stack_size : kDefaultStack;
+    session->trace = config->trace_syscalls;
 
     std::vector<std::string> argv;
     if (config->argv != nullptr && config->argc > 0) {

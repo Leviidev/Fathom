@@ -462,6 +462,10 @@ uint64_t GuestThread::Rsp() const {
                                     : impl_->thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP];
 }
 
+uint64_t GuestThread::Rax() const {
+    return impl_->thread == nullptr ? 0 : impl_->thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RAX];
+}
+
 void GuestThread::SetFsBase(uint64_t base) {
     if (impl_->thread != nullptr) {
         impl_->thread->CurrentFrame->State.fs_cached = base;
@@ -600,7 +604,19 @@ std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, Li
         return nullptr;
     }
 
-    impl->thread = impl_->context->CreateThread(parent_state.rip,
+    // Where the child resumes is not the parent's rip. During a syscall FEX sets
+    // State.rip to the address *of* the syscall instruction, so starting a child there
+    // would execute it a second time -- with RAX cleared, that is a read(), which is
+    // precisely the wrong thing and looks maddeningly like the child ignoring the fork.
+    //
+    // The x86-64 syscall instruction puts its own return address in RCX, and FEX honours
+    // that, so RCX is the instruction after the syscall: exactly where a returning fork
+    // belongs. sysret does the same thing on real hardware.
+    const uint64_t resume = parent_state.gregs[FEXCore::X86State::REG_RCX] != 0
+                                ? parent_state.gregs[FEXCore::X86State::REG_RCX]
+                                : parent_state.rip + 2; // 0F 05, for a guest that got here via int 0x80
+
+    impl->thread = impl_->context->CreateThread(resume,
                                                 parent_state.gregs[FEXCore::X86State::REG_RSP]);
     if (impl->thread == nullptr) {
         error = "FEXCore could not create the child guest thread";
@@ -611,6 +627,7 @@ std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, Li
     // difference is how a program knows which side of a fork it is on.
     auto& state = impl->thread->CurrentFrame->State;
     std::memcpy(&state, &parent_state, sizeof(state));
+    state.rip = resume;
     state.gregs[FEXCore::X86State::REG_RAX] = 0;
 
     // The copy above brought the parent's pointers to its own call/return stack and

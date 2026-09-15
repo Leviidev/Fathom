@@ -62,6 +62,7 @@ public:
 
     uint64_t Rip() const;
     uint64_t Rsp() const;
+    uint64_t Rax() const;
 
     /// Points this thread at a freshly loaded program image, which is what execve does:
     /// same thread, same pid, entirely different program.

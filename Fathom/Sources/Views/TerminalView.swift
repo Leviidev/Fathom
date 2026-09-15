@@ -6,11 +6,49 @@ struct TerminalView: View {
     let terminal: TerminalEmulator
     let onKey: (String) -> Void
 
+    /// A shell wants the full keyboard; the games want the compact keypad, which does not
+    /// cover half the screen. Either can be switched to once running.
+    var prefersKeyboard: Bool = false
+
+    @State private var usingKeyboard: Bool?
+    @State private var controlHeld = false
+
+    private var keyboardShown: Bool { usingKeyboard ?? prefersKeyboard }
+
     var body: some View {
         VStack(spacing: 14) {
             screen
-            KeypadView(onKey: onKey)
+            if keyboardShown {
+                SpecialKeysRow(onKey: send, controlHeld: $controlHeld)
+                // Zero height: it exists to hold the keyboard and catch keys, not to be
+                // seen. The system keyboard it raises is the visible part.
+                TerminalKeyboard(isActive: true, onKey: send)
+                    .frame(height: 0)
+            } else {
+                KeypadView(onKey: onKey)
+            }
+            Button {
+                usingKeyboard = !keyboardShown
+            } label: {
+                Label(keyboardShown ? "Use keypad" : "Use keyboard",
+                      systemImage: keyboardShown ? "gamecontroller" : "keyboard")
+                    .font(.footnote)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
         }
+    }
+
+    /// Applies the control modifier, which a phone keyboard has no key for. Ctrl+A is
+    /// simply 'A' with the top bits cleared, which is also why Ctrl+[ is escape.
+    private func send(_ key: String) {
+        if controlHeld, key.count == 1, let scalar = key.unicodeScalars.first,
+           scalar.value >= 0x3f, scalar.value <= 0x7f {
+            controlHeld = false
+            onKey(String(UnicodeScalar(scalar.value & 0x1f)!))
+            return
+        }
+        onKey(key)
     }
 
     private var screen: some View {

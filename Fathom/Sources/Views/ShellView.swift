@@ -22,7 +22,7 @@ struct ShellView: View {
                 } else if session.state == .idle {
                     idle
                 } else {
-                    ConsoleView(session: session)
+                    ConsoleView(session: session, prefersKeyboard: true)
                 }
             }
             .padding()

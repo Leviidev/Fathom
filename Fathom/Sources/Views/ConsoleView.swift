@@ -4,6 +4,7 @@ import SwiftUI
 /// making progress rather than wedged.
 struct ConsoleView: View {
     @ObservedObject var session: EmulatorSession
+    var prefersKeyboard: Bool = false
 
     var body: some View {
         VStack(spacing: 16) {
@@ -40,9 +41,9 @@ struct ConsoleView: View {
             }
 
             if session.isInteractive {
-                TerminalView(terminal: session.terminal) { key in
+                TerminalView(terminal: session.terminal, onKey: { key in
                     session.sendKey(key)
-                }
+                }, prefersKeyboard: prefersKeyboard)
             }
 
             Card {

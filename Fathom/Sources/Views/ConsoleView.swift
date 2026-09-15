@@ -4,7 +4,6 @@ import SwiftUI
 /// making progress rather than wedged.
 struct ConsoleView: View {
     @ObservedObject var session: EmulatorSession
-    let program: Program
 
     var body: some View {
         VStack(spacing: 16) {

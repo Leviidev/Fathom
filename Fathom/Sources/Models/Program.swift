@@ -29,13 +29,15 @@ struct Program: Identifiable, Codable, Hashable {
             case .staticExecutable:
                 return "Self-contained, but built to load at a fixed address. iOS reserves the low 4GB of every process, so this usually cannot be placed where it wants to go."
             case .dynamic:
-                return "Needs its interpreter and shared libraries from a guest root filesystem, which Fathom does not provide yet."
+                return "Finds its interpreter and shared libraries in the guest root filesystem. Anything the root filesystem does not provide will fail to load."
             case .unknown:
                 return "Fathom could not read this as an x86-64 ELF executable."
             }
         }
 
-        var runnable: Bool { self == .staticPIE }
+        // Dynamic programs became runnable once a root filesystem shipped with the app:
+        // their loader and libraries are resolved inside it.
+        var runnable: Bool { self == .staticPIE || self == .dynamic }
     }
 
     let id: UUID

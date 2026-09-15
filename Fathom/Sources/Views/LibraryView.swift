@@ -17,62 +17,66 @@ struct LibraryView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
-                if library.programs.isEmpty {
-                    ScrollView {
-                        VStack(spacing: 20) {
-                            if jit.status != .enabled {
-                                JITBanner()
-                                    .padding(.horizontal)
-                            }
-                            EmptyState(
-                                title: "No programs yet",
-                                message: "Add an x86-64 Linux executable to run it here. Statically linked, position-independent builds work best — try building with -static-pie.",
-                                systemImage: "tray.and.arrow.down",
-                                actionTitle: "Add a Program",
-                                action: { isImporting = true }
-                            )
-                        }
-                        .padding(.top, 24)
+            List {
+                if jit.status != .enabled {
+                    Section {
+                        JITBanner()
+                            .listRowInsets(EdgeInsets())
+                            .listRowBackground(Color.clear)
                     }
-                } else {
-                    List {
-                        if jit.status != .enabled {
-                            Section {
-                                JITBanner()
-                                    .listRowInsets(EdgeInsets())
-                                    .listRowBackground(Color.clear)
-                            }
-                        }
+                }
 
-                        Section {
-                            ForEach(filtered) { program in
-                                NavigationLink(value: program) {
-                                    ProgramRow(program: program)
-                                }
-                                .swipeActions(edge: .trailing) {
-                                    Button(role: .destructive) {
-                                        library.delete(program)
-                                    } label: {
-                                        Label("Delete", systemImage: "trash")
-                                    }
-                                    Button {
-                                        renaming = program
-                                        newName = program.name
-                                    } label: {
-                                        Label("Rename", systemImage: "pencil")
-                                    }
-                                    .tint(Theme.accent)
-                                }
-                            }
-                        } footer: {
-                            Text("\(library.programs.count) program\(library.programs.count == 1 ? "" : "s") · \(formatBytes(library.totalBytes))")
+                Section {
+                    NavigationLink {
+                        ShellView()
+                    } label: {
+                        Label("Linux Shell", systemImage: "terminal")
+                    }
+                } header: {
+                    Text("Linux")
+                } footer: {
+                    Text("A shell from the Alpine root filesystem that ships inside Fathom. It is dynamically linked, so opening it also exercises the loader.")
+                }
+
+                Section {
+                    if library.programs.isEmpty {
+                        Button {
+                            isImporting = true
+                        } label: {
+                            Label("Add a Program", systemImage: "tray.and.arrow.down")
                         }
                     }
-                    .listStyle(.insetGrouped)
-                    .searchable(text: $search, prompt: "Search programs")
+                    ForEach(filtered) { program in
+                        NavigationLink(value: program) {
+                            ProgramRow(program: program)
+                        }
+                        .swipeActions(edge: .trailing) {
+                            Button(role: .destructive) {
+                                library.delete(program)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                            Button {
+                                renaming = program
+                                newName = program.name
+                            } label: {
+                                Label("Rename", systemImage: "pencil")
+                            }
+                            .tint(Theme.accent)
+                        }
+                    }
+                } header: {
+                    Text("Programs")
+                } footer: {
+                    if library.programs.isEmpty {
+                        Text("Add an x86-64 Linux executable to run it here. Static, position-independent builds work best \u{2014} try -static-pie.")
+                    } else {
+                        Text("\(library.programs.count) program\(library.programs.count == 1 ? "" : "s") \u{00B7} \(formatBytes(library.totalBytes))")
+                    }
                 }
             }
+            .listStyle(.insetGrouped)
+            .searchable(text: $search, prompt: "Search programs")
             .navigationTitle("Library")
             .navigationDestination(for: Program.self) { program in
                 ProgramDetailView(program: program)

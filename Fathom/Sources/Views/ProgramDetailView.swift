@@ -19,7 +19,7 @@ struct ProgramDetailView: View {
                 if session.state == .idle {
                     details
                 } else {
-                    ConsoleView(session: session, program: current)
+                    ConsoleView(session: session)
                 }
             }
             .padding()

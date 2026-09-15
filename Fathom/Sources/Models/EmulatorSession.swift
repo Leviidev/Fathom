@@ -77,6 +77,29 @@ final class EmulatorSession: ObservableObject {
     // MARK: - Running
 
     func run(program: Program, settings: EmulatorSettings, library: ProgramLibrary) {
+        launch(hostPath: program.url.path, argv: [program.url.path], name: program.name,
+               settings: settings) { [weak self] exitCode in
+            self?.finish(exitCode: exitCode, program: program, library: library)
+        }
+    }
+
+    /// Runs something that lives inside the guest root filesystem -- /bin/sh, say --
+    /// rather than a program imported into the library.
+    ///
+    /// argv[0] is the guest-visible path, not the host one, because busybox decides
+    /// which of its ~300 applets to be from the name it was invoked under: hand it
+    /// "/bin/sh" and it is a shell, hand it a container path and it is nothing.
+    func runInGuest(path guestPath: String, arguments: [String] = [], settings: EmulatorSettings) {
+        let relative = guestPath.hasPrefix("/") ? String(guestPath.dropFirst()) : guestPath
+        let hostPath = ProgramLibrary.guestRootDirectory.appendingPathComponent(relative).path
+        launch(hostPath: hostPath, argv: [guestPath] + arguments, name: guestPath,
+               settings: settings) { [weak self] exitCode in
+            self?.finish(exitCode: exitCode, program: nil, library: nil)
+        }
+    }
+
+    private func launch(hostPath: String, argv: [String], name: String, settings: EmulatorSettings,
+                        onFinish: @escaping (Int) -> Void) {
         guard !state.isActive else { return }
 
         output.removeAll()
@@ -93,7 +116,7 @@ final class EmulatorSession: ObservableObject {
             return
         }
 
-        let path = program.url.path
+        let path = hostPath
         let guestRoot = ProgramLibrary.guestRootDirectory.path
         let environment = settings.guestEnvironment
 
@@ -115,21 +138,21 @@ final class EmulatorSession: ObservableObject {
         let pathString = CString(path)
         let rootString = CString(guestRoot)
         let workString = CString("/")
-        let argv = CStringArray([path])
+        let argvArray = CStringArray(argv)
         let envp = CStringArray(environment)
         defer {
             pathString.deallocate()
             rootString.deallocate()
             workString.deallocate()
-            argv.deallocate()
+            argvArray.deallocate()
             envp.deallocate()
         }
 
         config.program_path = pathString.pointer
         config.guest_root = rootString.pointer
         config.work_dir = workString.pointer
-        config.argv = UnsafePointer(argv.pointer)
-        config.argc = argv.count
+        config.argv = UnsafePointer(argvArray.pointer)
+        config.argc = argvArray.count
         config.envp = UnsafePointer(envp.pointer)
         config.envc = envp.count
 
@@ -152,7 +175,7 @@ final class EmulatorSession: ObservableObject {
         let thread = Thread { [weak self] in
             let exitCode = Int(fathom_session_run(created))
             DispatchQueue.main.async {
-                self?.finish(exitCode: exitCode, program: program, library: library)
+                onFinish(exitCode)
             }
         }
         thread.name = "fathom.guest"
@@ -166,7 +189,7 @@ final class EmulatorSession: ObservableObject {
         runThread = thread
         thread.start()
 
-        log("running \(program.name)")
+        log("running \(name)")
     }
 
     private func installOutputSink(for session: OpaquePointer) {
@@ -301,7 +324,7 @@ final class EmulatorSession: ObservableObject {
         }
     }
 
-    private func finish(exitCode: Int, program: Program, library: ProgramLibrary) {
+    private func finish(exitCode: Int, program: Program?, library: ProgramLibrary?) {
         statusTimer?.invalidate()
         statusTimer = nil
         tick()
@@ -315,7 +338,9 @@ final class EmulatorSession: ObservableObject {
         switch status.state {
         case FATHOM_STATE_EXITED:
             state = .finished(exitCode: exitCode)
-            library.recordRun(program, exitCode: exitCode)
+            if let program, let library {
+                library.recordRun(program, exitCode: exitCode)
+            }
         case FATHOM_STATE_STOPPED:
             state = .stopped
         default:

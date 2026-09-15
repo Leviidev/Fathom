@@ -70,6 +70,18 @@ public:
     /// True once the guest has asked for raw (non-canonical) terminal mode.
     bool WantsKeys() const { return raw_mode_.load(std::memory_order_relaxed); }
 
+    struct Framebuffer {
+        uint64_t address {};
+        uint32_t width {};
+        uint32_t height {};
+        uint32_t stride {};
+        uint32_t bits_per_pixel {};
+    };
+
+    /// The guest's display, once it has opened /dev/fb0. `address` is 0 until then.
+    Framebuffer Display() const;
+    uint64_t FramePresentations() const { return frame_presentations_.load(std::memory_order_relaxed); }
+
     /// Asks the guest to stop at the next syscall. Safe from any thread.
     void RequestStop();
     bool StopRequested() const { return stop_requested_.load(std::memory_order_relaxed); }
@@ -84,7 +96,8 @@ private:
     struct OpenFile {
         int host_fd {-1};
         std::string guest_path;
-        void* directory {};  ///< DIR* once getdents64 has been used on this fd.
+        void* directory {};      ///< DIR* once getdents64 has been used on this fd.
+        bool is_framebuffer {};  ///< A virtual fd for /dev/fb0, backed by no host file.
     };
 
     // Path handling.
@@ -114,6 +127,8 @@ private:
     uint64_t DoMmap(uint64_t address, uint64_t length, int protection, int flags, int fd, int64_t offset);
     uint64_t DoBrk(uint64_t requested);
     uint64_t DoUname(uint64_t address);
+    uint64_t DoFramebufferIoctl(uint64_t request, uint64_t argument);
+    bool EnsureFramebuffer();
     uint64_t DoClockGettime(int clock, uint64_t address);
     uint64_t DoReadlinkAt(int dirfd, uint64_t path_address, uint64_t buffer, uint64_t size);
 
@@ -150,6 +165,12 @@ private:
     std::deque<char> input_;
     std::atomic<bool> raw_mode_ {false};
     std::atomic<bool> nonblocking_stdin_ {false};
+
+    // The guest's display. Allocated out of the guest arena the first time /dev/fb0 is
+    // opened, so the guest can mmap it and write pixels straight into it.
+    mutable std::mutex framebuffer_mutex_;
+    Framebuffer framebuffer_;
+    std::atomic<uint64_t> frame_presentations_ {0};
 };
 
 } // namespace fathom

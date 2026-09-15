@@ -67,8 +67,63 @@ constexpr uint64_t kTcsetsf = 0x5404;
 constexpr uint32_t kIcanon = 0x0002;
 constexpr uint64_t kTiocgwinsz = 0x5413;
 
+// Linux framebuffer device. The oldest and simplest way to put pixels on a Linux screen:
+// ask for the geometry, mmap the memory, write pixels.
+constexpr uint64_t kFbioGetVarScreenInfo = 0x4600;
+constexpr uint64_t kFbioPutVarScreenInfo = 0x4601;
+constexpr uint64_t kFbioGetFixScreenInfo = 0x4602;
+constexpr uint64_t kFbioPanDisplay = 0x4606;
+constexpr uint64_t kFbioBlank = 0x4611;
+
 constexpr uint64_t kPageSize = 4096;
 } // namespace guest
+
+// The display Fathom offers a guest. Not a real panel resolution: a size that is cheap to
+// copy every frame and still looks sharp once scaled to a phone screen.
+constexpr uint32_t kDisplayWidth = 480;
+constexpr uint32_t kDisplayHeight = 800;
+constexpr uint32_t kDisplayBpp = 32;
+
+/// x86-64 Linux's fb_var_screeninfo, written field by field at the offsets the guest
+/// reads. 160 bytes; the trailing timing fields are all zero, which a framebuffer
+/// consumer ignores.
+void WriteVarScreenInfo(uint8_t* out, uint32_t width, uint32_t height, uint32_t bpp) {
+    std::memset(out, 0, 160);
+    auto put = [out](size_t offset, uint32_t value) {
+        std::memcpy(out + offset, &value, sizeof(value));
+    };
+    put(0, width);       // xres
+    put(4, height);      // yres
+    put(8, width);       // xres_virtual
+    put(12, height);     // yres_virtual
+    put(24, bpp);        // bits_per_pixel
+
+    // Channel layout, as three fb_bitfield {offset, length, msb_right} triples followed
+    // by the alpha one. This says BGRA in memory order on a little-endian machine, which
+    // is what both Core Graphics and every framebuffer program treat as the normal case.
+    auto channel = [&put](size_t base, uint32_t offset, uint32_t length) {
+        put(base, offset);
+        put(base + 4, length);
+        put(base + 8, 0);
+    };
+    channel(32, 16, 8);  // red
+    channel(44, 8, 8);   // green
+    channel(56, 0, 8);   // blue
+    channel(68, 24, 8);  // transp
+}
+
+/// x86-64 Linux's fb_fix_screeninfo, 80 bytes.
+void WriteFixScreenInfo(uint8_t* out, uint64_t address, uint32_t stride, uint32_t size) {
+    std::memset(out, 0, 80);
+    std::strncpy(reinterpret_cast<char*>(out), "fathom", 15);
+    std::memcpy(out + 16, &address, sizeof(address));   // smem_start
+    std::memcpy(out + 24, &size, sizeof(size));         // smem_len
+    const uint32_t type = 0;                            // FB_TYPE_PACKED_PIXELS
+    std::memcpy(out + 28, &type, sizeof(type));
+    const uint32_t visual = 2;                          // FB_VISUAL_TRUECOLOR
+    std::memcpy(out + 36, &visual, sizeof(visual));
+    std::memcpy(out + 48, &stride, sizeof(stride));     // line_length
+}
 
 // x86-64 Linux syscall numbers, in the order they are handled below.
 enum : uint64_t {
@@ -584,6 +639,25 @@ uint64_t LinuxSyscalls::DoOpenAt(int dirfd, uint64_t path_address, int flags, in
 
     std::string guest_path;
     const std::string host_path = ResolveAt(dirfd, path.c_str(), &guest_path);
+
+    // The display is a device, not a file: it is answered here rather than looked for in
+    // the guest root, and its fd is backed by no host file at all.
+    if (guest_path == "/dev/fb0" || guest_path == "/dev/graphics/fb0") {
+        if (!EnsureFramebuffer()) {
+            return FailLinux(12); // ENOMEM
+        }
+        std::scoped_lock lock {mutex_};
+        // Numbered well above anything open() will hand out, so it cannot collide with a
+        // real descriptor.
+        int fd = 900;
+        while (files_.count(fd) != 0) {
+            ++fd;
+        }
+        files_[fd] = OpenFile {-1, guest_path, nullptr, true};
+        FATHOM_INFO("guest opened the display as fd %d", fd);
+        return static_cast<uint64_t>(fd);
+    }
+
     const int host_fd = open(host_path.c_str(), ToHostOpenFlags(flags), static_cast<mode_t>(mode));
     if (host_fd < 0) {
         if (config_.trace) {
@@ -860,6 +934,18 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
             space_.Release(placed, length);
             return FailLinux(9);
         }
+        if (file->is_framebuffer) {
+            // Hand back the framebuffer itself rather than a copy: the whole point is
+            // that what the guest writes here is what ends up on screen.
+            space_.Release(placed, length);
+            const auto display = Display();
+            if (display.address == 0) {
+                return FailLinux(19);
+            }
+            FATHOM_INFO("guest mapped the display at %#llx",
+                        static_cast<unsigned long long>(display.address));
+            return display.address;
+        }
         // A real mmap shares pages with the page cache; this copies instead. For the one
         // case that matters here -- a dynamic loader mapping a library read-only or
         // private -- a copy is indistinguishable to the guest.
@@ -896,6 +982,73 @@ uint64_t LinuxSyscalls::DoBrk(uint64_t requested) {
     }
     heap_break_ = requested;
     return heap_break_;
+}
+
+bool LinuxSyscalls::EnsureFramebuffer() {
+    std::scoped_lock lock {framebuffer_mutex_};
+    if (framebuffer_.address != 0) {
+        return true;
+    }
+
+    const uint32_t stride = kDisplayWidth * (kDisplayBpp / 8);
+    const uint64_t size = static_cast<uint64_t>(stride) * kDisplayHeight;
+    const uint64_t address = space_.Allocate(size, 0, kGuestProtRead | kGuestProtWrite);
+    if (address == 0) {
+        FATHOM_ERROR("could not allocate a %ux%u framebuffer", kDisplayWidth, kDisplayHeight);
+        return false;
+    }
+    std::memset(reinterpret_cast<void*>(address), 0, size);
+
+    framebuffer_ = Framebuffer {address, kDisplayWidth, kDisplayHeight, stride, kDisplayBpp};
+    FATHOM_INFO("display: %ux%u at %u bpp, %llu KB at %#llx", kDisplayWidth, kDisplayHeight,
+                kDisplayBpp, static_cast<unsigned long long>(size / 1024),
+                static_cast<unsigned long long>(address));
+    return true;
+}
+
+LinuxSyscalls::Framebuffer LinuxSyscalls::Display() const {
+    std::scoped_lock lock {framebuffer_mutex_};
+    return framebuffer_;
+}
+
+uint64_t LinuxSyscalls::DoFramebufferIoctl(uint64_t request, uint64_t argument) {
+    const auto display = Display();
+    if (display.address == 0) {
+        return FailLinux(19); // ENODEV
+    }
+
+    switch (request) {
+    case guest::kFbioGetVarScreenInfo: {
+        auto* out = static_cast<uint8_t*>(GuestPointer(argument, 160, true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        WriteVarScreenInfo(out, display.width, display.height, display.bits_per_pixel);
+        return 0;
+    }
+    case guest::kFbioGetFixScreenInfo: {
+        auto* out = static_cast<uint8_t*>(GuestPointer(argument, 80, true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        WriteFixScreenInfo(out, display.address, display.stride, display.stride * display.height);
+        return 0;
+    }
+    case guest::kFbioPutVarScreenInfo:
+        // The mode is fixed. Accepted rather than refused, because a program that cannot
+        // set its preferred mode usually carries on with whatever it was given, while one
+        // that gets an error often gives up entirely.
+        return 0;
+    case guest::kFbioPanDisplay:
+        // There is only one buffer, so panning is where a frame ends -- the one moment
+        // the guest tells us it has finished drawing.
+        frame_presentations_.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    case guest::kFbioBlank:
+        return 0;
+    default:
+        return FailLinux(25); // ENOTTY
+    }
 }
 
 uint64_t LinuxSyscalls::DoUname(uint64_t address) {
@@ -1110,6 +1263,15 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
 
     case kSysIoctl: {
         const int fd = static_cast<int>(arg1);
+        bool is_display = false;
+        {
+            std::scoped_lock lock {mutex_};
+            auto* file = FindFile(fd);
+            is_display = file != nullptr && file->is_framebuffer;
+        }
+        if (is_display) {
+            return DoFramebufferIoctl(arg2, arg3);
+        }
         if (fd >= 0 && fd <= 2 && arg2 == guest::kTcgets) {
             // Claiming the console is a terminal makes the guest's libc line-buffer its
             // output, so the console view fills in as the program runs instead of only

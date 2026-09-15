@@ -151,6 +151,24 @@ void fathom_session_set_output_sink(fathom_session* session, fathom_output_sink 
 /// expects to find. Safe to call from any thread while the guest is running.
 void fathom_session_send_input(fathom_session* session, const char* bytes, size_t length);
 
+/// The guest's display, if it has opened one.
+typedef struct {
+    bool active;          ///< False until the guest opens /dev/fb0.
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;      ///< Bytes per row.
+    uint32_t bits_per_pixel;
+    const void* pixels;   ///< Guest memory. Valid while the session lives.
+    uint64_t writes;      ///< Counts guest frames presented, for a "is it drawing" check.
+} fathom_framebuffer;
+
+/// Describes the guest's framebuffer. Returns false when it has not opened one.
+///
+/// The pixels are guest memory read directly -- there is no copy and no handshake, which
+/// is exactly how a real framebuffer device behaves: the program writes pixels and they
+/// are on screen.
+bool fathom_session_framebuffer(fathom_session* session, fathom_framebuffer* out);
+
 /// True once the guest has put its terminal into raw mode, which is what a program does
 /// when it wants individual keypresses rather than whole lines. The UI uses this to know
 /// an on-screen keypad is worth showing.

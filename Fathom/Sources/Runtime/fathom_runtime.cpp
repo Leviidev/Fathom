@@ -275,6 +275,29 @@ void fathom_session_send_input(fathom_session* session, const char* bytes, size_
     session->syscalls->SendInput(bytes, length);
 }
 
+bool fathom_session_framebuffer(fathom_session* session, fathom_framebuffer* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    std::memset(out, 0, sizeof(*out));
+    if (session == nullptr || session->syscalls == nullptr) {
+        return false;
+    }
+
+    const auto display = session->syscalls->Display();
+    if (display.address == 0) {
+        return false;
+    }
+    out->active = true;
+    out->width = display.width;
+    out->height = display.height;
+    out->stride = display.stride;
+    out->bits_per_pixel = display.bits_per_pixel;
+    out->pixels = reinterpret_cast<const void*>(display.address);
+    out->writes = session->syscalls->FramePresentations();
+    return true;
+}
+
 bool fathom_session_wants_keys(fathom_session* session) {
     return session != nullptr && session->syscalls != nullptr && session->syscalls->WantsKeys();
 }

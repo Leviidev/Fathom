@@ -220,6 +220,7 @@ struct GuestProcess {
     uint64_t exec_rsp {};
 
     bool finished {};
+    bool joined {};
     int exit_status {};
     /// A vforked parent waits for this: set when the child execs or exits, whichever
     /// comes first, because either one means it is no longer using the parent's stack.
@@ -275,6 +276,7 @@ struct fathom_session final : fathom::ProcessHost {
     }
 
     fathom::RunResult RunProcess(GuestProcess* process);
+    void JoinFinishedChildren();
     void ReleaseParent(GuestProcess* process);
 
     // ProcessHost
@@ -357,6 +359,22 @@ fathom::RunResult fathom_session::RunProcess(GuestProcess* process) {
     return result;
 }
 
+void fathom_session::JoinFinishedChildren() {
+    std::vector<pthread_t> done;
+    {
+        std::scoped_lock lock {process_mutex};
+        for (auto& [pid, process] : processes) {
+            if (process->finished && process->thread_started && !process->joined) {
+                done.push_back(process->host_thread);
+                process->joined = true;
+            }
+        }
+    }
+    for (auto thread : done) {
+        pthread_join(thread, nullptr);
+    }
+}
+
 void fathom_session::ReleaseParent(GuestProcess* process) {
     {
         std::scoped_lock lock {process_mutex};
@@ -376,6 +394,13 @@ void fathom_session::ReleaseParent(GuestProcess* process) {
 int64_t fathom_session::ForkProcess(int caller_pid) {
     GuestProcess* child_raw = nullptr;
     int child_pid = 0;
+
+    // A child that has finished may still have a host thread winding down, and creating
+    // a new guest thread in the same FEXCore context while that happens leaves the new
+    // one with a corrupted register file -- a zeroed stack pointer, and a fault at a
+    // near-null address the moment it pushes anything. Waiting for the old thread to be
+    // properly gone costs nothing: it has already exited.
+    JoinFinishedChildren();
 
     {
         std::scoped_lock lock {process_mutex};
@@ -594,9 +619,9 @@ int64_t fathom_session::WaitForChild(int caller_pid, int wanted_pid, int* exit_s
             if (exit_status != nullptr) {
                 *exit_status = node.mapped()->exit_status;
             }
-            if (node.mapped()->thread_started) {
+            if (node.mapped()->thread_started && !node.mapped()->joined) {
                 pthread_join(node.mapped()->host_thread, nullptr);
-                node.mapped()->thread_started = false;
+                node.mapped()->joined = true;
             }
             FATHOM_INFO("wait4: pid %d reaped pid %d (status %d)", caller_pid, reaped,
                         node.mapped()->exit_status);
@@ -899,9 +924,9 @@ void fathom_session_destroy(fathom_session* session) {
         {
             std::scoped_lock lock {session->process_mutex};
             for (auto& [pid, process] : session->processes) {
-                if (process->thread_started) {
+                if (process->thread_started && !process->joined) {
                     running.push_back(process->host_thread);
-                    process->thread_started = false;
+                    process->joined = true;
                 }
             }
         }

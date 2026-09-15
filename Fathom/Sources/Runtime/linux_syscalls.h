@@ -133,7 +133,18 @@ private:
         std::string guest_path;
         void* directory {};      ///< DIR* once getdents64 has been used on this fd.
         bool is_framebuffer {};  ///< A virtual fd for /dev/fb0, backed by no host file.
+        /// 0, 1 or 2 when this descriptor is the console itself rather than a file. A
+        /// shell redirects by pointing fd 1 somewhere else, so "is this the terminal" has
+        /// to be a property of the entry, not of the number.
+        int console_stream {-1};
     };
+
+    /// Lowest unused guest descriptor, which is the number open() and pipe() must return:
+    /// a shell closes fd 0 and opens a file precisely because it knows it gets fd 0 back.
+    int AllocateFd();
+    bool IsConsole(int fd);
+    int DuplicateTo(const OpenFile& file, int target);
+    void CloseFd(int fd);
 
     // Path handling.
     std::string NormaliseGuestPath(const std::string& path) const;

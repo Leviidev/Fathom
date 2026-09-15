@@ -171,6 +171,8 @@ enum : uint64_t {
     kSysExecve = 59,
     kSysExit = 60,
     kSysWait4 = 61,
+    kSysPipe = 22,
+    kSysDup3 = 292,
     kSysKill = 62,
     kSysUname = 63,
     kSysFcntl = 72,
@@ -417,6 +419,9 @@ const char* SyscallName(uint64_t number) {
     case kSysVfork: return "vfork";
     case kSysExecve: return "execve";
     case kSysWait4: return "wait4";
+    case kSysPipe: return "pipe";
+    case kSysPipe2: return "pipe2";
+    case kSysDup3: return "dup3";
     case kSysGetpid: return "getpid";
     case kSysClone: return "clone";
     case kSysExit: return "exit";
@@ -461,6 +466,14 @@ LinuxSyscalls::LinuxSyscalls(GuestAddressSpace& space, GuestThreadControl& contr
     if (!config_.work_dir.empty()) {
         cwd_ = NormaliseGuestPath(config_.work_dir);
     }
+    // stdin, stdout and stderr are entries like any other, so that a shell can point them
+    // at a pipe or a file and everything downstream keeps working by number alone.
+    for (int stream = 0; stream <= 2; ++stream) {
+        OpenFile console;
+        console.console_stream = stream;
+        console.guest_path = "/dev/console";
+        files_[stream] = console;
+    }
 }
 
 LinuxSyscalls::~LinuxSyscalls() {
@@ -494,18 +507,21 @@ void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
     // table changing underneath it. dup keeps the underlying file description shared,
     // which is exactly what fork promises.
     for (const auto& [fd, file] : files_) {
-        if (file.is_framebuffer) {
-            child.files_[fd] = file;
-            continue;
-        }
-        const int copy = file.host_fd < 0 ? -1 : dup(file.host_fd);
-        if (copy < 0 && file.host_fd >= 0) {
-            continue;
-        }
         OpenFile inherited;
-        inherited.host_fd = copy;
         inherited.guest_path = file.guest_path;
-        child.files_[fd] = inherited;
+        // Carried across, and not obvious: without it a child's fd 1 is neither the
+        // console nor a file, so the first thing it prints fails and it exits reporting
+        // a write error instead of doing its job.
+        inherited.console_stream = file.console_stream;
+        inherited.is_framebuffer = file.is_framebuffer;
+
+        if (file.host_fd >= 0) {
+            inherited.host_fd = dup(file.host_fd);
+            if (inherited.host_fd < 0) {
+                continue;  // Out of descriptors: the child simply does not inherit it.
+            }
+        }
+        child.files_[fd] = std::move(inherited);
     }
     child.cwd_ = cwd_;
     child.heap_base_ = heap_base_;
@@ -578,6 +594,16 @@ std::string LinuxSyscalls::NormaliseGuestPath(const std::string& path) const {
 
 std::string LinuxSyscalls::ResolveGuestPath(const std::string& path) const {
     const std::string guest_path = NormaliseGuestPath(path);
+
+    // The character devices every Unix program assumes exist. A minirootfs ships no /dev
+    // at all -- it is built for a container runtime that mounts one -- so without this
+    // the first thing a shell does with /dev/null fails, and a great many programs treat
+    // that as fatal. The host has real ones, and they behave identically.
+    if (guest_path == "/dev/null" || guest_path == "/dev/zero" || guest_path == "/dev/full" ||
+        guest_path == "/dev/random" || guest_path == "/dev/urandom" || guest_path == "/dev/tty") {
+        return guest_path;
+    }
+
     if (config_.guest_root.empty()) {
         return guest_path;
     }
@@ -676,11 +702,24 @@ LinuxSyscalls::OpenFile* LinuxSyscalls::FindFile(int fd) {
     return entry == files_.end() ? nullptr : &entry->second;
 }
 
+int LinuxSyscalls::AllocateFd() {
+    int fd = 0;
+    while (files_.count(fd) != 0) {
+        ++fd;
+    }
+    return fd;
+}
+
 int LinuxSyscalls::RegisterFile(int host_fd, std::string guest_path) {
-    // Guest fds are host fds. open() never returns 0/1/2 here (those stay held by the
-    // app itself), so the guest's stdio numbers can never collide with a real file.
-    files_[host_fd] = OpenFile {host_fd, std::move(guest_path), nullptr};
-    return host_fd;
+    // Guest descriptors are their own numbering, not the host's. They have to be, because
+    // a guest expects the lowest free number back and expects to be able to move one onto
+    // fd 1 -- and fd 1 on the host belongs to this app.
+    const int fd = AllocateFd();
+    OpenFile file;
+    file.host_fd = host_fd;
+    file.guest_path = std::move(guest_path);
+    files_[fd] = std::move(file);
+    return fd;
 }
 
 // ---------------------------------------------------------------------------
@@ -703,13 +742,11 @@ uint64_t LinuxSyscalls::DoOpenAt(int dirfd, uint64_t path_address, int flags, in
             return FailLinux(12); // ENOMEM
         }
         std::scoped_lock lock {mutex_};
-        // Numbered well above anything open() will hand out, so it cannot collide with a
-        // real descriptor.
-        int fd = 900;
-        while (files_.count(fd) != 0) {
-            ++fd;
-        }
-        files_[fd] = OpenFile {-1, guest_path, nullptr, true};
+        const int fd = AllocateFd();
+        OpenFile display;
+        display.guest_path = guest_path;
+        display.is_framebuffer = true;
+        files_[fd] = std::move(display);
         FATHOM_INFO("guest opened the display as fd %d", fd);
         return static_cast<uint64_t>(fd);
     }
@@ -732,17 +769,20 @@ uint64_t LinuxSyscalls::DoWrite(int fd, uint64_t buffer, uint64_t count) {
         return count == 0 ? 0 : FailLinux(14);
     }
 
-    if (fd == 1 || fd == 2) {
-        console_.Write(fd, static_cast<const char*>(data), count);
-        return count;
+    int host_fd = -1;
+    {
+        std::scoped_lock lock {mutex_};
+        auto* file = FindFile(fd);
+        if (file == nullptr) {
+            return FailLinux(9); // EBADF
+        }
+        if (file->console_stream >= 0) {
+            console_.Write(file->console_stream, static_cast<const char*>(data), count);
+            return count;
+        }
+        host_fd = file->host_fd;
     }
-
-    std::scoped_lock lock {mutex_};
-    auto* file = FindFile(fd);
-    if (file == nullptr) {
-        return FailLinux(9); // EBADF
-    }
-    const ssize_t written = write(file->host_fd, data, count);
+    const ssize_t written = write(host_fd, data, count);
     return written < 0 ? Fail(errno) : static_cast<uint64_t>(written);
 }
 
@@ -751,7 +791,16 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
     if (data == nullptr) {
         return count == 0 ? 0 : FailLinux(14);
     }
-    if (fd == 0) {
+    bool from_console = false;
+    {
+        std::scoped_lock lock {mutex_};
+        auto* file = FindFile(fd);
+        if (file == nullptr) {
+            return FailLinux(9); // EBADF
+        }
+        from_console = file->console_stream >= 0;
+    }
+    if (from_console) {
         const int64_t read_bytes = console_.ReadInput(static_cast<char*>(data), count);
         if (read_bytes < 0) {
             return FailLinux(11); // EAGAIN
@@ -867,6 +916,42 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
         // Sleep until a key arrives, in slices so a stop request is still noticed.
         console_.WaitForInput(10);
     }
+}
+
+bool LinuxSyscalls::IsConsole(int fd) {
+    std::scoped_lock lock {mutex_};
+    auto* file = FindFile(fd);
+    return file != nullptr && file->console_stream >= 0;
+}
+
+/// Puts a copy of `file` on descriptor `target`. The caller holds the lock.
+int LinuxSyscalls::DuplicateTo(const OpenFile& file, int target) {
+    OpenFile copy;
+    copy.guest_path = file.guest_path;
+    copy.console_stream = file.console_stream;
+    copy.is_framebuffer = file.is_framebuffer;
+    if (file.host_fd >= 0) {
+        copy.host_fd = dup(file.host_fd);
+        if (copy.host_fd < 0) {
+            return -1;
+        }
+    }
+    files_[target] = std::move(copy);
+    return target;
+}
+
+/// Closes one descriptor. The caller holds the lock.
+void LinuxSyscalls::CloseFd(int fd) {
+    auto entry = files_.find(fd);
+    if (entry == files_.end()) {
+        return;
+    }
+    if (entry->second.directory != nullptr) {
+        closedir(static_cast<DIR*>(entry->second.directory)); // also closes host_fd
+    } else if (entry->second.host_fd >= 0) {
+        close(entry->second.host_fd);
+    }
+    files_.erase(entry);
 }
 
 uint64_t LinuxSyscalls::DoWritev(int fd, uint64_t iov, uint64_t count) {
@@ -1253,8 +1338,12 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
     NoteSyscall(number, arg1, count);
 
     if (config_.trace) {
-        FATHOM_INFO("syscall %llu %s(%#llx, %#llx, %#llx)", static_cast<unsigned long long>(number),
-                    SyscallName(number), static_cast<unsigned long long>(arg1),
+        // The pid matters more than anything else on this line once there is more than
+        // one process: the same syscall from a shell and from its child mean opposite
+        // things, and without it a pipeline's trace is unreadable.
+        FATHOM_INFO("[pid %d] syscall %llu %s(%#llx, %#llx, %#llx)", pid_,
+                    static_cast<unsigned long long>(number), SyscallName(number),
+                    static_cast<unsigned long long>(arg1),
                     static_cast<unsigned long long>(arg2), static_cast<unsigned long long>(arg3));
     }
 
@@ -1266,9 +1355,9 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
         // the answer is logged too.
         const auto signed_result = static_cast<int64_t>(result);
         if (signed_result < 0 && signed_result > -4096) {
-            FATHOM_INFO("  -> error %lld", static_cast<long long>(-signed_result));
+            FATHOM_INFO("[pid %d]   -> error %lld", pid_, static_cast<long long>(-signed_result));
         } else {
-            FATHOM_INFO("  -> %#llx", static_cast<unsigned long long>(result));
+            FATHOM_INFO("[pid %d]   -> %#llx", pid_, static_cast<unsigned long long>(result));
         }
     }
     return result;
@@ -1395,7 +1484,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (is_display) {
             return DoFramebufferIoctl(arg2, arg3);
         }
-        if (fd >= 0 && fd <= 2 && arg2 == guest::kTcgets) {
+        if (IsConsole(fd) && arg2 == guest::kTcgets) {
             // Claiming the console is a terminal makes the guest's libc line-buffer its
             // output, so the console view fills in as the program runs instead of only
             // at exit. Everything else about it is honest; this one is a choice.
@@ -1410,7 +1499,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             *reinterpret_cast<uint32_t*>(termios_out + 12) = 0x8a3b; // ISIG | ICANON | ECHO ...
             return 0;
         }
-        if (fd >= 0 && fd <= 2 &&
+        if (IsConsole(fd) &&
             (arg2 == guest::kTcsets || arg2 == guest::kTcsetsw || arg2 == guest::kTcsetsf)) {
             // The guest is configuring the terminal. The only part that matters here is
             // ICANON: with it cleared the program wants individual keypresses rather than
@@ -1429,7 +1518,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             }
             return 0;
         }
-        if (fd >= 0 && fd <= 2 && arg2 == guest::kTiocgwinsz) {
+        if (IsConsole(fd) && arg2 == guest::kTiocgwinsz) {
             auto* window = static_cast<uint16_t*>(GuestPointer(arg3, 8, true));
             if (window == nullptr) {
                 return FailLinux(14);
@@ -1562,18 +1651,53 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return 0;
     }
 
-    case kSysDup:
-    case kSysDup2: {
+    case kSysDup: {
         std::scoped_lock lock {mutex_};
         auto* file = FindFile(static_cast<int>(arg1));
         if (file == nullptr) {
             return FailLinux(9);
         }
-        const int duplicated = dup(file->host_fd);
-        if (duplicated < 0) {
+        return static_cast<uint64_t>(DuplicateTo(*file, AllocateFd()));
+    }
+
+    case kSysDup2:
+    case kSysDup3: {
+        const int from = static_cast<int>(arg1);
+        const int to = static_cast<int>(arg2);
+        std::scoped_lock lock {mutex_};
+        auto* file = FindFile(from);
+        if (file == nullptr) {
+            return FailLinux(9);
+        }
+        if (from == to) {
+            return static_cast<uint64_t>(to);
+        }
+        // Whatever was on the target goes, silently: this is how a shell puts a pipe on
+        // stdout, and the descriptor it is replacing is usually the console.
+        CloseFd(to);
+        return static_cast<uint64_t>(DuplicateTo(*file, to));
+    }
+
+    case kSysPipe:
+    case kSysPipe2: {
+        int ends[2] = {-1, -1};
+        if (pipe(ends) != 0) {
             return Fail(errno);
         }
-        return static_cast<uint64_t>(RegisterFile(duplicated, file->guest_path));
+        if (number == kSysPipe2 && (arg2 & guest::kONonBlock) != 0) {
+            fcntl(ends[0], F_SETFL, fcntl(ends[0], F_GETFL, 0) | O_NONBLOCK);
+            fcntl(ends[1], F_SETFL, fcntl(ends[1], F_GETFL, 0) | O_NONBLOCK);
+        }
+        auto* out = static_cast<int32_t*>(GuestPointer(arg1, sizeof(int32_t) * 2, true));
+        if (out == nullptr) {
+            close(ends[0]);
+            close(ends[1]);
+            return FailLinux(14);
+        }
+        std::scoped_lock lock {mutex_};
+        out[0] = static_cast<int32_t>(RegisterFile(ends[0], "pipe:[read]"));
+        out[1] = static_cast<int32_t>(RegisterFile(ends[1], "pipe:[write]"));
+        return 0;
     }
 
     case kSysUname:
@@ -1843,7 +1967,6 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysStatfs:
     case kSysFstatfs:
     case kSysEpollCreate1:
-    case kSysPipe2:
     case kSysMemfdCreate:
         return FailLinux(38);
 

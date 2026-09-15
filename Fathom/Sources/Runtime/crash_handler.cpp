@@ -24,6 +24,7 @@ namespace {
 
 int g_crash_fd = -1;
 std::atomic<FaultRecovery> g_recovery {nullptr};
+std::atomic<GuestStateDescriber> g_describer {nullptr};
 
 // Updated on every guest syscall. Plain atomics, so reading them from a signal handler
 // is safe -- and the last syscall the guest made is usually the single most useful fact
@@ -123,6 +124,18 @@ void Handle(int number, siginfo_t* info, void* context) {
     }
     WriteText("\n=== END ===\n");
 
+    // The guest's own registers. A fault at a small address means some pointer was null;
+    // this is what says which one, and what the code was doing with it.
+    if (auto* describer = g_describer.load(std::memory_order_acquire)) {
+        char state[1024];
+        const size_t length = describer(state, sizeof(state));
+        if (length > 0) {
+            WriteText("\nguest registers:\n");
+            ssize_t ignored = write(g_crash_fd, state, length);
+            (void)ignored;
+        }
+    }
+
     // A host backtrace, which is the difference between "it crashed somewhere" and
     // knowing which function. backtrace() walks the frame pointers and touches no locks,
     // which is about as safe as anything gets inside a signal handler; backtrace_symbols
@@ -145,6 +158,10 @@ void Handle(int number, siginfo_t* info, void* context) {
 
 void SetFaultRecovery(FaultRecovery recovery) {
     g_recovery.store(recovery, std::memory_order_release);
+}
+
+void SetGuestStateDescriber(GuestStateDescriber describer) {
+    g_describer.store(describer, std::memory_order_release);
 }
 
 void NoteSyscall(uint64_t number, uint64_t first_argument, uint64_t count) {

@@ -29,6 +29,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <sys/mman.h>
@@ -275,6 +276,27 @@ public:
 /// one LinuxSyscalls per process, so the handler has to route to whichever guest thread
 /// is currently executing on this host thread.
 thread_local LinuxSyscalls* g_current_syscalls = nullptr;
+
+/// Writes the executing guest thread's registers out for a crash record. Signal-handler
+/// context: no allocation, no locks, and g_active is thread-local so it describes the
+/// thread that actually faulted.
+size_t DescribeGuestState(char* buffer, size_t capacity) {
+    if (g_active.thread == nullptr || buffer == nullptr || capacity == 0) {
+        return 0;
+    }
+    const auto& state = g_active.thread->CurrentFrame->State;
+    static const char* kNames[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                                   "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
+    int written = std::snprintf(buffer, capacity, "  rip %016llx\n",
+                                static_cast<unsigned long long>(state.rip));
+    for (size_t index = 0; index < 16 && written > 0 && static_cast<size_t>(written) < capacity; ++index) {
+        written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
+                                 "  %-3s %016llx%s", kNames[index],
+                                 static_cast<unsigned long long>(state.gregs[index]),
+                                 (index % 2 == 1) ? "\n" : "");
+    }
+    return written < 0 ? 0 : static_cast<size_t>(written);
+}
 
 class FathomSyscallHandler final : public FEXCore::HLE::SyscallHandler {
 public:
@@ -548,6 +570,7 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
 
     // From here on, a guest alignment fault is recoverable rather than fatal.
     SetFaultRecovery(RecoverAlignmentFault);
+    SetGuestStateDescriber(DescribeGuestState);
 
     FATHOM_INFO("FEXCore context ready (AVX=%d, SVE128=%d, cache line %u)",
                 impl->host_features.SupportsAVX ? 1 : 0, impl->host_features.SupportsSVE128 ? 1 : 0,

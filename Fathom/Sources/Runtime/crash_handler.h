@@ -14,6 +14,15 @@ using FaultRecovery = bool (*)(int signal, siginfo_t* info, void* context);
 /// are an expected part of running x86 code on ARM64 rather than a crash.
 void SetFaultRecovery(FaultRecovery recovery);
 
+/// Writes a description of the currently executing guest thread's registers into `buffer`.
+/// Supplied by the engine, because only it knows FEXCore exists. Returns the length
+/// written. Runs inside a signal handler, so it must not allocate or take locks.
+using GuestStateDescriber = size_t (*)(char* buffer, size_t capacity);
+
+/// Installs the describer. Without one, a guest fault records only its address, which
+/// says a pointer was null but nothing about which one.
+void SetGuestStateDescriber(GuestStateDescriber describer);
+
 /// Records the guest syscall about to be serviced. Cheap enough for the hot path
 /// (three relaxed atomic stores) and it is what turns "the log stops here" into
 /// "the log stops in openat".

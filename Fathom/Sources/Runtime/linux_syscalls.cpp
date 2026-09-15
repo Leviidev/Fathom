@@ -2,6 +2,8 @@
 
 #include "guest_path.h"
 
+#include <poll.h>
+
 #include "crash_handler.h"
 #include "fathom_log.h"
 
@@ -186,6 +188,7 @@ enum : uint64_t {
     kSysGetuid = 102,
     kSysGetgid = 104,
     kSysSetuid = 105,
+    kSysSetgid = 106,
     kSysGeteuid = 107,
     kSysGetegid = 108,
     kSysGetppid = 110,
@@ -382,6 +385,7 @@ clockid_t ToHostClock(int guest_clock, bool* supported) {
 
 const char* SyscallName(uint64_t number) {
     switch (number) {
+    case kSysPoll: return "poll";
     case kSysRead: return "read";
     case kSysWrite: return "write";
     case kSysOpen: return "open";
@@ -415,6 +419,8 @@ const char* SyscallName(uint64_t number) {
     case kSysReadlink: return "readlink";
     case kSysGettimeofday: return "gettimeofday";
     case kSysGetrlimit: return "getrlimit";
+    case kSysSetuid: return "setuid";
+    case kSysSetgid: return "setgid";
     case kSysGetuid: return "getuid";
     case kSysGeteuid: return "geteuid";
     case kSysArchPrctl: return "arch_prctl";
@@ -740,6 +746,106 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
     }
     const ssize_t bytes = read(file->host_fd, data, count);
     return bytes < 0 ? Fail(errno) : static_cast<uint64_t>(bytes);
+}
+
+namespace {
+
+/// x86-64 Linux struct pollfd: 4 bytes of fd, then two 2-byte masks.
+struct LinuxPollfd {
+    int32_t fd;
+    int16_t events;
+    int16_t revents;
+};
+static_assert(sizeof(LinuxPollfd) == 8, "guest pollfd must be 8 bytes");
+
+constexpr int16_t kPollIn = 0x001;
+constexpr int16_t kPollOut = 0x004;
+constexpr int16_t kPollNval = 0x020;
+
+} // namespace
+
+/// poll, which busybox's line editor depends on: after reading an ESC it polls stdin with
+/// a short timeout to decide whether an arrow key followed or the user really pressed
+/// escape. Returning ENOSYS here left the shell redrawing its prompt instead of reading.
+uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
+
+    // poll(NULL, 0, ms) is just a sleep, and some programs use it as one.
+    if (count == 0) {
+        if (timeout_ms > 0) {
+            std::unique_lock lock {input_mutex_};
+            input_ready_.wait_until(lock, deadline);
+        }
+        return 0;
+    }
+
+    auto* fds = static_cast<LinuxPollfd*>(GuestPointer(fds_address, count * sizeof(LinuxPollfd), true));
+    if (fds == nullptr) {
+        return FailLinux(14);
+    }
+
+    for (;;) {
+        if (stop_requested_.load(std::memory_order_relaxed)) {
+            exit_status_ = -1;
+            control_.ExitGuest(-1);
+        }
+
+        uint64_t ready = 0;
+        for (uint64_t index = 0; index < count; ++index) {
+            auto& entry = fds[index];
+            entry.revents = 0;
+            if (entry.fd < 0) {
+                continue;  // Negative fds are ignored, not errors.
+            }
+
+            if (entry.fd == 0) {
+                std::scoped_lock lock {input_mutex_};
+                if ((entry.events & kPollIn) != 0 && !input_.empty()) {
+                    entry.revents |= kPollIn;
+                }
+            } else if (entry.fd == 1 || entry.fd == 2) {
+                // The console never blocks a write.
+                if ((entry.events & kPollOut) != 0) {
+                    entry.revents |= kPollOut;
+                }
+            } else {
+                int host_fd = -1;
+                {
+                    std::scoped_lock lock {mutex_};
+                    auto* file = FindFile(entry.fd);
+                    if (file != nullptr) {
+                        host_fd = file->host_fd;
+                    }
+                }
+                if (host_fd < 0) {
+                    entry.revents |= kPollNval;
+                } else {
+                    // Ask the host about its own descriptor; a regular file is always ready.
+                    struct pollfd probe {};
+                    probe.fd = host_fd;
+                    probe.events = static_cast<short>(entry.events);
+                    if (poll(&probe, 1, 0) > 0) {
+                        entry.revents = static_cast<int16_t>(probe.revents);
+                    }
+                }
+            }
+
+            if (entry.revents != 0) {
+                ++ready;
+            }
+        }
+
+        if (ready > 0 || timeout_ms == 0) {
+            return ready;
+        }
+        if (timeout_ms > 0 && std::chrono::steady_clock::now() >= deadline) {
+            return 0;
+        }
+
+        // Sleep until a key arrives, in slices so a stop request is still noticed.
+        std::unique_lock lock {input_mutex_};
+        input_ready_.wait_for(lock, std::chrono::milliseconds(10));
+    }
 }
 
 uint64_t LinuxSyscalls::DoWritev(int fd, uint64_t iov, uint64_t count) {
@@ -1552,6 +1658,13 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysGetgid:
     case kSysGetegid:
         return 1000;
+    // The guest is uid 1000 and stays that way. Setting it to what it already is
+    // succeeds, which is what busybox does at startup; anything else is EPERM, the same
+    // answer an unprivileged process gets on Linux. ENOSYS was simply the wrong error.
+    case kSysSetuid:
+    case kSysSetgid:
+        return arg1 == 1000 ? 0 : FailLinux(1);
+
     case kSysUmask:
         return 0022;
 
@@ -1662,10 +1775,12 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return FailLinux(38);
     }
 
+    case kSysPoll:
+        return DoPoll(arg1, arg2, static_cast<int>(arg3));
+
     case kSysSysinfo:
     case kSysStatfs:
     case kSysFstatfs:
-    case kSysPoll:
     case kSysEpollCreate1:
     case kSysPipe2:
     case kSysMemfdCreate:

@@ -36,6 +36,13 @@ final class ProgramLibrary: ObservableObject {
         for directory in [Self.programsDirectory, Self.guestRootDirectory] {
             try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         }
+        // Dynamically linked programs need a root filesystem to find their loader and
+        // libraries in. Installing it here means it is in place before any program runs.
+        do {
+            try GuestRootfs.installIfNeeded()
+        } catch {
+            log("could not install the guest root filesystem: \(error.localizedDescription)", level: .error)
+        }
     }
 
     // MARK: - Persistence

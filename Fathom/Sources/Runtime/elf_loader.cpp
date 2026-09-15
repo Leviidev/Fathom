@@ -250,8 +250,8 @@ ElfInspection InspectElf(const std::string& path) {
         break;
     case ProgramKind::Dynamic:
         result.loadable = true;
-        result.error = "dynamically linked: needs a guest root filesystem containing " +
-                       result.interpreter;
+        result.error = "dynamically linked: the guest root filesystem must provide " +
+                       result.interpreter + " and the libraries this program links against";
         break;
     case ProgramKind::Static:
         // Reported as loadable so the attempt is still made -- fathom_probe_device

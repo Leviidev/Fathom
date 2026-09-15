@@ -85,6 +85,36 @@ constexpr uint32_t kCsDebugged = 0x10000000;
 
 } // namespace
 
+/// Resolves a guest-absolute path -- the interpreter named in PT_INTERP, say -- to a host
+/// path inside the guest root. ".." cannot climb past the root, so a binary naming
+/// "/../../../etc/passwd" as its loader still reaches nothing outside the sandbox.
+std::string ResolveInGuestRoot(const std::string& guest_root, const std::string& guest_path) {
+    std::vector<std::string> parts;
+    size_t index = 0;
+    while (index < guest_path.size()) {
+        const auto next = guest_path.find('/', index);
+        const auto piece = guest_path.substr(
+            index, next == std::string::npos ? std::string::npos : next - index);
+        if (piece == "..") {
+            if (!parts.empty()) {
+                parts.pop_back();
+            }
+        } else if (!piece.empty() && piece != ".") {
+            parts.push_back(piece);
+        }
+        if (next == std::string::npos) {
+            break;
+        }
+        index = next + 1;
+    }
+    std::string resolved = guest_root;
+    for (const auto& piece : parts) {
+        resolved += '/';
+        resolved += piece;
+    }
+    return resolved;
+}
+
 struct fathom_session {
     std::unique_ptr<fathom::GuestAddressSpace> space;
     std::unique_ptr<DeferredThreadControl> control;
@@ -93,6 +123,8 @@ struct fathom_session {
 
     std::string program_path;
     fathom::LoadedImage image {};
+    fathom::LoadedImage interpreter {};  ///< The dynamic loader, when the program needs one.
+    bool dynamic {};
     fathom::StackImage stack {};
 
     std::atomic<int> state {FATHOM_STATE_IDLE};
@@ -177,12 +209,6 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     if (!inspection.ok) {
         return fail(inspection.error);
     }
-    if (inspection.kind == fathom::ProgramKind::Dynamic) {
-        return fail("this program is dynamically linked and needs " + inspection.interpreter +
-                    ", which means a guest root filesystem Fathom does not have yet. A "
-                    "statically linked build (ideally -static-pie) runs as-is.");
-    }
-
     std::string reason;
     const uint64_t arena_size =
         config->address_space_size != 0 ? config->address_space_size : kDefaultAddressSpace;
@@ -193,6 +219,33 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
 
     if (!fathom::LoadElf(session->program_path, *session->space, 0, &session->image, reason)) {
         return fail(reason);
+    }
+
+    // A dynamically linked program does not begin at its own entry point. The kernel maps
+    // its interpreter -- ld.so -- alongside it and enters *that*; ld.so then loads the
+    // shared libraries the program needs and jumps to the program itself. AT_BASE on the
+    // initial stack is how ld.so discovers where it was placed.
+    if (inspection.kind == fathom::ProgramKind::Dynamic) {
+        const std::string guest_root = config->guest_root == nullptr ? "" : config->guest_root;
+        if (guest_root.empty()) {
+            return fail("this program is dynamically linked and needs " + inspection.interpreter +
+                        ", but no guest root filesystem is configured.");
+        }
+        const std::string loader = ResolveInGuestRoot(guest_root, inspection.interpreter);
+        if (access(loader.c_str(), R_OK) != 0) {
+            return fail("this program needs its dynamic loader, " + inspection.interpreter +
+                        ", which the guest root filesystem does not provide. Install a root "
+                        "filesystem that contains it.");
+        }
+        if (!fathom::LoadElf(loader, *session->space, session->image.image_end,
+                             &session->interpreter, reason)) {
+            return fail("could not load the dynamic loader " + inspection.interpreter + ": " + reason);
+        }
+        session->dynamic = true;
+        FATHOM_INFO("dynamic: loader %s based at %#llx, program entry %#llx",
+                    inspection.interpreter.c_str(),
+                    static_cast<unsigned long long>(session->interpreter.load_base),
+                    static_cast<unsigned long long>(session->image.entry));
     }
 
     std::vector<std::string> argv;
@@ -215,7 +268,8 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
 
     const uint64_t stack_size = config->stack_size != 0 ? config->stack_size : kDefaultStack;
     if (!fathom::BuildInitialStack(*session->space, session->image, argv, envp, session->program_path,
-                                   0, stack_size, &session->stack, reason)) {
+                                   session->dynamic ? session->interpreter.load_base : 0,
+                                   stack_size, &session->stack, reason)) {
         return fail(reason);
     }
 
@@ -231,7 +285,8 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     // The heap is placed right after the image so a guest malloc that walks up from brk
     // sees the layout it expects. It is reserved, not touched -- nothing is paged in
     // until the guest actually writes.
-    const uint64_t heap = session->space->Allocate(kHeapReservation, session->image.image_end,
+    const uint64_t images_end = std::max(session->image.image_end, session->interpreter.image_end);
+    const uint64_t heap = session->space->Allocate(kHeapReservation, images_end,
                                                   fathom::kGuestProtRead | fathom::kGuestProtWrite);
     if (heap == 0) {
         return fail("could not reserve the guest heap");
@@ -251,7 +306,8 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     }
     session->control->Bind(session->engine.get());
 
-    if (!session->engine->Prepare(session->image.entry, session->stack.rsp, reason)) {
+    const uint64_t start = session->dynamic ? session->interpreter.entry : session->image.entry;
+    if (!session->engine->Prepare(start, session->stack.rsp, reason)) {
         return fail(reason);
     }
 

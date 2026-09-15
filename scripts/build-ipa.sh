@@ -9,8 +9,14 @@ SCHEME="Fathom"
 CONFIGURATION="${CONFIGURATION:-Release}"
 DEST_DIR="${1:-$HOME/Desktop}"
 
-if [[ ! -d "$APP_DIR/$SCHEME.xcodeproj" ]]; then
+# Always regenerated: the project lists its Swift sources explicitly, so a file added
+# since the last build would silently not be compiled.
+if true; then
     echo "==> Generating the Xcode project"
+    # The guest root filesystem is a fetched artefact rather than a checked-in blob.
+    if [ ! -f "$REPO_ROOT/Fathom/Resources/guest-rootfs.tar" ]; then
+        bash "$REPO_ROOT/scripts/fetch-rootfs.sh"
+    fi
     ruby "$REPO_ROOT/scripts/generate_project.rb"
 fi
 

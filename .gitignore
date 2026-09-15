@@ -18,3 +18,6 @@ xcuserdata/
 # Notes to self, kept local and out of the repo.
 CLAUDE.md
 NEXT.md
+
+# Fetched by scripts/fetch-rootfs.sh, not checked in.
+Fathom/Resources/guest-rootfs.tar

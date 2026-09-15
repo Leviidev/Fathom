@@ -443,9 +443,11 @@ const char* SyscallName(uint64_t number) {
 
 } // namespace
 
-LinuxSyscalls::LinuxSyscalls(GuestAddressSpace& space, GuestThreadControl& control, SyscallConfig config)
+LinuxSyscalls::LinuxSyscalls(GuestAddressSpace& space, GuestThreadControl& control,
+                             GuestConsole& console, SyscallConfig config)
     : space_ {space}
     , control_ {control}
+    , console_ {console}
     , config_ {std::move(config)} {
     if (!config_.work_dir.empty()) {
         cwd_ = NormaliseGuestPath(config_.work_dir);
@@ -468,30 +470,6 @@ void LinuxSyscalls::CloseAll() {
         }
     }
     files_.clear();
-}
-
-void LinuxSyscalls::SetOutputCallback(OutputCallback callback, void* context) {
-    std::scoped_lock lock {mutex_};
-    output_ = callback;
-    output_context_ = context;
-}
-
-void LinuxSyscalls::RequestStop() {
-    stop_requested_.store(true, std::memory_order_relaxed);
-    // A guest parked in read() is not at a syscall boundary and would otherwise wait for
-    // a keystroke that is never coming.
-    input_ready_.notify_all();
-}
-
-void LinuxSyscalls::SendInput(const char* bytes, size_t length) {
-    if (bytes == nullptr || length == 0) {
-        return;
-    }
-    {
-        std::scoped_lock lock {input_mutex_};
-        input_.insert(input_.end(), bytes, bytes + length);
-    }
-    input_ready_.notify_all();
 }
 
 void LinuxSyscalls::InitialiseHeap(uint64_t base, uint64_t reserved) {
@@ -685,16 +663,7 @@ uint64_t LinuxSyscalls::DoWrite(int fd, uint64_t buffer, uint64_t count) {
     }
 
     if (fd == 1 || fd == 2) {
-        OutputCallback callback = nullptr;
-        void* context = nullptr;
-        {
-            std::scoped_lock lock {mutex_};
-            callback = output_;
-            context = output_context_;
-        }
-        if (callback != nullptr) {
-            callback(context, fd, static_cast<const char*>(data), count);
-        }
+        console_.Write(fd, static_cast<const char*>(data), count);
         return count;
     }
 
@@ -713,30 +682,15 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
         return count == 0 ? 0 : FailLinux(14);
     }
     if (fd == 0) {
-        std::unique_lock lock {input_mutex_};
-        while (input_.empty()) {
-            if (stop_requested_.load(std::memory_order_relaxed)) {
-                // Unlocked by hand: ExitGuest unwinds by long jump and no destructor
-                // between here and the run loop will ever run.
-                lock.unlock();
-                exit_status_ = -1;
-                control_.ExitGuest(-1);
-            }
-            if (nonblocking_stdin_.load(std::memory_order_relaxed)) {
-                return FailLinux(11); // EAGAIN
-            }
-            // Woken by SendInput; the timeout only exists so a stop request is noticed
-            // even if no key ever arrives.
-            input_ready_.wait_for(lock, std::chrono::milliseconds(100));
+        const int64_t read_bytes = console_.ReadInput(static_cast<char*>(data), count);
+        if (read_bytes < 0) {
+            return FailLinux(11); // EAGAIN
         }
-
-        const auto available = std::min<uint64_t>(count, input_.size());
-        auto* out = static_cast<char*>(data);
-        for (uint64_t index = 0; index < available; ++index) {
-            out[index] = input_.front();
-            input_.pop_front();
+        if (read_bytes == 0 && console_.StopRequested()) {
+            exit_status_ = -1;
+            control_.ExitGuest(-1);
         }
-        return available;
+        return static_cast<uint64_t>(read_bytes);
     }
 
     std::scoped_lock lock {mutex_};
@@ -773,8 +727,7 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
     // poll(NULL, 0, ms) is just a sleep, and some programs use it as one.
     if (count == 0) {
         if (timeout_ms > 0) {
-            std::unique_lock lock {input_mutex_};
-            input_ready_.wait_until(lock, deadline);
+            console_.WaitForInput(timeout_ms);
         }
         return 0;
     }
@@ -785,7 +738,7 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
     }
 
     for (;;) {
-        if (stop_requested_.load(std::memory_order_relaxed)) {
+        if (console_.StopRequested()) {
             exit_status_ = -1;
             control_.ExitGuest(-1);
         }
@@ -799,8 +752,7 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
             }
 
             if (entry.fd == 0) {
-                std::scoped_lock lock {input_mutex_};
-                if ((entry.events & kPollIn) != 0 && !input_.empty()) {
+                if ((entry.events & kPollIn) != 0 && console_.InputAvailable()) {
                     entry.revents |= kPollIn;
                 }
             } else if (entry.fd == 1 || entry.fd == 2) {
@@ -843,8 +795,7 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
         }
 
         // Sleep until a key arrives, in slices so a stop request is still noticed.
-        std::unique_lock lock {input_mutex_};
-        input_ready_.wait_for(lock, std::chrono::milliseconds(10));
+        console_.WaitForInput(10);
     }
 }
 
@@ -1093,8 +1044,7 @@ uint64_t LinuxSyscalls::DoBrk(uint64_t requested) {
 }
 
 bool LinuxSyscalls::EnsureFramebuffer() {
-    std::scoped_lock lock {framebuffer_mutex_};
-    if (framebuffer_.address != 0) {
+    if (console_.Display().address != 0) {
         return true;
     }
 
@@ -1107,16 +1057,11 @@ bool LinuxSyscalls::EnsureFramebuffer() {
     }
     std::memset(reinterpret_cast<void*>(address), 0, size);
 
-    framebuffer_ = Framebuffer {address, kDisplayWidth, kDisplayHeight, stride, kDisplayBpp};
+    console_.SetFramebuffer(Framebuffer {address, kDisplayWidth, kDisplayHeight, stride, kDisplayBpp});
     FATHOM_INFO("display: %ux%u at %u bpp, %llu KB at %#llx", kDisplayWidth, kDisplayHeight,
                 kDisplayBpp, static_cast<unsigned long long>(size / 1024),
                 static_cast<unsigned long long>(address));
     return true;
-}
-
-LinuxSyscalls::Framebuffer LinuxSyscalls::Display() const {
-    std::scoped_lock lock {framebuffer_mutex_};
-    return framebuffer_;
 }
 
 uint64_t LinuxSyscalls::DoFramebufferIoctl(uint64_t request, uint64_t argument) {
@@ -1150,7 +1095,7 @@ uint64_t LinuxSyscalls::DoFramebufferIoctl(uint64_t request, uint64_t argument) 
     case guest::kFbioPanDisplay:
         // There is only one buffer, so panning is where a frame ends -- the one moment
         // the guest tells us it has finished drawing.
-        frame_presentations_.fetch_add(1, std::memory_order_relaxed);
+        console_.NotePresentation();
         return 0;
     case guest::kFbioBlank:
         return 0;
@@ -1225,16 +1170,16 @@ uint64_t LinuxSyscalls::DoReadlinkAt(int dirfd, uint64_t path_address, uint64_t 
 
 uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3,
                                uint64_t arg4, uint64_t arg5, uint64_t arg6) {
-    syscall_count_.fetch_add(1, std::memory_order_relaxed);
+    console_.NoteSyscall();
 
-    if (stop_requested_.load(std::memory_order_relaxed)) {
+    if (console_.StopRequested()) {
         // Every syscall is a safe point to unwind from, which is what makes "stop" feel
         // immediate for anything that talks to the outside world at all.
         exit_status_ = -1;
         control_.ExitGuest(-1);
     }
 
-    const auto count = syscall_count_.load(std::memory_order_relaxed);
+    const auto count = console_.SyscallCount();
     NoteSyscall(number, arg1, count);
 
     if (config_.trace) {
@@ -1407,7 +1352,9 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             }
             const uint32_t lflag = *reinterpret_cast<const uint32_t*>(termios_in + 12);
             const bool raw = (lflag & guest::kIcanon) == 0;
-            if (raw != raw_mode_.exchange(raw, std::memory_order_relaxed)) {
+            const bool was_raw = console_.WantsKeys();
+            console_.SetRawMode(raw);
+            if (raw != was_raw) {
                 FATHOM_INFO("guest terminal mode: %s", raw ? "raw (wants individual keys)" : "canonical");
             }
             return 0;
@@ -1533,7 +1480,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         const int command = static_cast<int>(arg2);
         if (command == kGuestFSetfl && static_cast<int>(arg1) == 0) {
             const bool nonblocking = (arg3 & guest::kONonBlock) != 0;
-            nonblocking_stdin_.store(nonblocking, std::memory_order_relaxed);
+            console_.SetNonblockingStdin(nonblocking);
             return 0;
         }
         if (command == kGuestFGetfd || command == kGuestFSetfd) {
@@ -1748,7 +1695,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysExitGroup:
         exit_status_ = static_cast<int>(arg1);
         FATHOM_INFO("guest exited with status %d after %llu syscalls", exit_status_,
-                    static_cast<unsigned long long>(syscall_count_.load(std::memory_order_relaxed)));
+                    static_cast<unsigned long long>(console_.SyscallCount()));
         control_.ExitGuest(exit_status_);
 
     case kSysClone:

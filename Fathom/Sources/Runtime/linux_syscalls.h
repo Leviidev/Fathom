@@ -15,6 +15,7 @@
 //     x86-64 Linux binary expects, rather than memcpy'ing a host struct across.
 #pragma once
 
+#include "guest_console.h"
 #include "guest_memory.h"
 
 #include <atomic>
@@ -42,9 +43,6 @@ public:
     [[noreturn]] virtual void ExitGuest(int status) = 0;
 };
 
-/// Where the guest's stdout and stderr go.
-using OutputCallback = void (*)(void* context, int fd, const char* bytes, size_t length);
-
 struct SyscallConfig {
     std::string guest_root;  ///< Host directory presented to the guest as "/".
     std::string work_dir {"/"};
@@ -53,7 +51,8 @@ struct SyscallConfig {
 
 class LinuxSyscalls {
 public:
-    LinuxSyscalls(GuestAddressSpace& space, GuestThreadControl& control, SyscallConfig config);
+    LinuxSyscalls(GuestAddressSpace& space, GuestThreadControl& control, GuestConsole& console,
+                  SyscallConfig config);
     ~LinuxSyscalls();
 
     /// Entry point from FEXCore. `number` is RAX; the arguments are RDI, RSI, RDX, R10,
@@ -62,31 +61,25 @@ public:
     uint64_t Handle(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4,
                     uint64_t arg5, uint64_t arg6);
 
-    void SetOutputCallback(OutputCallback callback, void* context);
+    void SetOutputCallback(OutputCallback callback, void* context) { console_.SetOutputCallback(callback, context); }
 
     /// Queues bytes for the guest to read from fd 0. Safe from any thread.
-    void SendInput(const char* bytes, size_t length);
+    void SendInput(const char* bytes, size_t length) { console_.SendInput(bytes, length); }
 
     /// True once the guest has asked for raw (non-canonical) terminal mode.
-    bool WantsKeys() const { return raw_mode_.load(std::memory_order_relaxed); }
+    bool WantsKeys() const { return console_.WantsKeys(); }
 
-    struct Framebuffer {
-        uint64_t address {};
-        uint32_t width {};
-        uint32_t height {};
-        uint32_t stride {};
-        uint32_t bits_per_pixel {};
-    };
+    using Framebuffer = GuestConsole::Framebuffer;
 
     /// The guest's display, once it has opened /dev/fb0. `address` is 0 until then.
-    Framebuffer Display() const;
-    uint64_t FramePresentations() const { return frame_presentations_.load(std::memory_order_relaxed); }
+    Framebuffer Display() const { return console_.Display(); }
+    uint64_t FramePresentations() const { return console_.FramePresentations(); }
 
-    /// Asks the guest to stop at the next syscall. Safe from any thread.
-    void RequestStop();
-    bool StopRequested() const { return stop_requested_.load(std::memory_order_relaxed); }
+    /// Asks every guest process to stop at its next syscall. Safe from any thread.
+    void RequestStop() { console_.RequestStop(); }
+    bool StopRequested() const { return console_.StopRequested(); }
 
-    uint64_t SyscallCount() const { return syscall_count_.load(std::memory_order_relaxed); }
+    uint64_t SyscallCount() const { return console_.SyscallCount(); }
     int ExitStatus() const { return exit_status_; }
 
     /// Where the guest's heap starts; established once the program image is loaded.
@@ -139,39 +132,23 @@ private:
 
     GuestAddressSpace& space_;
     GuestThreadControl& control_;
+    GuestConsole& console_;
     SyscallConfig config_;
 
     mutable std::mutex mutex_;
     std::map<int, OpenFile> files_;
     std::string cwd_ {"/"};
 
-    OutputCallback output_ {};
-    void* output_context_ {};
+    /// Per-process: what this process passed to exit, and where set_tid_address pointed.
+    int exit_status_ {};
 
     uint64_t heap_base_ {};
     uint64_t heap_limit_ {};
     uint64_t heap_break_ {};
 
-    std::atomic<uint64_t> syscall_count_ {0};
-    std::atomic<bool> stop_requested_ {false};
-    int exit_status_ {0};
-
     /// Guest address passed to set_tid_address, cleared on exit the way Linux does.
     uint64_t clear_child_tid_ {};
 
-    // Standard input. A guest reading a terminal blocks until a key arrives, so this is a
-    // real queue with a real wait rather than an immediate end-of-input.
-    mutable std::mutex input_mutex_;
-    std::condition_variable input_ready_;
-    std::deque<char> input_;
-    std::atomic<bool> raw_mode_ {false};
-    std::atomic<bool> nonblocking_stdin_ {false};
-
-    // The guest's display. Allocated out of the guest arena the first time /dev/fb0 is
-    // opened, so the guest can mmap it and write pixels straight into it.
-    mutable std::mutex framebuffer_mutex_;
-    Framebuffer framebuffer_;
-    std::atomic<uint64_t> frame_presentations_ {0};
 };
 
 } // namespace fathom

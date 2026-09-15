@@ -6,6 +6,7 @@
 #include "elf_loader.h"
 #include "fathom_log.h"
 #include "fex_engine.h"
+#include "guest_console.h"
 #include "guest_memory.h"
 #include "guest_path.h"
 #include "linux_syscalls.h"
@@ -87,6 +88,9 @@ constexpr uint32_t kCsDebugged = 0x10000000;
 } // namespace
 
 struct fathom_session {
+    /// Shared by every guest process: one keyboard, one screen, one stop.
+    fathom::GuestConsole console;
+
     std::unique_ptr<fathom::GuestAddressSpace> space;
     std::unique_ptr<DeferredThreadControl> control;
     std::unique_ptr<fathom::LinuxSyscalls> syscalls;
@@ -262,7 +266,8 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
 
     session->control = std::make_unique<DeferredThreadControl>();
     session->syscalls =
-        std::make_unique<fathom::LinuxSyscalls>(*session->space, *session->control, syscall_config);
+        std::make_unique<fathom::LinuxSyscalls>(*session->space, *session->control, session->console,
+                                                syscall_config);
 
     // The heap is placed right after the image so a guest malloc that walks up from brk
     // sees the layout it expects. It is reserved, not touched -- nothing is paged in

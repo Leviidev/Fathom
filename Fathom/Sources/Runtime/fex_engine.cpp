@@ -616,22 +616,26 @@ std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, Li
                                 ? parent_state.gregs[FEXCore::X86State::REG_RCX]
                                 : parent_state.rip + 2; // 0F 05, for a guest that got here via int 0x80
 
-    impl->thread = impl_->context->CreateThread(resume,
-                                                parent_state.gregs[FEXCore::X86State::REG_RSP]);
+    // Handed to CreateThread rather than memcpy'd in afterwards. FEX copies the state
+    // first and *then* does its own per-thread setup on top -- InitializeCompiler, and
+    // clearing DeferredSignalRefCount. Copying over the register file after the fact
+    // undoes exactly that work and leaves the child holding its parent's signal
+    // bookkeeping, which is how a second running thread ends up dereferencing null.
+    FEXCore::Core::CPUState child_state;
+    std::memcpy(&child_state, &parent_state, sizeof(child_state));
+    child_state.rip = resume;
+    child_state.gregs[FEXCore::X86State::REG_RAX] = 0;
+
+    impl->thread = impl_->context->CreateThread(resume, child_state.gregs[FEXCore::X86State::REG_RSP],
+                                                &child_state);
     if (impl->thread == nullptr) {
         error = "FEXCore could not create the child guest thread";
         return nullptr;
     }
 
-    // The child is its parent, register for register, except for RAX. That single
-    // difference is how a program knows which side of a fork it is on.
+    // The call/return stack and the segment table are reached through the register file,
+    // and the child must not share its parent's.
     auto& state = impl->thread->CurrentFrame->State;
-    std::memcpy(&state, &parent_state, sizeof(state));
-    state.rip = resume;
-    state.gregs[FEXCore::X86State::REG_RAX] = 0;
-
-    // The copy above brought the parent's pointers to its own call/return stack and
-    // segment table with it, and those must not be shared.
     impl->segments.Initialise(state);
     impl->callret->Attach(impl->thread);
 

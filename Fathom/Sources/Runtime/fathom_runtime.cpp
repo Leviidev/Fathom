@@ -198,8 +198,14 @@ struct GuestProcess {
     std::unique_ptr<fathom::LinuxSyscalls> syscalls;
     std::unique_ptr<fathom::GuestThread> thread;
     LoadedProgram program;
-    /// What this process was running before an execve replaced it, kept only so its
-    /// stack and heap can be given back once the switch is complete.
+    /// Whether this process loaded `program` itself. A forked child does not: it shares
+    /// its parent's image, stack and heap until it execs, and freeing them on its behalf
+    /// pulls the ground out from under the still-running parent.
+    bool owns_program {};
+
+    /// What this process was running before an execve replaced it, kept only so its stack
+    /// and heap can be given back once the switch is complete -- and only if they were
+    /// ever this process's to give.
     LoadedProgram previous_program;
     bool has_previous {};
 
@@ -218,6 +224,27 @@ struct GuestProcess {
     /// A vforked parent waits for this: set when the child execs or exits, whichever
     /// comes first, because either one means it is no longer using the parent's stack.
     bool released {};
+
+    /// The parent's writable memory, as it was at the moment of the fork.
+    ///
+    /// Sharing memory with the parent is what makes this fork cheap, and it is also what
+    /// breaks it: busybox calls fork() and expects a private copy of everything, so the
+    /// child returns through its parent's stack frames, writes to its parent's globals,
+    /// and allocates out of its parent's heap, all before reaching exec. The parent then
+    /// resumes into the wreckage.
+    ///
+    /// Holding a copy and putting it back before the parent runs again gives the parent
+    /// the fork semantics it was promised, for the case that matters -- a child that
+    /// execs or exits promptly. It is not general: a child that keeps running without
+    /// execing still shares memory, and real copy-on-write is what that would need. The
+    /// regions are small (a shell at a fork has a few kilobytes of live stack and heap,
+    /// and about a megabyte of image), so the copy costs well under a millisecond.
+    /// Address and contents of each region held for the parent.
+    struct BorrowedRegion {
+        uint64_t address {};
+        std::vector<uint8_t> bytes;
+    };
+    std::vector<BorrowedRegion> borrowed;
 };
 
 struct fathom_session final : fathom::ProcessHost {
@@ -310,8 +337,15 @@ fathom::RunResult fathom_session::RunProcess(GuestProcess* process) {
             result.message = reason;
             break;
         }
+        // The outgoing thread is kept alive until the control block points at the new
+        // one, so there is no instant where it refers to a destroyed thread.
+        auto outgoing = std::move(process->thread);
         process->thread = std::move(fresh);
         process->control->Bind(process->thread.get());
+        outgoing.reset();
+
+        // Now, and not before, the child counts as having exec'd.
+        ReleaseParent(process);
 
         // Safe only here: the replaced program's stack is no longer under any guest
         // register, and its heap is unreachable.
@@ -326,6 +360,14 @@ fathom::RunResult fathom_session::RunProcess(GuestProcess* process) {
 void fathom_session::ReleaseParent(GuestProcess* process) {
     {
         std::scoped_lock lock {process_mutex};
+        for (auto& region : process->borrowed) {
+            // Put the parent's memory back exactly as the fork found it, before anything
+            // lets the parent run on it again.
+            std::memcpy(reinterpret_cast<void*>(region.address), region.bytes.data(),
+                        region.bytes.size());
+        }
+        process->borrowed.clear();
+        process->borrowed.shrink_to_fit();
         process->released = true;
     }
     process_changed.notify_all();
@@ -347,7 +389,10 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         child->pid = child_pid;
         child->ppid = caller_pid;
         child->path = parent->path;
+        // Shared, not owned: until this child execs it is running inside its parent's
+        // image and on its parent's stack.
         child->program = parent->program;
+        child->owns_program = false;
         child->control = std::make_unique<DeferredThreadControl>();
 
         fathom::SyscallConfig child_config;
@@ -372,6 +417,38 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
                     static_cast<unsigned long long>(child->thread->Rip()),
                     static_cast<unsigned long long>(child->thread->Rsp()),
                     static_cast<unsigned long long>(child->thread->Rax()));
+
+        // Taken before the child runs a single instruction.
+        uint64_t held = 0;
+        const auto hold = [&](uint64_t from, uint64_t to) {
+            if (to <= from) {
+                return;
+            }
+            const auto* bytes = reinterpret_cast<const uint8_t*>(from);
+            child->borrowed.push_back({from, std::vector<uint8_t>(bytes, bytes + (to - from))});
+            held += to - from;
+        };
+
+        // The live stack: everything from the parent's stack pointer up to the top.
+        const uint64_t rsp = parent->thread->Rsp();
+        const uint64_t stack_low = parent->program.stack.stack_base;
+        const uint64_t stack_top = stack_low + parent->program.stack.stack_size;
+        if (rsp >= stack_low && rsp < stack_top) {
+            hold(rsp, stack_top);
+        }
+        // The images, which is where the globals live.
+        hold(parent->program.image.image_begin, parent->program.image.image_end);
+        if (parent->program.dynamic) {
+            hold(parent->program.interpreter.image_begin, parent->program.interpreter.image_end);
+        }
+        // The part of the heap that has actually been handed out.
+        const uint64_t heap_used = parent->syscalls->HeapBreak();
+        if (heap_used > parent->program.heap) {
+            hold(parent->program.heap, heap_used);
+        }
+
+        FATHOM_INFO("fork: holding %llu KB of pid %d's memory while pid %d borrows it",
+                    static_cast<unsigned long long>(held / 1024), caller_pid, child_pid);
 
         child_raw = child.get();
         processes[child_pid] = std::move(child);
@@ -436,8 +513,9 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& path,
     }
 
     process->previous_program = process->program;
-    process->has_previous = true;
+    process->has_previous = process->owns_program;
     process->program = loaded;
+    process->owns_program = true;
     process->path = path;
     process->exec_entry = loaded.entry;
     process->exec_rsp = loaded.stack.rsp;
@@ -446,8 +524,10 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& path,
     FATHOM_INFO("execve: pid %d is now %s (entry %#llx)", caller_pid, path.c_str(),
                 static_cast<unsigned long long>(loaded.entry));
 
-    // The child is done with its parent's stack, so a vforked parent may run again.
-    ReleaseParent(process);
+    // Deliberately not released here. The parent may only resume once the child is
+    // running its new image: until then the child is still creating a thread inside the
+    // same FEXCore context the parent would be executing in, and the two racing there is
+    // a segfault with no useful backtrace. RunProcess releases it.
 
     // Never returns: unwinds out of the JIT, and this process's run loop restarts it on
     // the image just loaded.
@@ -463,9 +543,15 @@ void* RunChildThread(void* raw) {
 
     FATHOM_INFO("pid %d: running", process->pid);
     const auto result = session->RunProcess(process);
+    // If this child exited without ever execing, the parent is still waiting and its
+    // stack is still borrowed.
+    session->ReleaseParent(process);
     FATHOM_INFO("pid %d: finished (%s, status %d, rip=%#llx)", process->pid, result.message.c_str(),
                 result.status, static_cast<unsigned long long>(result.rip));
-    ReleaseProgramData(*session->space, process->program);
+    // A child that exited without ever execing is still standing on its parent's stack.
+    if (process->owns_program) {
+        ReleaseProgramData(*session->space, process->program);
+    }
     {
         std::scoped_lock lock {session->process_mutex};
         process->finished = true;
@@ -638,6 +724,7 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     process->pid = 1;
     process->ppid = 0;
     process->path = session->program_path;
+    process->owns_program = true;
 
     if (!LoadProgram(*session->space, session->guest_root, session->program_path, argv, envp,
                      session->stack_size, &process->program, reason)) {

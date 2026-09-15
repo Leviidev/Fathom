@@ -16,6 +16,7 @@
 #include <initializer_list>
 #include <cstring>
 #include <fcntl.h>
+#include <execinfo.h>
 #include <unistd.h>
 
 namespace fathom {
@@ -121,6 +122,16 @@ void Handle(int number, siginfo_t* info, void* context) {
         WriteHex(rip);
     }
     WriteText("\n=== END ===\n");
+
+    // A host backtrace, which is the difference between "it crashed somewhere" and
+    // knowing which function. backtrace() walks the frame pointers and touches no locks,
+    // which is about as safe as anything gets inside a signal handler; backtrace_symbols
+    // would allocate, so the raw addresses are written and symbolised afterwards with
+    // atos or llvm-symbolizer.
+    WriteText("\nhost backtrace:\n");
+    void* frames[32];
+    const int depth = backtrace(frames, 32);
+    backtrace_symbols_fd(frames, depth, g_crash_fd);
 
     fsync(g_crash_fd);
 

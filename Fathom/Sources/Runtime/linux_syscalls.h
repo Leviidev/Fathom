@@ -121,6 +121,9 @@ public:
     uint64_t SyscallCount() const { return console_.SyscallCount(); }
     int ExitStatus() const { return exit_status_; }
 
+    /// How far brk has grown: the part of the heap a fork actually has to preserve.
+    uint64_t HeapBreak() const { return heap_break_; }
+
     /// Where the guest's heap starts; established once the program image is loaded.
     void InitialiseHeap(uint64_t base, uint64_t reserved);
 

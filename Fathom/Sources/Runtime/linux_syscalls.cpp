@@ -312,6 +312,10 @@ enum : uint64_t {
     kSysSemctl = 66,
     kSysMknod = 133,
     kSysMknodat = 259,
+    kSysShmget = 29,
+    kSysShmat = 30,
+    kSysShmctl = 31,
+    kSysShmdt = 67,
     kSysEpollCreate = 213,
     kSysEpollWait = 232,
     kSysEpollCtl = 233,
@@ -688,6 +692,10 @@ const char* SyscallName(uint64_t number) {
     case kSysEpollCtl: return "epoll_ctl";
     case kSysEpollWait: return "epoll_wait";
     case kSysEpollPwait: return "epoll_pwait";
+    case kSysShmget: return "shmget";
+    case kSysShmat: return "shmat";
+    case kSysShmctl: return "shmctl";
+    case kSysShmdt: return "shmdt";
     case kSysTimerfdCreate: return "timerfd_create";
     case kSysTimerfdSettime: return "timerfd_settime";
     case kSysTimerfdGettime: return "timerfd_gettime";
@@ -3085,6 +3093,136 @@ int ToHostSemctlCommand(int guest_command, bool* supported) {
 
 } // namespace
 
+namespace {
+
+/// A System V shared memory segment.
+///
+/// Sharing memory between guest processes needs no kernel here, because they already
+/// share one: every guest process is a thread of this one, in one arena. A segment is a
+/// range of that arena, and every process that attaches to it is handed the same guest
+/// address -- which is not what Linux promises, but is indistinguishable from it for a
+/// caller that asked the kernel to pick the address, and that is every caller X11's
+/// MIT-SHM has.
+///
+/// Doing it this way rather than through Darwin's own System V shm also sidesteps a
+/// 4MB default segment limit that a window the size of a screen goes straight past.
+struct SharedSegment {
+    int32_t key {};
+    uint64_t guest_address {};
+    uint64_t size {};
+    int attachments {};
+    bool removed {};
+};
+
+std::mutex g_shared_memory_mutex;
+std::map<int, SharedSegment> g_shared_segments;
+int g_next_shared_id = 1;
+
+} // namespace
+
+uint64_t LinuxSyscalls::DoShmget(int32_t key, uint64_t size, int flags) {
+    constexpr int kIpcCreat = 0001000;
+    constexpr int kIpcExcl = 0002000;
+    constexpr int32_t kIpcPrivate = 0;
+
+    std::scoped_lock lock {g_shared_memory_mutex};
+    if (key != kIpcPrivate) {
+        for (const auto& [id, segment] : g_shared_segments) {
+            if (segment.key != key || segment.removed) {
+                continue;
+            }
+            if ((flags & kIpcCreat) != 0 && (flags & kIpcExcl) != 0) {
+                return FailLinux(17); // EEXIST
+            }
+            if (size != 0 && segment.size < size) {
+                return FailLinux(22); // EINVAL: the existing one is too small.
+            }
+            return static_cast<uint64_t>(id);
+        }
+        if ((flags & kIpcCreat) == 0) {
+            return FailLinux(2); // ENOENT
+        }
+    }
+    if (size == 0) {
+        return FailLinux(22);
+    }
+    const uint64_t host = space_.Allocate(size, 0, kGuestProtRead | kGuestProtWrite);
+    if (host == 0) {
+        return FailLinux(12); // ENOMEM
+    }
+    std::memset(reinterpret_cast<void*>(host), 0, size);
+    const int id = g_next_shared_id++;
+    g_shared_segments[id] = SharedSegment {key, ToGuest(host), size, 0, false};
+    return static_cast<uint64_t>(id);
+}
+
+uint64_t LinuxSyscalls::DoShmat(int id, uint64_t address, int flags) {
+    (void)address;  // The caller's hint; every segment already has one address.
+    (void)flags;
+    std::scoped_lock lock {g_shared_memory_mutex};
+    const auto entry = g_shared_segments.find(id);
+    if (entry == g_shared_segments.end()) {
+        return FailLinux(22);
+    }
+    entry->second.attachments += 1;
+    return entry->second.guest_address;
+}
+
+uint64_t LinuxSyscalls::DoShmdt(uint64_t address) {
+    std::scoped_lock lock {g_shared_memory_mutex};
+    for (auto entry = g_shared_segments.begin(); entry != g_shared_segments.end(); ++entry) {
+        if (entry->second.guest_address != address) {
+            continue;
+        }
+        if (entry->second.attachments > 0) {
+            entry->second.attachments -= 1;
+        }
+        // Linux frees a removed segment once the last attachment goes, not when it was
+        // marked -- Xlib relies on exactly that, removing a segment the moment it has
+        // attached so a crash cannot leak it.
+        if (entry->second.removed && entry->second.attachments == 0) {
+            space_.Release(ToHost(entry->second.guest_address), entry->second.size);
+            g_shared_segments.erase(entry);
+        }
+        return 0;
+    }
+    return FailLinux(22);
+}
+
+uint64_t LinuxSyscalls::DoShmctl(int id, int command, uint64_t buffer) {
+    constexpr int kIpcRmid = 0;
+    constexpr int kIpcStat = 2;
+
+    std::scoped_lock lock {g_shared_memory_mutex};
+    const auto entry = g_shared_segments.find(id);
+    if (entry == g_shared_segments.end()) {
+        return FailLinux(22);
+    }
+    switch (command & 0xFF) {
+    case kIpcRmid:
+        entry->second.removed = true;
+        if (entry->second.attachments == 0) {
+            space_.Release(ToHost(entry->second.guest_address), entry->second.size);
+            g_shared_segments.erase(entry);
+        }
+        return 0;
+    case kIpcStat: {
+        // Only the size is answered for, at the offset struct shmid_ds keeps it at:
+        // after struct ipc_perm, which is 48 bytes on x86-64 and 40 on i386.
+        const size_t size_offset = config_.guest_is_32bit ? 40 : 48;
+        const size_t width = config_.guest_is_32bit ? 4 : 8;
+        auto* out = static_cast<unsigned char*>(GuestPointer(buffer, size_offset + width, true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        std::memcpy(out + size_offset, &entry->second.size, width);
+        return 0;
+    }
+    default:
+        return FailLinux(22);
+    }
+}
+
 uint64_t LinuxSyscalls::DoSemget(int32_t key, int count, int flags) {
     const int id = semget(static_cast<key_t>(key), count, flags);
     return id < 0 ? Fail(errno) : static_cast<uint64_t>(id);
@@ -3182,8 +3320,33 @@ uint64_t LinuxSyscalls::DoIpc(uint64_t call, uint64_t first, uint64_t second, ui
     constexpr uint64_t kSemget = 2;
     constexpr uint64_t kSemctl = 3;
     constexpr uint64_t kSemtimedop = 4;
+    constexpr uint64_t kShmat = 21;
+    constexpr uint64_t kShmdt = 22;
+    constexpr uint64_t kShmget = 23;
+    constexpr uint64_t kShmctl = 24;
 
     switch (call & 0xFFFF) {
+    case kShmat: {
+        // sys_ipc does not return the address: it writes it through `third` and returns
+        // zero, which is the one place shmat's signature differs from every other libc.
+        const uint64_t result = DoShmat(static_cast<int>(first), pointer,
+                                        static_cast<int>(second));
+        if (static_cast<int64_t>(result) < 0 && static_cast<int64_t>(result) > -4096) {
+            return result;
+        }
+        auto* out = static_cast<uint32_t*>(GuestPointer(third, sizeof(uint32_t), true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        *out = static_cast<uint32_t>(result);
+        return 0;
+    }
+    case kShmdt:
+        return DoShmdt(pointer);
+    case kShmget:
+        return DoShmget(static_cast<int32_t>(first), second, static_cast<int>(third));
+    case kShmctl:
+        return DoShmctl(static_cast<int>(first), static_cast<int>(second), pointer);
     case kSemop:
     case kSemtimedop:
         // The timeout is ignored: semop blocks until it can proceed, which is the same
@@ -5027,6 +5190,18 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return DoMknodAt(guest::kAtFdCwd, arg1, static_cast<uint32_t>(arg2));
     case kSysMknodat:
         return DoMknodAt(static_cast<int>(arg1), arg2, static_cast<uint32_t>(arg3));
+
+    case kSysShmget:
+        return DoShmget(static_cast<int32_t>(arg1), arg2, static_cast<int>(arg3));
+
+    case kSysShmat:
+        return DoShmat(static_cast<int>(arg1), arg2, static_cast<int>(arg3));
+
+    case kSysShmdt:
+        return DoShmdt(arg1);
+
+    case kSysShmctl:
+        return DoShmctl(static_cast<int>(arg1), static_cast<int>(arg2), arg3);
 
     case kSysTimerfdCreate:
         return DoTimerfdCreate(static_cast<int>(arg1), static_cast<int>(arg2));

@@ -31,4 +31,9 @@ void NoteSyscall(uint64_t number, uint64_t first_argument, uint64_t count);
 /// Records where the guest was, as of the last syscall boundary.
 void NoteGuestRip(uint64_t rip);
 
+/// Which guest process and thread this host thread is running, and which program. Kept
+/// per host thread rather than globally, because a crash report that names the last
+/// syscall any thread made says nothing about the one that died.
+void NoteGuestIdentity(int pid, int tid, bool is_32bit, const char* program);
+
 } // namespace fathom

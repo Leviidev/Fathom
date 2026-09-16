@@ -30,6 +30,14 @@ std::atomic<GuestStateDescriber> g_describer {nullptr};
 // is safe -- and the last syscall the guest made is usually the single most useful fact
 // about where it died.
 std::atomic<uint64_t> g_last_syscall {UINT64_MAX};
+
+// Per host thread, so that the handler -- which runs on the thread that faulted -- can
+// say who it was. A plain char buffer rather than a std::string: this is read from a
+// signal handler, where allocating is not allowed.
+thread_local int t_pid = 0;
+thread_local int t_tid = 0;
+thread_local bool t_is_32bit = false;
+thread_local char t_program[256] = {};
 std::atomic<uint64_t> g_last_syscall_arg {0};
 std::atomic<uint64_t> g_syscall_count {0};
 std::atomic<uint64_t> g_last_guest_rip {0};
@@ -135,6 +143,17 @@ void Handle(int number, siginfo_t* info, void* context) {
     WriteText("\nfault address: ");
     WriteHex(info == nullptr ? 0 : reinterpret_cast<uint64_t>(info->si_addr));
 
+    if (t_pid != 0) {
+        WriteText("\nin: pid ");
+        WriteDecimal(static_cast<uint64_t>(t_pid));
+        if (t_tid != 0 && t_tid != t_pid) {
+            WriteText(" tid ");
+            WriteDecimal(static_cast<uint64_t>(t_tid));
+        }
+        WriteText(t_is_32bit ? " (32-bit) " : " (64-bit) ");
+        WriteText(t_program);
+    }
+
     WriteText("\nguest syscalls so far: ");
     WriteDecimal(g_syscall_count.load(std::memory_order_relaxed));
 
@@ -229,6 +248,19 @@ void NoteSyscall(uint64_t number, uint64_t first_argument, uint64_t count) {
 
 void NoteGuestRip(uint64_t rip) {
     g_last_guest_rip.store(rip, std::memory_order_relaxed);
+}
+
+void NoteGuestIdentity(int pid, int tid, bool is_32bit, const char* program) {
+    t_pid = pid;
+    t_tid = tid;
+    t_is_32bit = is_32bit;
+    if (program != nullptr) {
+        size_t index = 0;
+        for (; index + 1 < sizeof(t_program) && program[index] != '\0'; ++index) {
+            t_program[index] = program[index];
+        }
+        t_program[index] = '\0';
+    }
 }
 
 } // namespace fathom

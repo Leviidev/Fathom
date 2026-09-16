@@ -3,6 +3,7 @@
 
 #include "fathom_api.h"
 
+#include "crash_handler.h"
 #include "elf_loader.h"
 #include "fathom_log.h"
 #include "fex_engine.h"
@@ -561,12 +562,15 @@ namespace {
 
 struct ThreadStart {
     fathom_session* session;
+    GuestProcess* process;
     GuestProcess::GuestThreadRecord* record;
 };
 
 void* RunGuestThread(void* raw) {
     std::unique_ptr<ThreadStart> start {static_cast<ThreadStart*>(raw)};
     FATHOM_INFO("tid %d: running", start->record->tid);
+    fathom::NoteGuestIdentity(start->process->pid, start->record->tid,
+                              start->process->is_32bit, start->process->path.c_str());
     const auto result = start->record->thread->Run();
 
     // A thread's descriptors are the process's, so nothing is closed here. What does have
@@ -596,6 +600,7 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
     }
 
     GuestProcess::GuestThreadRecord* record_raw = nullptr;
+    GuestProcess* process_raw = nullptr;
     int tid = 0;
     {
         std::scoped_lock lock {process_mutex};
@@ -683,9 +688,10 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
 
         record_raw = record.get();
         process->threads.push_back(std::move(record));
+        process_raw = process;
     }
 
-    auto* start = new ThreadStart {this, record_raw};
+    auto* start = new ThreadStart {this, process_raw, record_raw};
     pthread_attr_t attributes;
     pthread_attr_init(&attributes);
     pthread_attr_setstacksize(&attributes, kGuestThreadStack);
@@ -1027,6 +1033,8 @@ void* RunChildThread(void* raw) {
     auto* process = start->process;
 
     FATHOM_INFO("pid %d: running", process->pid);
+    fathom::NoteGuestIdentity(process->pid, process->pid, process->is_32bit,
+                              process->path.c_str());
     const auto result = session->RunProcess(process);
 
     // Its own threads first: they are still running inside the JIT, and everything they

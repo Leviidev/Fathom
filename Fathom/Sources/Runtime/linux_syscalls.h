@@ -356,6 +356,11 @@ private:
     uint64_t DoSemget(int32_t key, int count, int flags);
     uint64_t DoSemop(int id, uint64_t operations_address, uint64_t count);
     uint64_t DoSemctl(int id, int index, int command, uint64_t argument);
+    uint64_t DoShmget(int32_t key, uint64_t size, int flags);
+    uint64_t DoShmat(int id, uint64_t address, int flags);
+    uint64_t DoShmdt(uint64_t address);
+    uint64_t DoShmctl(int id, int command, uint64_t buffer);
+
     uint64_t DoTimerfdCreate(int clock_id, int flags);
     uint64_t DoTimerfdSettime(int fd, int flags, uint64_t new_value, uint64_t old_value);
     uint64_t DoTimerfdGettime(int fd, uint64_t current_value);

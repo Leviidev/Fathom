@@ -45,9 +45,46 @@ struct Elf64Phdr {
     uint64_t p_align;
 };
 
+/// A 32-bit ELF, which is a different shape rather than a smaller one: the fields are
+/// narrower *and* the program header puts p_flags in a different place. Both are read
+/// here and widened into the 64-bit structures above, so everything downstream -- segment
+/// mapping, the interpreter, the initial stack -- works on one representation.
+struct Elf32Ehdr {
+    uint8_t e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint32_t e_entry;
+    uint32_t e_phoff;
+    uint32_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+};
+static_assert(sizeof(Elf32Ehdr) == 52, "Elf32_Ehdr is 52 bytes");
+
+struct Elf32Phdr {
+    uint32_t p_type;
+    uint32_t p_offset;   // Note the order: p_flags is last here, second in the 64-bit form.
+    uint32_t p_vaddr;
+    uint32_t p_paddr;
+    uint32_t p_filesz;
+    uint32_t p_memsz;
+    uint32_t p_flags;
+    uint32_t p_align;
+};
+static_assert(sizeof(Elf32Phdr) == 32, "Elf32_Phdr is 32 bytes");
+
 constexpr uint16_t kElfTypeExec = 2;
 constexpr uint16_t kElfTypeDyn = 3;
 constexpr uint16_t kElfMachineX8664 = 62;
+constexpr uint16_t kElfMachineI386 = 3;
+constexpr uint8_t kElfClass32 = 1;
+constexpr uint8_t kElfClass64 = 2;
 
 constexpr uint32_t kPtLoad = 1;
 constexpr uint32_t kPtInterp = 3;
@@ -131,15 +168,40 @@ bool ReadHeaders(const std::string& path, Elf64Ehdr* header, std::vector<Elf64Ph
         error = "not an ELF file (bad magic)";
         return false;
     }
-    if (header->e_ident[4] != 2) {
-        error = "not a 64-bit ELF -- Fathom emulates x86-64 only, not 32-bit x86";
+    const uint8_t elf_class = header->e_ident[4];
+    if (elf_class != kElfClass64 && elf_class != kElfClass32) {
+        error = "not a 32-bit or 64-bit ELF";
         return false;
     }
     if (header->e_ident[5] != 1) {
         error = "not a little-endian ELF";
         return false;
     }
-    if (header->e_machine != kElfMachineX8664) {
+
+    // A 32-bit header was just read into a 64-bit structure, so almost nothing past
+    // e_version is where it appears to be. Re-read it properly and widen.
+    if (elf_class == kElfClass32) {
+        Elf32Ehdr narrow {};
+        if (!ReadExactly(file.get(), &narrow, sizeof(narrow), 0)) {
+            error = "file is too small to be a 32-bit ELF executable";
+            return false;
+        }
+        if (narrow.e_machine != kElfMachineI386) {
+            error = "wrong architecture: a 32-bit ELF that is not i386";
+            return false;
+        }
+        std::memcpy(header->e_ident, narrow.e_ident, sizeof(header->e_ident));
+        header->e_type = narrow.e_type;
+        header->e_machine = narrow.e_machine;
+        header->e_version = narrow.e_version;
+        header->e_entry = narrow.e_entry;
+        header->e_phoff = narrow.e_phoff;
+        header->e_shoff = narrow.e_shoff;
+        header->e_flags = narrow.e_flags;
+        header->e_ehsize = narrow.e_ehsize;
+        header->e_phentsize = narrow.e_phentsize;
+        header->e_phnum = narrow.e_phnum;
+    } else if (header->e_machine != kElfMachineX8664) {
         char message[128];
         std::snprintf(message, sizeof(message),
                       "wrong architecture: this binary targets ELF machine %u, and Fathom runs x86-64 (62)",
@@ -151,9 +213,26 @@ bool ReadHeaders(const std::string& path, Elf64Ehdr* header, std::vector<Elf64Ph
         error = "not an executable or shared object";
         return false;
     }
-    if (header->e_phentsize != sizeof(Elf64Phdr) || header->e_phnum == 0) {
+    const size_t expected_phentsize = elf_class == kElfClass32 ? sizeof(Elf32Phdr) : sizeof(Elf64Phdr);
+    if (header->e_phentsize != expected_phentsize || header->e_phnum == 0) {
         error = "malformed program header table";
         return false;
+    }
+
+    if (elf_class == kElfClass32) {
+        std::vector<Elf32Phdr> narrow(header->e_phnum);
+        if (!ReadExactly(file.get(), narrow.data(), sizeof(Elf32Phdr) * header->e_phnum,
+                         static_cast<off_t>(header->e_phoff))) {
+            error = "truncated program header table";
+            return false;
+        }
+        headers->clear();
+        headers->reserve(narrow.size());
+        for (const auto& entry : narrow) {
+            headers->push_back(Elf64Phdr {entry.p_type, entry.p_flags, entry.p_offset, entry.p_vaddr,
+                                          entry.p_paddr, entry.p_filesz, entry.p_memsz, entry.p_align});
+        }
+        return true;
     }
 
     headers->resize(header->e_phnum);
@@ -203,7 +282,6 @@ std::string ReadInterpreter(const std::string& path, const Elf64Phdr& segment) {
 
 ElfInspection InspectElf(const std::string& path) {
     ElfInspection result;
-    result.machine = "x86-64";
 
     Elf64Ehdr header {};
     std::vector<Elf64Phdr> segments;
@@ -229,6 +307,8 @@ ElfInspection InspectElf(const std::string& path) {
     }
 
     result.ok = true;
+    result.is_32bit = header.e_ident[4] == kElfClass32;
+    result.machine = result.is_32bit ? "i386" : "x86-64";
     result.entry = header.e_entry;
     result.min_vaddr = lowest;
     result.image_size = highest - (lowest & ~(kGuestPageSize - 1));

@@ -39,6 +39,9 @@ struct ElfInspection {
     uint16_t phentsize {};
     uint16_t phnum {};
     uint64_t phoff {};
+    /// True for an i386 binary. Such a guest's pointers are 32 bits, so its memory has to
+    /// be placed where a 32-bit value can reach it and every address relocated to suit.
+    bool is_32bit {};
     std::string machine;
     std::string interpreter;
     std::string error;

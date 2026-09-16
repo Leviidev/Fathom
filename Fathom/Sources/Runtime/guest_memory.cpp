@@ -335,6 +335,25 @@ std::vector<GuestRange> GuestAddressSpace::WritableRanges() const {
     return writable;
 }
 
+std::vector<GuestRange> GuestAddressSpace::WritableRangesIn(uint64_t begin, uint64_t end) const {
+    std::scoped_lock lock {mutex_};
+    std::vector<GuestRange> writable;
+    for (const auto& range : committed_) {
+        if (range.end() <= begin || range.begin >= end) {
+            continue;
+        }
+        if ((range.protection & kGuestProtWrite) == 0) {
+            continue;
+        }
+        const uint64_t low = std::max(range.begin, begin);
+        const uint64_t high = std::min(range.end(), end);
+        if (high > low) {
+            writable.push_back(GuestRange {low, high - low, range.protection});
+        }
+    }
+    return writable;
+}
+
 bool GuestAddressSpace::Contains(uint64_t address, uint64_t size) const {
     return address >= base_ && size <= size_ && address + size <= base_ + size_;
 }

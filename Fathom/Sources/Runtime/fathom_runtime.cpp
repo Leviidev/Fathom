@@ -605,6 +605,11 @@ void fathom_session::ReleaseParent(GuestProcess* process) {
             // with the parent's address in it, which reads as a wild pointer and is not.
             if (!space->Validate(region.address, region.bytes.size(),
                                  fathom::kGuestProtWrite)) {
+                FATHOM_WARN("fork: not putting back %#llx..%#llx for pid %d -- it is no "
+                            "longer writable",
+                            static_cast<unsigned long long>(region.address),
+                            static_cast<unsigned long long>(region.address + region.bytes.size()),
+                            process->ppid);
                 continue;
             }
             // Put the parent's memory back exactly as the fork found it, before anything
@@ -897,8 +902,10 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         // whatever the child left in them for a stack pointer and a return address.
         uint64_t stack_low = parent->program.stack.stack_base;
         uint64_t stack_top = stack_low + parent->program.stack.stack_size;
+        int caller_tid = caller_pid;
         for (const auto& thread : parent->threads) {
             if (thread->thread.get() == caller && thread->stack_top != 0) {
+                caller_tid = thread->tid;
                 stack_top = thread->stack_top + parent->guest_base;
                 // A cloned thread's stack is the guest's own allocation and its extent is
                 // not reported to us, so the low bound is the calling thread's stack
@@ -936,6 +943,7 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         // seven hundred megabytes twice per fork, which is the difference between a fork
         // costing a millisecond and costing a second.
         bool threaded = false;
+        if (getenv("FATHOM_FORK_FULL") != nullptr) { threaded = false; } else
         for (const auto& thread : parent->threads) {
             if (thread->started && !thread->finished.load(std::memory_order_acquire)) {
                 threaded = true;
@@ -983,14 +991,26 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
             if (to <= from) {
                 continue;
             }
-            const auto* bytes = reinterpret_cast<const uint8_t*>(from);
-            child->borrowed.push_back({from, std::vector<uint8_t>(bytes, bytes + (to - from))});
-            held += to - from;
+            // Only the writable parts, and each one on its own. A span named here is
+            // rarely one mapping: an image is read-only text next to writable data, and a
+            // heap that has not been fully handed out has nothing mapped above the break.
+            // Copying read-only memory would be pointless -- nothing can change it -- and
+            // trying to write it back afterwards would fault.
+            for (const auto& piece : space->WritableRangesIn(from, to)) {
+                const auto* bytes = reinterpret_cast<const uint8_t*>(piece.begin);
+                child->borrowed.push_back(
+                    {piece.begin, std::vector<uint8_t>(bytes, bytes + piece.size)});
+                held += piece.size;
+            }
         }
 
-        FATHOM_INFO("fork: holding %llu KB of pid %d's %s while pid %d borrows it",
+        FATHOM_INFO("fork: holding %llu KB of pid %d's %s (tid %d, rsp %#llx, stack %#llx..%#llx)"
+                    " while pid %d borrows it",
                     static_cast<unsigned long long>(held / 1024), caller_pid,
-                    threaded ? "stack" : "memory", child_pid);
+                    threaded ? "stack" : "memory", caller_tid,
+                    static_cast<unsigned long long>(rsp),
+                    static_cast<unsigned long long>(stack_low),
+                    static_cast<unsigned long long>(stack_top), child_pid);
 
         child_raw = child.get();
         processes[child_pid] = std::move(child);

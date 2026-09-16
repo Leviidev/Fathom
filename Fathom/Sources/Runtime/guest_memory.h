@@ -109,6 +109,11 @@ public:
     /// this is the only way to find.
     std::vector<GuestRange> WritableRanges() const;
 
+    /// The writable parts of [begin, end), clipped to it. A caller that wants to copy a
+    /// span of guest memory has to ask, because the span it names may be partly read-only
+    /// and partly not mapped at all, and only the writable parts can be written back.
+    std::vector<GuestRange> WritableRangesIn(uint64_t begin, uint64_t end) const;
+
     std::vector<GuestRange> Snapshot() const;
 
     uint64_t CommittedBytes() const;
@@ -130,6 +135,7 @@ private:
     void RecordCommitted(uint64_t address, uint64_t size, int protection);
 
     bool ProtectLocked(uint64_t address, uint64_t size, int protection);
+
 
     mutable std::mutex mutex_;
     uint64_t base_ {};

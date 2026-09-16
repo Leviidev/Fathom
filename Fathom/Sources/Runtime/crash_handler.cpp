@@ -88,6 +88,37 @@ const char* SignalName(int number) {
     }
 }
 
+/// Dumps the guest's state without dying, on SIGUSR1.
+///
+/// A guest that hangs gives nothing away: no syscalls, no signal, no output, just a
+/// process at 100% CPU. This makes the state readable on demand -- send SIGUSR1 and the
+/// log says where the guest actually is.
+void Report(int, siginfo_t*, void* context) {
+    WriteText("\n=== FATHOM STATE ===\nguest syscalls so far: ");
+    WriteDecimal(g_syscall_count.load(std::memory_order_relaxed));
+    const uint64_t last = g_last_syscall.load(std::memory_order_relaxed);
+    if (last != UINT64_MAX) {
+        WriteText("\nlast guest syscall: ");
+        WriteDecimal(last);
+    }
+    if (context != nullptr) {
+        auto* uc = static_cast<ucontext_t*>(context);
+        WriteText("\nhost pc: ");
+        WriteHex(uc->uc_mcontext->__ss.__pc);
+    }
+    if (auto* describer = g_describer.load(std::memory_order_acquire)) {
+        char state[1024];
+        const size_t length = describer(state, sizeof(state));
+        if (length > 0) {
+            WriteText("\nguest registers:\n");
+            ssize_t ignored = write(g_crash_fd, state, length);
+            (void)ignored;
+        }
+    }
+    WriteText("=== END STATE ===\n");
+    fsync(g_crash_fd);
+}
+
 void Handle(int number, siginfo_t* info, void* context) {
     // An unaligned guest access is a normal event, not a crash: x86 permits unaligned
     // memory access and the ARM64 instructions FEXCore emits for it do not. The engine's
@@ -132,11 +163,22 @@ void Handle(int number, siginfo_t* info, void* context) {
         const uint64_t pc = uc->uc_mcontext->__ss.__pc;
         WriteText("\nfaulting host pc: ");
         WriteHex(pc);
-        uint32_t instruction = 0;
-        std::memcpy(&instruction, reinterpret_cast<const void*>(pc), sizeof(instruction));
-        WriteText("\nfaulting instruction: ");
-        WriteHex(instruction);
-        WriteText("\n");
+        // Only when the faulting address is not the program counter itself. When it is,
+        // the fault was an instruction fetch -- a jump to memory that is not there -- and
+        // reading that address to report it faults again, inside this handler, forever.
+        // The symptom is not a crash report but a process pinned at 100% CPU with no
+        // output at all, which is considerably harder to recognise.
+        const uint64_t fault = info == nullptr ? 0 : reinterpret_cast<uint64_t>(info->si_addr);
+        if (fault == pc) {
+            WriteText("\nfaulting instruction: unreadable -- the fault was the fetch itself,"
+                      " so this is a jump to an address with no code at it\n");
+        } else {
+            uint32_t instruction = 0;
+            std::memcpy(&instruction, reinterpret_cast<const void*>(pc), sizeof(instruction));
+            WriteText("\nfaulting instruction: ");
+            WriteHex(instruction);
+            WriteText("\n");
+        }
     }
 
     // The guest's own registers. A fault at a small address means some pointer was null;
@@ -210,4 +252,11 @@ extern "C" void fathom_install_crash_handler(const char* log_path) {
     for (const int number : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP}) {
         sigaction(number, &action, nullptr);
     }
+
+    // Not a crash: a way to ask a running -- or stuck -- guest where it is.
+    struct sigaction report {};
+    report.sa_sigaction = fathom::Report;
+    report.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&report.sa_mask);
+    sigaction(SIGUSR1, &report, nullptr);
 }

@@ -277,6 +277,22 @@ struct GuestProcess {
         std::vector<uint8_t> bytes;
     };
     std::vector<BorrowedRegion> borrowed;
+
+    /// One thread of this process beyond the first.
+    ///
+    /// A thread is far less machinery than a process: it shares the address space and the
+    /// descriptor table outright, so there is nothing to copy and nothing to hand back.
+    /// What it needs of its own is a guest register file, a host thread to run on, and a
+    /// syscall layer carrying its own thread id and exit status.
+    struct GuestThreadRecord {
+        int tid {};
+        std::unique_ptr<DeferredThreadControl> control;
+        std::unique_ptr<fathom::LinuxSyscalls> syscalls;
+        std::unique_ptr<fathom::GuestThread> thread;
+        pthread_t host_thread {};
+        bool started {};
+    };
+    std::vector<std::unique_ptr<GuestThreadRecord>> threads;
 };
 
 struct fathom_session final : fathom::ProcessHost {
@@ -319,6 +335,9 @@ struct fathom_session final : fathom::ProcessHost {
     int64_t ExecProcess(int caller_pid, const std::string& path, std::vector<std::string> argv,
                         std::vector<std::string> envp) override;
     int64_t WaitForChild(int caller_pid, int wanted_pid, int* exit_status, int options) override;
+    int64_t CreateThread(int caller_pid, uint64_t flags, uint64_t stack,
+                         uint64_t parent_tid_address, uint64_t child_tid_address,
+                         uint64_t tls) override;
 
     std::atomic<int> state {FATHOM_STATE_IDLE};
     std::atomic<int> exit_code {0};
@@ -424,6 +443,136 @@ void fathom_session::ReleaseParent(GuestProcess* process) {
         process->released = true;
     }
     process_changed.notify_all();
+}
+
+namespace {
+
+struct ThreadStart {
+    fathom_session* session;
+    GuestProcess::GuestThreadRecord* record;
+};
+
+void* RunGuestThread(void* raw) {
+    std::unique_ptr<ThreadStart> start {static_cast<ThreadStart*>(raw)};
+    FATHOM_INFO("tid %d: running", start->record->tid);
+    const auto result = start->record->thread->Run();
+
+    // A thread's descriptors are the process's, so nothing is closed here. What does have
+    // to happen is the kernel's own parting act: clear the word the thread was created
+    // with and wake whoever is waiting on it, which is how pthread_join returns.
+    start->record->syscalls->ReleaseThreadId();
+    FATHOM_INFO("tid %d: finished (%s, status %d)", start->record->tid, result.message.c_str(),
+                result.status);
+    return nullptr;
+}
+
+} // namespace
+
+int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t stack,
+                                     uint64_t parent_tid_address, uint64_t child_tid_address,
+                                     uint64_t tls) {
+    constexpr uint64_t kCloneParentSettid = 0x00100000;
+    constexpr uint64_t kCloneChildCleartid = 0x00200000;
+    constexpr uint64_t kCloneChildSettid = 0x01000000;
+    constexpr uint64_t kCloneSettls = 0x00080000;
+
+    if (stack == 0) {
+        // Without CLONE_VM this would be a fork; with it and no stack, the new thread
+        // would run on its creator's, which is not something to guess at.
+        return -22; // -EINVAL
+    }
+
+    GuestProcess::GuestThreadRecord* record_raw = nullptr;
+    int tid = 0;
+    {
+        std::scoped_lock lock {process_mutex};
+        auto* process = Find(caller_pid);
+        if (process == nullptr) {
+            return -1;
+        }
+        tid = next_pid++;
+
+        auto record = std::make_unique<GuestProcess::GuestThreadRecord>();
+        record->tid = tid;
+        record->control = std::make_unique<DeferredThreadControl>();
+
+        fathom::SyscallConfig thread_config;
+        thread_config.guest_root = guest_root;
+        thread_config.work_dir = "/";
+        thread_config.trace = trace;
+        thread_config.guest_is_32bit = guest_is_32bit;
+        record->syscalls = std::make_unique<fathom::LinuxSyscalls>(*space, *record->control, console,
+                                                                   thread_config);
+        // Shared rather than copied: this is the entire difference between a thread and a
+        // fork as far as the syscall layer is concerned.
+        process->syscalls->ShareInto(*record->syscalls);
+        record->syscalls->SetProcess(process->pid, process->ppid, this);
+        record->syscalls->SetThreadId(tid);
+        if ((flags & kCloneChildCleartid) != 0) {
+            record->syscalls->SetClearChildTid(child_tid_address);
+        }
+
+        std::string reason;
+        record->thread = engine->ForkThread(*process->thread, *record->syscalls, reason, stack);
+        if (record->thread == nullptr) {
+            FATHOM_ERROR("could not create a guest thread: %s", reason.c_str());
+            return -11; // -EAGAIN
+        }
+        record->control->Bind(record->thread.get());
+
+        // The tid goes into whichever of the two words the guest asked for. Both are in
+        // shared memory, so the creating thread writes them and the new one sees them.
+        const auto write_tid = [&](uint64_t address) {
+            if (address == 0) {
+                return;
+            }
+            auto* slot = reinterpret_cast<int32_t*>(space->ToHost(address));
+            if (space->Validate(space->ToHost(address), sizeof(int32_t), fathom::kGuestProtWrite)) {
+                *slot = tid;
+            }
+        };
+        if ((flags & kCloneParentSettid) != 0) {
+            write_tid(parent_tid_address);
+        }
+        if ((flags & kCloneChildSettid) != 0) {
+            write_tid(child_tid_address);
+        }
+
+        // CLONE_SETTLS means something different on the two architectures: a 64-bit guest
+        // passes the FS base directly, while an i386 one passes a user_desc of the kind
+        // set_thread_area takes, and expects %gs to be loaded from it afterwards.
+        if ((flags & kCloneSettls) != 0 && tls != 0) {
+            if (guest_is_32bit) {
+                auto* descriptor = reinterpret_cast<uint32_t*>(space->ToHost(tls));
+                if (space->Validate(space->ToHost(tls), 16, fathom::kGuestProtRead)) {
+                    const uint32_t entry = descriptor[0] == 0xFFFF'FFFFU ? 12 : descriptor[0];
+                    record->control->SetTlsDescriptor(static_cast<int>(entry), descriptor[1],
+                                                      descriptor[2] >> 12);
+                }
+            } else {
+                record->control->SetFsBase(tls);
+            }
+        }
+
+        record_raw = record.get();
+        process->threads.push_back(std::move(record));
+    }
+
+    auto* start = new ThreadStart {this, record_raw};
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    pthread_attr_setstacksize(&attributes, kGuestThreadStack);
+    const int created = pthread_create(&record_raw->host_thread, &attributes, &RunGuestThread, start);
+    pthread_attr_destroy(&attributes);
+    if (created != 0) {
+        delete start;
+        FATHOM_ERROR("could not start a host thread for tid %d: %s", tid, std::strerror(created));
+        return -11;
+    }
+    record_raw->started = true;
+    FATHOM_INFO("clone: pid %d created tid %d on stack %#llx", caller_pid, tid,
+                static_cast<unsigned long long>(stack));
+    return tid;
 }
 
 int64_t fathom_session::ForkProcess(int caller_pid) {

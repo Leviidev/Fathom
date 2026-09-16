@@ -17,6 +17,8 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <sys/ipc.h>
 #include <sys/sem.h>
 #include <sys/param.h>
@@ -173,6 +175,7 @@ enum : uint64_t {
     kSysSchedYield = 24,
     kSysMremap = 25,
     kSysMsync = 26,
+    kSysMincore = 27,
     kSysMadvise = 28,
     kSysDup = 32,
     kSysDup2 = 33,
@@ -284,6 +287,16 @@ enum : uint64_t {
     kSysGetRobustList = 274,
     kSysPrctl = 157,
     kSysSemget = 64,
+    kSysGetitimer = 36,
+    kSysSetitimer = 38,
+    kSysSetpgid = 109,
+    kSysGetpgid = 121,
+    kSysSetsid = 112,
+    kSysGetsid = 124,
+    kSysSetresuid = 117,
+    kSysGetresuid = 118,
+    kSysSetresgid = 119,
+    kSysGetresgid = 120,
     kSysSemop = 65,
     kSysSemctl = 66,
     kSysMknod = 133,
@@ -587,6 +600,16 @@ const char* SyscallName(uint64_t number) {
     case kSysPipe2: return "pipe2";
     case kSysPrctl: return "prctl";
     case kSysSemget: return "semget";
+    case kSysGetitimer: return "getitimer";
+    case kSysSetitimer: return "setitimer";
+    case kSysSetpgid: return "setpgid";
+    case kSysGetpgid: return "getpgid";
+    case kSysSetsid: return "setsid";
+    case kSysGetsid: return "getsid";
+    case kSysSetresuid: return "setresuid";
+    case kSysGetresuid: return "getresuid";
+    case kSysSetresgid: return "setresgid";
+    case kSysGetresgid: return "getresgid";
     case kSysSemop: return "semop";
     case kSysSemctl: return "semctl";
     case kSysMknod: return "mknod";
@@ -632,16 +655,57 @@ const char* SyscallName(uint64_t number) {
     }
 }
 
+/// Every guest thread waiting on a futex waits here.
+///
+/// One queue rather than one per address: a wake notifies everybody and each waiter
+/// re-checks the word it was told to watch, which futex semantics explicitly allow. It
+/// costs a few spurious wake-ups under contention and saves keeping a hash table of
+/// queues alive across forks and execs.
+struct FutexQueueState {
+    std::mutex mutex;
+    std::condition_variable changed;
+    uint64_t generation {};
+};
+
+FutexQueueState& FutexQueue() {
+    static FutexQueueState queue;
+    return queue;
+}
+
 } // namespace
+
+void LinuxSyscalls::WakeFutex(uint64_t host_address) {
+    (void)host_address;  // One queue, so the address only matters to the waiter.
+    {
+        std::scoped_lock lock {FutexQueue().mutex};
+        ++FutexQueue().generation;
+    }
+    FutexQueue().changed.notify_all();
+}
+
+void LinuxSyscalls::ReleaseThreadId() {
+    if (clear_child_tid_ == 0) {
+        return;
+    }
+    // What the kernel does for CLONE_CHILD_CLEARTID, and what pthread_join waits for.
+    auto* slot = static_cast<uint32_t*>(GuestPointer(clear_child_tid_, sizeof(uint32_t), true));
+    const uint64_t address = space_.ToHost(clear_child_tid_);
+    clear_child_tid_ = 0;
+    if (slot != nullptr) {
+        *slot = 0;
+    }
+    WakeFutex(address);
+}
 
 LinuxSyscalls::LinuxSyscalls(GuestAddressSpace& space, GuestThreadControl& control,
                              GuestConsole& console, SyscallConfig config)
     : space_ {space}
     , control_ {control}
     , console_ {console}
-    , config_ {std::move(config)} {
+    , config_ {std::move(config)}
+    , shared_ {std::make_shared<ProcessFiles>()} {
     if (!config_.work_dir.empty()) {
-        cwd_ = NormaliseGuestPath(config_.work_dir);
+        shared_->cwd = NormaliseGuestPath(config_.work_dir);
     }
     // stdin, stdout and stderr are entries like any other, so that a shell can point them
     // at a pipe or a file and everything downstream keeps working by number alone.
@@ -649,17 +713,21 @@ LinuxSyscalls::LinuxSyscalls(GuestAddressSpace& space, GuestThreadControl& contr
         OpenFile console;
         console.console_stream = stream;
         console.guest_path = "/dev/console";
-        files_[stream] = console;
+        shared_->files[stream] = console;
     }
 }
 
 LinuxSyscalls::~LinuxSyscalls() {
-    CloseAll();
+    // Only the last thread holding the table closes what is in it. A thread going away
+    // is not a process going away, and its siblings still need their descriptors.
+    if (shared_.use_count() == 1) {
+        CloseAll();
+    }
 }
 
 void LinuxSyscalls::CloseAll() {
-    std::scoped_lock lock {mutex_};
-    for (auto& [fd, file] : files_) {
+    std::scoped_lock lock {shared_->mutex};
+    for (auto& [fd, file] : shared_->files) {
         if (file.directory != nullptr) {
             closedir(static_cast<DIR*>(file.directory)); // also closes host_fd
             continue;
@@ -668,7 +736,7 @@ void LinuxSyscalls::CloseAll() {
             close(file.host_fd);
         }
     }
-    files_.clear();
+    shared_->files.clear();
 }
 
 void LinuxSyscalls::SetProcess(int pid, int ppid, ProcessHost* host) {
@@ -678,12 +746,12 @@ void LinuxSyscalls::SetProcess(int pid, int ppid, ProcessHost* host) {
 }
 
 void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
-    std::scoped_lock lock {mutex_};
+    std::scoped_lock lock {shared_->mutex};
     // Every descriptor is dup'd rather than shared outright: the child must be able to
     // close one, or point it somewhere else for a redirection, without the parent's
     // table changing underneath it. dup keeps the underlying file description shared,
     // which is exactly what fork promises.
-    for (const auto& [fd, file] : files_) {
+    for (const auto& [fd, file] : shared_->files) {
         OpenFile inherited;
         inherited.guest_path = file.guest_path;
         // Carried across, and not obvious: without it a child's fd 1 is neither the
@@ -700,13 +768,24 @@ void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
                 continue;  // Out of descriptors: the child simply does not inherit it.
             }
         }
-        child.files_[fd] = std::move(inherited);
+        child.shared_->files[fd] = std::move(inherited);
     }
-    child.cwd_ = cwd_;
-    child.heap_base_ = heap_base_;
-    child.heap_limit_ = heap_limit_;
-    child.heap_break_ = heap_break_;
+    child.shared_->cwd = shared_->cwd;
+    child.shared_->heap_base = shared_->heap_base;
+    child.shared_->heap_limit = shared_->heap_limit;
+    child.shared_->heap_break = shared_->heap_break;
     child.config_.work_dir = config_.work_dir;
+}
+
+uint64_t LinuxSyscalls::HeapBreak() const {
+    return shared_->heap_break;
+}
+
+void LinuxSyscalls::ShareInto(LinuxSyscalls& thread) const {
+    thread.shared_ = shared_;
+    thread.config_.work_dir = config_.work_dir;
+    thread.command_line_ = command_line_;
+    thread.thread_name_ = thread_name_;
 }
 
 void LinuxSyscalls::AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const std::string& path) {
@@ -716,16 +795,16 @@ void LinuxSyscalls::AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const
     // this process's any more. Keeping the list would make a later fork snapshot and
     // then restore regions that have since been released and handed to somebody else --
     // which corrupts whichever process is now living there.
-    std::scoped_lock lock {mutex_};
-    mappings_.clear();
+    std::scoped_lock lock {shared_->mutex};
+    shared_->mappings.clear();
 }
 
 void LinuxSyscalls::InitialiseHeap(uint64_t base, uint64_t reserved) {
-    heap_base_ = base;
-    heap_break_ = base;
-    heap_limit_ = base + reserved;
+    shared_->heap_base = base;
+    shared_->heap_break = base;
+    shared_->heap_limit = base + reserved;
     FATHOM_INFO("guest heap: %#llx..%#llx (%llu MB)", static_cast<unsigned long long>(base),
-                static_cast<unsigned long long>(heap_limit_),
+                static_cast<unsigned long long>(shared_->heap_limit),
                 static_cast<unsigned long long>(reserved >> 20));
 }
 
@@ -736,9 +815,9 @@ void LinuxSyscalls::InitialiseHeap(uint64_t base, uint64_t reserved) {
 std::string LinuxSyscalls::NormaliseGuestPath(const std::string& path) const {
     std::string absolute = path;
     if (absolute.empty()) {
-        absolute = cwd_;
+        absolute = shared_->cwd;
     } else if (absolute.front() != '/') {
-        absolute = cwd_ + (cwd_.back() == '/' ? "" : "/") + absolute;
+        absolute = shared_->cwd + (shared_->cwd.back() == '/' ? "" : "/") + absolute;
     }
 
     std::vector<std::string> parts;
@@ -801,9 +880,9 @@ std::string LinuxSyscalls::ResolveGuestPath(const std::string& path) const {
 std::string LinuxSyscalls::ResolveAt(int dirfd, const char* path, std::string* guest_path_out) {
     std::string request = path == nullptr ? std::string {} : std::string {path};
     if (!request.empty() && request.front() != '/' && dirfd != guest::kAtFdCwd) {
-        std::scoped_lock lock {mutex_};
-        const auto entry = files_.find(dirfd);
-        if (entry != files_.end()) {
+        std::scoped_lock lock {shared_->mutex};
+        const auto entry = shared_->files.find(dirfd);
+        if (entry != shared_->files.end()) {
             request = entry->second.guest_path + "/" + request;
         }
     }
@@ -892,18 +971,18 @@ bool LinuxSyscalls::ReadGuestString(uint64_t address, std::string* out, size_t l
 // ---------------------------------------------------------------------------
 
 LinuxSyscalls::OpenFile* LinuxSyscalls::FindFile(int fd) {
-    const auto entry = files_.find(fd);
-    return entry == files_.end() ? nullptr : &entry->second;
+    const auto entry = shared_->files.find(fd);
+    return entry == shared_->files.end() ? nullptr : &entry->second;
 }
 
 std::vector<std::pair<uint64_t, uint64_t>> LinuxSyscalls::Mappings() const {
-    std::scoped_lock lock {mutex_};
-    return mappings_;
+    std::scoped_lock lock {shared_->mutex};
+    return shared_->mappings;
 }
 
 int LinuxSyscalls::AllocateFd() {
     int fd = 0;
-    while (files_.count(fd) != 0) {
+    while (shared_->files.count(fd) != 0) {
         ++fd;
     }
     return fd;
@@ -917,7 +996,7 @@ int LinuxSyscalls::RegisterFile(int host_fd, std::string guest_path) {
     OpenFile file;
     file.host_fd = host_fd;
     file.guest_path = std::move(guest_path);
-    files_[fd] = std::move(file);
+    shared_->files[fd] = std::move(file);
     return fd;
 }
 
@@ -940,12 +1019,12 @@ uint64_t LinuxSyscalls::DoOpenAt(int dirfd, uint64_t path_address, int flags, in
         if (!EnsureFramebuffer()) {
             return FailLinux(12); // ENOMEM
         }
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         const int fd = AllocateFd();
         OpenFile display;
         display.guest_path = guest_path;
         display.is_framebuffer = true;
-        files_[fd] = std::move(display);
+        shared_->files[fd] = std::move(display);
         FATHOM_INFO("guest opened the display as fd %d", fd);
         return static_cast<uint64_t>(fd);
     }
@@ -965,7 +1044,7 @@ uint64_t LinuxSyscalls::DoOpenAt(int dirfd, uint64_t path_address, int flags, in
             (void)!write(backing, synthesised.data(), synthesised.size());
         }
         lseek(backing, 0, SEEK_SET);
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         return static_cast<uint64_t>(RegisterFile(backing, guest_path));
     }
 
@@ -977,7 +1056,7 @@ uint64_t LinuxSyscalls::DoOpenAt(int dirfd, uint64_t path_address, int flags, in
         return Fail(errno);
     }
 
-    std::scoped_lock lock {mutex_};
+    std::scoped_lock lock {shared_->mutex};
     return static_cast<uint64_t>(RegisterFile(host_fd, guest_path));
 }
 
@@ -989,7 +1068,7 @@ uint64_t LinuxSyscalls::DoWrite(int fd, uint64_t buffer, uint64_t count) {
 
     int host_fd = -1;
     {
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(fd);
         if (file == nullptr) {
             return FailLinux(9); // EBADF
@@ -1014,7 +1093,7 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
     }
     bool from_console = false;
     {
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(fd);
         if (file == nullptr) {
             return FailLinux(9); // EBADF
@@ -1036,7 +1115,7 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
         return static_cast<uint64_t>(read_bytes);
     }
 
-    std::scoped_lock lock {mutex_};
+    std::scoped_lock lock {shared_->mutex};
     auto* file = FindFile(fd);
     if (file == nullptr) {
         return FailLinux(9);
@@ -1135,7 +1214,7 @@ uint64_t LinuxSyscalls::DoSelect(int count, uint64_t read_address, uint64_t writ
             int console_stream = -1;
             int host_fd = -1;
             {
-                std::scoped_lock lock {mutex_};
+                std::scoped_lock lock {shared_->mutex};
                 auto* file = FindFile(fd);
                 if (file == nullptr) {
                     return FailLinux(9); // EBADF
@@ -1226,7 +1305,7 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
             } else {
                 int host_fd = -1;
                 {
-                    std::scoped_lock lock {mutex_};
+                    std::scoped_lock lock {shared_->mutex};
                     auto* file = FindFile(entry.fd);
                     if (file != nullptr) {
                         host_fd = file->host_fd;
@@ -1301,8 +1380,22 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
         return FailLinux(9);
     }
 
-    constexpr uint64_t kGuestMsghdrSize = 56;
-    auto* header = static_cast<uint8_t*>(GuestPointer(header_address, kGuestMsghdrSize, true));
+    // struct msghdr is pointers and size_ts throughout, so an i386 guest's is exactly half
+    // the width of this process's -- 28 bytes against 56, with every field at a different
+    // offset. Read at the wrong width, msg_controllen picks up half a pointer and comes
+    // out as a nonsense length, and the call is refused with EINVAL. That is what an X
+    // server's first read from a new client looks like when it goes wrong.
+    const bool narrow = config_.guest_is_32bit;
+    const size_t width = narrow ? 4 : 8;
+    const size_t name_offset = 0;
+    const size_t name_length_offset = width;
+    const size_t iov_offset = narrow ? 8 : 16;
+    const size_t iov_count_offset = narrow ? 12 : 24;
+    const size_t control_length_offset = narrow ? 20 : 40;
+    const size_t flags_offset = narrow ? 24 : 48;
+    const uint64_t header_size = narrow ? 28 : 56;
+
+    auto* header = static_cast<uint8_t*>(GuestPointer(header_address, header_size, true));
     if (header == nullptr) {
         return FailLinux(14);
     }
@@ -1312,25 +1405,29 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
     uint64_t iov_address = 0;
     uint64_t iov_count = 0;
     uint64_t control_length = 0;
-    std::memcpy(&name_address, header + 0, 8);
-    std::memcpy(&name_length, header + 8, 4);
-    std::memcpy(&iov_address, header + 16, 8);
-    std::memcpy(&iov_count, header + 24, 8);
-    std::memcpy(&control_length, header + 40, 8);
+    std::memcpy(&name_address, header + name_offset, width);
+    std::memcpy(&name_length, header + name_length_offset, 4);
+    std::memcpy(&iov_address, header + iov_offset, width);
+    std::memcpy(&iov_count, header + iov_count_offset, width);
+    std::memcpy(&control_length, header + control_length_offset, width);
 
     if (iov_count > 1024) {
         return FailLinux(22); // EINVAL
     }
-    auto* vectors = static_cast<LinuxIovec*>(
-        GuestPointer(iov_address, iov_count * sizeof(LinuxIovec), true));
-    if (vectors == nullptr && iov_count != 0) {
+    // Built rather than cast: the guest's iovec is its own width, and its bases are guest
+    // addresses that have to be turned into host ones before the kernel sees them.
+    std::vector<std::pair<uint64_t, uint64_t>> guest_vectors;
+    if (!ReadGuestIovec(iov_address, iov_count, &guest_vectors)) {
         return FailLinux(14);
     }
-    for (uint64_t index = 0; index < iov_count; ++index) {
-        if (vectors[index].length != 0 &&
-            GuestPointer(vectors[index].base, vectors[index].length, !sending) == nullptr) {
+    std::vector<iovec> vectors;
+    vectors.reserve(guest_vectors.size());
+    for (const auto& [base, length] : guest_vectors) {
+        void* data = length == 0 ? nullptr : GuestPointer(base, length, !sending);
+        if (data == nullptr && length != 0) {
             return FailLinux(14);
         }
+        vectors.push_back({data, static_cast<size_t>(length)});
     }
     if (control_length != 0) {
         // Ancillary data is laid out differently again, and nothing Fathom runs yet passes
@@ -1342,14 +1439,14 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
 
     sockaddr_storage address {};
     msghdr host_header {};
-    host_header.msg_iov = reinterpret_cast<iovec*>(vectors);
-    host_header.msg_iovlen = static_cast<int>(iov_count);
+    host_header.msg_iov = vectors.empty() ? nullptr : vectors.data();
+    host_header.msg_iovlen = static_cast<int>(vectors.size());
 
     if (sending) {
         if (name_address != 0 && name_length != 0) {
             const void* guest_name = GuestPointer(name_address, name_length, false);
             if (guest_name != nullptr) {
-                const socklen_t length = fathom::net::ToHostAddress(guest_name, name_length, &address);
+                const socklen_t length = ToHostSocketAddress(guest_name, name_length, &address);
                 if (length != 0) {
                     host_header.msg_name = &address;
                     host_header.msg_namelen = length;
@@ -1371,24 +1468,23 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
     if (host_header.msg_name != nullptr && host_header.msg_namelen != 0) {
         void* guest_name = GuestPointer(name_address, name_length, true);
         if (guest_name != nullptr) {
-            const socklen_t written =
-                fathom::net::ToGuestAddress(reinterpret_cast<sockaddr*>(&address), guest_name, name_length);
-            std::memcpy(header + 8, &written, 4);
+            const socklen_t written = ToGuestSocketAddress(&address, guest_name, name_length);
+            std::memcpy(header + name_length_offset, &written, 4);
         }
     }
     const int32_t out_flags = host_header.msg_flags;
-    std::memcpy(header + 48, &out_flags, 4);
+    std::memcpy(header + flags_offset, &out_flags, 4);
     return static_cast<uint64_t>(received);
 }
 
 int LinuxSyscalls::HostFdFor(int guest_fd) {
-    std::scoped_lock lock {mutex_};
+    std::scoped_lock lock {shared_->mutex};
     auto* file = FindFile(guest_fd);
     return file == nullptr ? -1 : file->host_fd;
 }
 
 bool LinuxSyscalls::IsConsole(int fd) {
-    std::scoped_lock lock {mutex_};
+    std::scoped_lock lock {shared_->mutex};
     auto* file = FindFile(fd);
     return file != nullptr && file->console_stream >= 0;
 }
@@ -1405,14 +1501,14 @@ int LinuxSyscalls::DuplicateTo(const OpenFile& file, int target) {
             return -1;
         }
     }
-    files_[target] = std::move(copy);
+    shared_->files[target] = std::move(copy);
     return target;
 }
 
 /// Closes one descriptor. The caller holds the lock.
 void LinuxSyscalls::CloseFd(int fd) {
-    auto entry = files_.find(fd);
-    if (entry == files_.end()) {
+    auto entry = shared_->files.find(fd);
+    if (entry == shared_->files.end()) {
         return;
     }
     if (entry->second.directory != nullptr) {
@@ -1420,7 +1516,7 @@ void LinuxSyscalls::CloseFd(int fd) {
     } else if (entry->second.host_fd >= 0) {
         close(entry->second.host_fd);
     }
-    files_.erase(entry);
+    shared_->files.erase(entry);
 }
 
 bool LinuxSyscalls::ReadGuestIovec(uint64_t address, uint64_t count,
@@ -1520,7 +1616,7 @@ uint64_t LinuxSyscalls::DoStatAt(int dirfd, uint64_t path_address, uint64_t stat
     int result = 0;
     if (path.empty() && (flags & guest::kAtEmptyPath) != 0) {
         if (dirfd == guest::kAtFdCwd) {
-            result = stat(ResolveGuestPath(cwd_).c_str(), &host);
+            result = stat(ResolveGuestPath(shared_->cwd).c_str(), &host);
         } else {
             const int host_fd = HostFdFor(dirfd);
             if (host_fd < 0) {
@@ -1553,7 +1649,7 @@ uint64_t LinuxSyscalls::DoFstat(int fd, uint64_t stat_address) {
     }
 
     {
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(fd);
         if (file == nullptr) {
             return FailLinux(9);
@@ -1571,7 +1667,7 @@ uint64_t LinuxSyscalls::DoGetdents64(int fd, uint64_t buffer, uint64_t size) {
         return FailLinux(14);
     }
 
-    std::scoped_lock lock {mutex_};
+    std::scoped_lock lock {shared_->mutex};
     auto* file = FindFile(fd);
     if (file == nullptr) {
         return FailLinux(9);
@@ -1624,7 +1720,7 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
     if (length == 0) {
         return FailLinux(22);
     }
-    // Everything below -- the arena, mappings_, the framebuffer -- is in host addresses.
+    // Everything below -- the arena, shared_->mappings, the framebuffer -- is in host addresses.
     // The guest's hint comes in guest-numbered and the result goes back out the same way;
     // for a 1:1 (64-bit) guest both conversions are the identity.
     if (address != 0) {
@@ -1676,7 +1772,7 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
     }
 
     if (!anonymous) {
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(fd);
         if (file == nullptr) {
             space_.Release(placed, length);
@@ -1694,9 +1790,31 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
                         static_cast<unsigned long long>(display.address));
             return space_.ToGuest(display.address);
         }
-        // A real mmap shares pages with the page cache; this copies instead. For the one
-        // case that matters here -- a dynamic loader mapping a library read-only or
-        // private -- a copy is indistinguishable to the guest.
+        // MAP_SHARED means the guest's writes must be visible in the file, and to
+        // everything else that mapped it. That is not something a copy can imitate, and
+        // it is exactly what an X server's framebuffer and X11's shared-memory images
+        // rely on. Mapped for real, over the arena pages the allocation just handed out.
+        //
+        // The one thing that cannot be honoured is an offset the host's larger pages
+        // cannot express; that falls through to the copy below, which is still right for
+        // a reader and only wrong for a writer.
+        const uint64_t host_page = space_.HostPageSize();
+        if ((flags & guest::kMapShared) != 0 && (static_cast<uint64_t>(offset) % host_page) == 0) {
+            const uint64_t rounded = (length + host_page - 1) & ~(host_page - 1);
+            int host_protection = PROT_READ;
+            if ((protection & guest::kProtWrite) != 0) {
+                host_protection |= PROT_WRITE;
+            }
+            void* mapped = mmap(reinterpret_cast<void*>(placed), rounded, host_protection,
+                                MAP_FIXED | MAP_SHARED, file->host_fd, static_cast<off_t>(offset));
+            if (mapped != MAP_FAILED) {
+                // The table's lock is already held by the block this sits in.
+                shared_->mappings.emplace_back(placed, length);
+                return space_.ToGuest(placed);
+            }
+            FATHOM_WARN("shared mapping of %s failed (%s); falling back to a private copy",
+                        file->guest_path.c_str(), std::strerror(errno));
+        }
         if ((flags & guest::kMapShared) != 0) {
             FATHOM_WARN("MAP_SHARED file mapping is emulated as a private copy (fd %d)", fd);
         }
@@ -1715,25 +1833,25 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         space_.Protect(placed, length, guest_protection);
     }
     {
-        std::scoped_lock lock {mutex_};
-        mappings_.emplace_back(placed, length);
+        std::scoped_lock lock {shared_->mutex};
+        shared_->mappings.emplace_back(placed, length);
     }
     return space_.ToGuest(placed);
 }
 
 uint64_t LinuxSyscalls::DoBrk(uint64_t requested) {
-    if (heap_base_ == 0) {
+    if (shared_->heap_base == 0) {
         return 0;
     }
     if (requested == 0) {
-        return heap_break_;
+        return shared_->heap_break;
     }
-    if (requested < heap_base_ || requested > heap_limit_) {
+    if (requested < shared_->heap_base || requested > shared_->heap_limit) {
         // Linux answers an unsatisfiable brk with the current break rather than an error.
-        return heap_break_;
+        return shared_->heap_break;
     }
-    heap_break_ = requested;
-    return heap_break_;
+    shared_->heap_break = requested;
+    return shared_->heap_break;
 }
 
 bool LinuxSyscalls::EnsureFramebuffer() {
@@ -1812,11 +1930,33 @@ uint64_t LinuxSyscalls::DoUname(uint64_t address) {
     return 0;
 }
 
-uint64_t LinuxSyscalls::DoClockGettime(int clock, uint64_t address) {
-    auto* out = static_cast<LinuxTimespec*>(GuestPointer(address, sizeof(LinuxTimespec), true));
-    if (out == nullptr) {
-        return FailLinux(14);
+bool LinuxSyscalls::ReadGuestTimespec(uint64_t address, int64_t* seconds,
+                                      int64_t* nanoseconds) const {
+    const size_t width = TimeWidth();
+    const auto* raw = static_cast<const unsigned char*>(GuestPointer(address, width * 2, false));
+    if (raw == nullptr) {
+        return false;
     }
+    *seconds = 0;
+    *nanoseconds = 0;
+    std::memcpy(seconds, raw, width);
+    std::memcpy(nanoseconds, raw + width, width);
+    return true;
+}
+
+bool LinuxSyscalls::WriteGuestTimespec(uint64_t address, int64_t seconds,
+                                       int64_t nanoseconds) const {
+    const size_t width = TimeWidth();
+    auto* raw = static_cast<unsigned char*>(GuestPointer(address, width * 2, true));
+    if (raw == nullptr) {
+        return false;
+    }
+    std::memcpy(raw, &seconds, width);
+    std::memcpy(raw + width, &nanoseconds, width);
+    return true;
+}
+
+uint64_t LinuxSyscalls::DoClockGettime(int clock, uint64_t address) {
     bool supported = false;
     const clockid_t host_clock = ToHostClock(clock, &supported);
     if (!supported) {
@@ -1826,9 +1966,7 @@ uint64_t LinuxSyscalls::DoClockGettime(int clock, uint64_t address) {
     if (clock_gettime(host_clock, &host) != 0) {
         return Fail(errno);
     }
-    out->seconds = host.tv_sec;
-    out->nanoseconds = host.tv_nsec;
-    return 0;
+    return WriteGuestTimespec(address, host.tv_sec, host.tv_nsec) ? 0 : FailLinux(14);
 }
 
 uint64_t LinuxSyscalls::DoReadlinkAt(int dirfd, uint64_t path_address, uint64_t buffer, uint64_t size) {
@@ -1855,6 +1993,69 @@ uint64_t LinuxSyscalls::DoReadlinkAt(int dirfd, uint64_t path_address, uint64_t 
 
     const ssize_t length = readlink(host_path.c_str(), out, size);
     return length < 0 ? Fail(errno) : static_cast<uint64_t>(length);
+}
+
+uint32_t LinuxSyscalls::ToHostSocketAddress(const void* guest_address, uint64_t guest_length,
+                                            sockaddr_storage* out) const {
+    const uint32_t length = fathom::net::ToHostAddress(guest_address, guest_length, out);
+    if (length == 0 || out->ss_family != AF_UNIX) {
+        return length;
+    }
+
+    // A unix socket is named by a path, and a path from the guest means a path inside the
+    // guest root. Passed through untouched, a guest binding /tmp/.X11-unix/X0 would bind
+    // the Mac's own /tmp -- outside the sandbox, and colliding with a real X server.
+    auto* un = reinterpret_cast<sockaddr_un*>(out);
+    std::string guest_path;
+    if (un->sun_path[0] == '\0') {
+        // Linux's abstract namespace, which Darwin does not have. X11 clients try the
+        // abstract name before the filesystem one, so refusing it would work but would
+        // cost a failed connection every time. Giving it a directory of its own instead
+        // keeps both ends agreeing on where the socket is, which is all the namespace was
+        // doing for them.
+        const size_t name_length = strnlen(un->sun_path + 1, sizeof(un->sun_path) - 1);
+        std::string name {un->sun_path + 1, name_length};
+        std::replace(name.begin(), name.end(), '/', '%');
+        guest_path = "/tmp/.fathom-abstract/" + name;
+        ::mkdir(ResolveGuestPath("/tmp/.fathom-abstract").c_str(), 0777);
+    } else {
+        guest_path.assign(un->sun_path, strnlen(un->sun_path, sizeof(un->sun_path)));
+    }
+
+    const std::string host_path = ResolveGuestPath(guest_path);
+    if (config_.trace) {
+        FATHOM_DEBUG("unix socket %s -> %s", guest_path.c_str(), host_path.c_str());
+    }
+    if (host_path.size() >= sizeof(un->sun_path)) {
+        // Darwin allows four fewer bytes here than Linux does, and the guest root is a
+        // prefix on top of that, so this is a real limit rather than a formality.
+        errno = ENAMETOOLONG;
+        return 0;
+    }
+    std::memset(un->sun_path, 0, sizeof(un->sun_path));
+    std::memcpy(un->sun_path, host_path.c_str(), host_path.size());
+    un->sun_len = static_cast<uint8_t>(sizeof(sockaddr_un));
+    return static_cast<uint32_t>(sizeof(sockaddr_un));
+}
+
+uint32_t LinuxSyscalls::ToGuestSocketAddress(sockaddr_storage* host_address, void* guest_address,
+                                             uint64_t capacity) const {
+    // The guest must not be told where its root really is, so the prefix comes back off.
+    if (host_address->ss_family == AF_UNIX) {
+        auto* un = reinterpret_cast<sockaddr_un*>(host_address);
+        std::string path {un->sun_path, strnlen(un->sun_path, sizeof(un->sun_path))};
+        const std::string& root = config_.guest_root;
+        if (!root.empty() && path.rfind(root, 0) == 0) {
+            path.erase(0, root.size());
+            if (path.empty() || path.front() != '/') {
+                path.insert(path.begin(), '/');
+            }
+            std::memset(un->sun_path, 0, sizeof(un->sun_path));
+            std::memcpy(un->sun_path, path.c_str(), std::min(path.size(), sizeof(un->sun_path) - 1));
+        }
+    }
+    return fathom::net::ToGuestAddress(reinterpret_cast<sockaddr*>(host_address), guest_address,
+                                       capacity);
 }
 
 uint64_t LinuxSyscalls::DoSocketcall(uint64_t call, uint64_t arguments_address) {
@@ -1898,8 +2099,20 @@ uint64_t LinuxSyscalls::DoSocketcall(uint64_t call, uint64_t arguments_address) 
         unpacked[4] = 0;
         unpacked[5] = 0;
     }
-    return Dispatch(selected.x86_64_number, unpacked[0], unpacked[1], unpacked[2], unpacked[3],
-                    unpacked[4], unpacked[5]);
+    const uint64_t result = Dispatch(selected.x86_64_number, unpacked[0], unpacked[1],
+                                     unpacked[2], unpacked[3], unpacked[4], unpacked[5]);
+    if (config_.trace) {
+        // Not routed through Handle's own tracing: socketcall is unpacked before the
+        // number is translated, so without this every socket operation an older binary
+        // makes is invisible in the log.
+        FATHOM_INFO("[pid %d] socketcall %llu -> %s(%#llx, %#llx, %#llx) -> %lld", pid_,
+                    static_cast<unsigned long long>(call), SyscallName(selected.x86_64_number),
+                    static_cast<unsigned long long>(unpacked[0]),
+                    static_cast<unsigned long long>(unpacked[1]),
+                    static_cast<unsigned long long>(unpacked[2]),
+                    static_cast<long long>(result));
+    }
+    return result;
 }
 
 uint64_t LinuxSyscalls::DoSetThreadArea(uint64_t descriptor_address) {
@@ -1953,9 +2166,9 @@ uint64_t LinuxSyscalls::DoEventfd(uint64_t initial, int flags) {
     counter->semaphore = (flags & kEfdSemaphore) != 0;
     counter->signal_write_fd = ends[1];
 
-    std::scoped_lock lock {mutex_};
+    std::scoped_lock lock {shared_->mutex};
     const int fd = RegisterFile(ends[0], "anon_inode:[eventfd]");
-    files_[fd].event = counter;
+    shared_->files[fd].event = counter;
     if (initial != 0) {
         const char byte = 1;
         if (write(ends[1], &byte, 1) == 1) {
@@ -2012,9 +2225,9 @@ uint64_t LinuxSyscalls::DoEventfdWrite(OpenFile& file, uint64_t buffer) {
 
 uint64_t LinuxSyscalls::DoEpollCreate(int flags) {
     (void)flags;
-    std::scoped_lock lock {mutex_};
+    std::scoped_lock lock {shared_->mutex};
     const int fd = RegisterFile(-1, "anon_inode:[eventpoll]");
-    files_[fd].epoll = std::make_shared<EpollSet>();
+    shared_->files[fd].epoll = std::make_shared<EpollSet>();
     return static_cast<uint64_t>(fd);
 }
 
@@ -2025,7 +2238,7 @@ uint64_t LinuxSyscalls::DoEpollCtl(int epoll_fd, int operation, int fd, uint64_t
 
     std::shared_ptr<EpollSet> set;
     {
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(epoll_fd);
         if (file == nullptr || file->epoll == nullptr) {
             return FailLinux(9); // EBADF
@@ -2076,7 +2289,7 @@ uint64_t LinuxSyscalls::DoEpollWait(int epoll_fd, uint64_t events_address, int m
     }
     std::shared_ptr<EpollSet> set;
     {
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(epoll_fd);
         if (file == nullptr || file->epoll == nullptr) {
             return FailLinux(9);
@@ -2108,7 +2321,7 @@ uint64_t LinuxSyscalls::DoEpollWait(int epoll_fd, uint64_t events_address, int m
         host_fds.reserve(watched.size());
         owners.reserve(watched.size());
         {
-            std::scoped_lock lock {mutex_};
+            std::scoped_lock lock {shared_->mutex};
             for (const auto& [guest_fd, interest] : watched) {
                 auto* file = FindFile(guest_fd);
                 if (file == nullptr || file->host_fd < 0) {
@@ -2446,6 +2659,12 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
             // 4096-byte pages so that a 32-bit register can address a large file.
             arg6 *= 4096;
         }
+        // i386 kept its original 32-bit time_t syscalls and gained _time64 versions
+        // beside them; glibc uses whichever the kernel offers. They translate to the same
+        // x86-64 number, so which one was called is the only thing that says how wide the
+        // structures are, and it has to be remembered before the number is lost.
+        narrow_time_ = IsI386NarrowTime(number);
+
         const int64_t translated = X86_64SyscallForI386(number);
         if (translated < 0) {
             FATHOM_WARN("unimplemented i386 syscall %llu (%#llx, %#llx, %#llx, %#llx, %#llx)",
@@ -2516,7 +2735,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         // output is not where it put it, and it aborts. The console entries carry no host
         // descriptor, so removing one costs the app nothing.
         const int fd = static_cast<int>(arg1);
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         if (FindFile(fd) == nullptr) {
             return FailLinux(9);
         }
@@ -2534,7 +2753,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return DoFstat(static_cast<int>(arg1), arg2);
 
     case kSysLseek: {
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(static_cast<int>(arg1));
         if (file == nullptr) {
             return FailLinux(9);
@@ -2548,7 +2767,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (data == nullptr) {
             return arg3 == 0 ? 0 : FailLinux(14);
         }
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(static_cast<int>(arg1));
         if (file == nullptr) {
             return FailLinux(9);
@@ -2569,8 +2788,8 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysMunmap: {
         const uint64_t host_address = space_.ToHost(arg1);
         {
-            std::scoped_lock lock {mutex_};
-            std::erase_if(mappings_, [&](const auto& entry) {
+            std::scoped_lock lock {shared_->mutex};
+            std::erase_if(shared_->mappings, [&](const auto& entry) {
                 return entry.first >= host_address && entry.first + entry.second <= host_address + arg2;
             });
         }
@@ -2618,6 +2837,19 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysBrk:
         return DoBrk(arg1);
 
+    case kSysMincore: {
+        // One byte per guest page, low bit set when the page is resident. Every arena
+        // page is, so the answer is uniform -- but it has to actually be written, because
+        // the caller reads the vector rather than the return value.
+        const uint64_t pages = (arg2 + guest::kPageSize - 1) / guest::kPageSize;
+        auto* out = static_cast<unsigned char*>(GuestPointer(arg3, pages, true));
+        if (out == nullptr) {
+            return pages == 0 ? 0 : FailLinux(14);
+        }
+        std::memset(out, 1, pages);
+        return 0;
+    }
+
     case kSysMadvise:
     case kSysMsync:
     case kSysFsync:
@@ -2633,7 +2865,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         const int fd = static_cast<int>(arg1);
         bool is_display = false;
         {
-            std::scoped_lock lock {mutex_};
+            std::scoped_lock lock {shared_->mutex};
             auto* file = FindFile(fd);
             is_display = file != nullptr && file->is_framebuffer;
         }
@@ -2717,12 +2949,12 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (out == nullptr) {
             return FailLinux(14);
         }
-        std::scoped_lock lock {mutex_};
-        if (cwd_.size() + 1 > arg2) {
+        std::scoped_lock lock {shared_->mutex};
+        if (shared_->cwd.size() + 1 > arg2) {
             return FailLinux(34); // ERANGE
         }
-        std::memcpy(out, cwd_.c_str(), cwd_.size() + 1);
-        return cwd_.size() + 1;
+        std::memcpy(out, shared_->cwd.c_str(), shared_->cwd.size() + 1);
+        return shared_->cwd.size() + 1;
     }
 
     case kSysChdir: {
@@ -2738,8 +2970,8 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (!S_ISDIR(host.st_mode)) {
             return FailLinux(20); // ENOTDIR
         }
-        std::scoped_lock lock {mutex_};
-        cwd_ = guest_path;
+        std::scoped_lock lock {shared_->mutex};
+        shared_->cwd = guest_path;
         return 0;
     }
 
@@ -2779,7 +3011,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     }
 
     case kSysFtruncate: {
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(static_cast<int>(arg1));
         if (file == nullptr) {
             return FailLinux(9);
@@ -2788,27 +3020,74 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     }
 
     case kSysFcntl: {
+        constexpr int kGuestFDupfd = 0;
         constexpr int kGuestFGetfd = 1;
         constexpr int kGuestFSetfd = 2;
         constexpr int kGuestFGetfl = 3;
         constexpr int kGuestFSetfl = 4;
+        constexpr int kGuestFDupfdCloexec = 1030;
+        const int fd = static_cast<int>(arg1);
         const int command = static_cast<int>(arg2);
-        if (command == kGuestFSetfl && static_cast<int>(arg1) == 0) {
+
+        if (command == kGuestFSetfl && fd == 0) {
             const bool nonblocking = (arg3 & guest::kONonBlock) != 0;
             console_.SetNonblockingStdin(nonblocking);
             return 0;
         }
-        if (command == kGuestFGetfd || command == kGuestFSetfd) {
+        if (command == kGuestFDupfd || command == kGuestFDupfdCloexec) {
+            std::scoped_lock lock {shared_->mutex};
+            auto* file = FindFile(fd);
+            if (file == nullptr) {
+                return FailLinux(9);
+            }
+            return static_cast<uint64_t>(DuplicateTo(*file, AllocateFd()));
+        }
+        // Close-on-exec is bookkeeping about a descriptor, not about the file, and
+        // Fathom's exec keeps the table rather than replacing it. Reporting it clear is
+        // the truthful answer for how this runs.
+        if (command == kGuestFGetfd) {
             return 0;
         }
+        if (command == kGuestFSetfd) {
+            return HostFdFor(fd) < 0 && !IsConsole(fd) ? FailLinux(9) : 0;
+        }
+
+        // F_GETFL and F_SETFL are about the open file description, and they have to be
+        // real: a program that sets O_NONBLOCK and is told it succeeded, but whose
+        // descriptor still blocks, deadlocks the first time it writes more than the
+        // socket buffer holds and waits for a short write that never comes.
+        const int host_fd = HostFdFor(fd);
+        if (host_fd < 0) {
+            // The console, which has no host descriptor. Answer for it directly.
+            return IsConsole(fd) ? (command == kGuestFGetfl ? 2 : 0) : FailLinux(9);
+        }
         if (command == kGuestFGetfl) {
-            return 2; // O_RDWR, which is a safe answer for anything already open.
+            const int host_flags = fcntl(host_fd, F_GETFL, 0);
+            if (host_flags < 0) {
+                return Fail(errno);
+            }
+            int guest_flags = host_flags & O_ACCMODE;
+            if ((host_flags & O_NONBLOCK) != 0) guest_flags |= guest::kONonBlock;
+            if ((host_flags & O_APPEND) != 0) guest_flags |= guest::kOAppend;
+            return static_cast<uint64_t>(guest_flags);
+        }
+        if (command == kGuestFSetfl) {
+            int host_flags = fcntl(host_fd, F_GETFL, 0);
+            if (host_flags < 0) {
+                return Fail(errno);
+            }
+            // Only these two are settable after the fact; the rest of the word describes
+            // how the file was opened and the kernel ignores changes to it.
+            host_flags &= ~(O_NONBLOCK | O_APPEND);
+            if ((arg3 & guest::kONonBlock) != 0) host_flags |= O_NONBLOCK;
+            if ((arg3 & guest::kOAppend) != 0) host_flags |= O_APPEND;
+            return fcntl(host_fd, F_SETFL, host_flags) < 0 ? Fail(errno) : 0;
         }
         return 0;
     }
 
     case kSysDup: {
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(static_cast<int>(arg1));
         if (file == nullptr) {
             return FailLinux(9);
@@ -2820,7 +3099,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysDup3: {
         const int from = static_cast<int>(arg1);
         const int to = static_cast<int>(arg2);
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(from);
         if (file == nullptr) {
             return FailLinux(9);
@@ -2850,7 +3129,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             close(ends[1]);
             return FailLinux(14);
         }
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         out[0] = static_cast<int32_t>(RegisterFile(ends[0], "pipe:[read]"));
         out[1] = static_cast<int32_t>(RegisterFile(ends[1], "pipe:[write]"));
         return 0;
@@ -2885,26 +3164,16 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysClockGettime:
         return DoClockGettime(static_cast<int>(arg1), arg2);
 
-    case kSysClockGetres: {
-        auto* out = static_cast<LinuxTimespec*>(GuestPointer(arg2, sizeof(LinuxTimespec), true));
-        if (out == nullptr) {
-            return 0;
-        }
-        out->seconds = 0;
-        out->nanoseconds = 1;
+    case kSysClockGetres:
+        WriteGuestTimespec(arg2, 0, 1);
         return 0;
-    }
 
     case kSysGettimeofday: {
-        auto* out = static_cast<LinuxTimeval*>(GuestPointer(arg1, sizeof(LinuxTimeval), true));
-        if (out == nullptr) {
-            return FailLinux(14);
-        }
+        // Same shape as a timespec, and the same pair of widths: a timeval is a time_t
+        // and a suseconds_t, both of which narrow together on i386.
         struct timeval host {};
         gettimeofday(&host, nullptr);
-        out->seconds = host.tv_sec;
-        out->microseconds = host.tv_usec;
-        return 0;
+        return WriteGuestTimespec(arg1, host.tv_sec, host.tv_usec) ? 0 : FailLinux(14);
     }
 
     case kSysTime: {
@@ -2920,13 +3189,34 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
 
     case kSysNanosleep:
     case kSysClockNanosleep: {
+        constexpr int kTimerAbstime = 1;
         const uint64_t request_address = number == kSysNanosleep ? arg1 : arg3;
-        const auto* request = static_cast<const LinuxTimespec*>(
-            GuestPointer(request_address, sizeof(LinuxTimespec), false));
-        if (request == nullptr) {
+        int64_t seconds = 0;
+        int64_t nanoseconds = 0;
+        if (!ReadGuestTimespec(request_address, &seconds, &nanoseconds)) {
             return FailLinux(14);
         }
-        struct timespec host {request->seconds, request->nanoseconds};
+        // clock_nanosleep's TIMER_ABSTIME makes the request a deadline rather than a
+        // duration, and sleeping for the deadline itself would be a sleep until the heat
+        // death of the universe.
+        if (number == kSysClockNanosleep && (static_cast<int>(arg2) & kTimerAbstime) != 0) {
+            bool supported = false;
+            const clockid_t host_clock = ToHostClock(static_cast<int>(arg1), &supported);
+            struct timespec now {};
+            clock_gettime(supported ? host_clock : CLOCK_MONOTONIC, &now);
+            int64_t remaining_seconds = seconds - now.tv_sec;
+            int64_t remaining_nanoseconds = nanoseconds - now.tv_nsec;
+            if (remaining_nanoseconds < 0) {
+                remaining_nanoseconds += 1'000'000'000;
+                --remaining_seconds;
+            }
+            if (remaining_seconds < 0) {
+                return 0; // Already past.
+            }
+            seconds = remaining_seconds;
+            nanoseconds = remaining_nanoseconds;
+        }
+        struct timespec host {static_cast<time_t>(seconds), static_cast<long>(nanoseconds)};
         nanosleep(&host, nullptr);
         return 0;
     }
@@ -2945,8 +3235,9 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     }
 
     case kSysGetpid:
-    case kSysGettid:
         return static_cast<uint64_t>(pid_);
+    case kSysGettid:
+        return static_cast<uint64_t>(Tid());
     case kSysGetppid:
     case kSysGetpgrp:
         return static_cast<uint64_t>(ppid_);
@@ -2962,12 +3253,46 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysSetgid:
         return arg1 == 1000 ? 0 : FailLinux(1);
 
+    // The same bargain for the three-argument forms, where -1 means "leave this one
+    // alone". An X server calls these to drop privileges it was never given.
+    case kSysSetresuid:
+    case kSysSetresgid: {
+        const auto unchanged_or_self = [](uint64_t value) {
+            return value == ~0ULL || static_cast<uint32_t>(value) == 0xFFFF'FFFFU || value == 1000;
+        };
+        return unchanged_or_self(arg1) && unchanged_or_self(arg2) && unchanged_or_self(arg3)
+                   ? 0
+                   : FailLinux(1);
+    }
+    case kSysGetresuid:
+    case kSysGetresgid: {
+        // Real, effective and saved, all the same and all writable separately.
+        for (uint64_t address : {arg1, arg2, arg3}) {
+            auto* out = static_cast<uint32_t*>(GuestPointer(address, sizeof(uint32_t), true));
+            if (out == nullptr) {
+                return FailLinux(14);
+            }
+            *out = 1000;
+        }
+        return 0;
+    }
+
+    // There is one process group and one session here, and the guest is in it. Accepting
+    // these rather than refusing them matters: a server that cannot detach from its
+    // terminal treats that as fatal.
+    case kSysSetpgid:
+    case kSysSetsid:
+        return 0;
+    case kSysGetpgid:
+    case kSysGetsid:
+        return static_cast<uint64_t>(pid_);
+
     case kSysUmask:
         return 0022;
 
     case kSysSetTidAddress:
         clear_child_tid_ = arg1;
-        return 1000;
+        return static_cast<uint64_t>(Tid());
 
     case kSysSetRobustList:
     case kSysGetRobustList:
@@ -3028,25 +3353,102 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysFutex: {
         constexpr int kFutexWait = 0;
         constexpr int kFutexWake = 1;
+        constexpr int kFutexRequeue = 3;
+        constexpr int kFutexCmpRequeue = 4;
+        constexpr int kFutexWaitBitset = 9;
+        constexpr int kFutexWakeBitset = 10;
+        // The PRIVATE and CLOCK_REALTIME bits change nothing here: every guest thread is
+        // a thread of this one host process, so private and shared are the same thing.
         const int operation = static_cast<int>(arg2) & 0x7f;
-        if (operation == kFutexWake) {
-            return 0; // Nothing is ever waiting: the guest runs on one thread.
+
+        switch (operation) {
+        case kFutexWake:
+        case kFutexWakeBitset:
+        case kFutexRequeue:
+        case kFutexCmpRequeue: {
+            // Requeue moves waiters from one futex to another. Waking them instead is
+            // allowed -- a futex waiter must re-check its own condition on waking -- and
+            // it avoids keeping a queue per address.
+            const uint64_t host_address = space_.ToHost(arg1);
+            WakeFutex(host_address);
+            if (operation == kFutexRequeue || operation == kFutexCmpRequeue) {
+                WakeFutex(space_.ToHost(arg5));
+            }
+            return arg3;  // How many were woken; the caller only checks for an error.
         }
-        if (operation == kFutexWait) {
+        case kFutexWait:
+        case kFutexWaitBitset: {
             const auto* value = static_cast<const uint32_t*>(GuestPointer(arg1, sizeof(uint32_t), false));
             if (value == nullptr) {
                 return FailLinux(14);
             }
+
+            // FUTEX_WAIT's timeout is relative; FUTEX_WAIT_BITSET's is absolute. Either
+            // way it is optional, and a null pointer means wait indefinitely.
+            std::chrono::steady_clock::time_point deadline;
+            bool timed = false;
+            if (arg4 != 0) {
+                const size_t width = config_.guest_is_32bit ? 4 : 8;
+                const auto* raw = static_cast<const unsigned char*>(GuestPointer(arg4, width * 2, false));
+                if (raw == nullptr) {
+                    return FailLinux(14);
+                }
+                int64_t seconds = 0;
+                int64_t nanoseconds = 0;
+                std::memcpy(&seconds, raw, width);
+                std::memcpy(&nanoseconds, raw + width, width);
+                auto interval = std::chrono::seconds(seconds) + std::chrono::nanoseconds(nanoseconds);
+                if (operation == kFutexWaitBitset) {
+                    // Absolute rather than relative, and against CLOCK_MONOTONIC unless
+                    // FUTEX_CLOCK_REALTIME says otherwise. Reading the wrong one is not a
+                    // small error: the two epochs are decades apart, so a monotonic
+                    // deadline measured against the realtime clock is always already
+                    // past, and every wait returns ETIMEDOUT immediately. A guest waiting
+                    // for a thread to start up then reports a deadlock.
+                    constexpr uint64_t kFutexClockRealtime = 0x100;
+                    struct timespec now {};
+                    clock_gettime((arg2 & kFutexClockRealtime) != 0 ? CLOCK_REALTIME : CLOCK_MONOTONIC, &now);
+                    const auto elapsed = std::chrono::seconds(now.tv_sec) + std::chrono::nanoseconds(now.tv_nsec);
+                    interval = interval > elapsed ? interval - elapsed : std::chrono::nanoseconds(0);
+                }
+                deadline = std::chrono::steady_clock::now() + interval;
+                timed = true;
+            }
+
+            std::unique_lock lock {FutexQueue().mutex};
             if (*value != static_cast<uint32_t>(arg3)) {
                 return FailLinux(11); // EAGAIN: the value moved, which is the common case.
             }
-            // A genuine wait with one thread would be a deadlock. Reporting a spurious
-            // wakeup sends the guest back around its own condition check, which is the
-            // one answer that cannot corrupt its state.
-            sched_yield();
+            const uint64_t seen = FutexQueue().generation;
+            for (;;) {
+                if (console_.StopRequested()) {
+                    lock.unlock();
+                    exit_status_ = -1;
+                    control_.ExitGuest(-1);
+                }
+                // Woken by a FUTEX_WAKE, or by the value changing under us. Either way the
+                // caller re-checks its own condition, which is what the API promises.
+                if (FutexQueue().generation != seen || *value != static_cast<uint32_t>(arg3)) {
+                    return 0;
+                }
+                // Bounded, so that a stop request is noticed and so that a wake this
+                // layer never saw -- a value written with no futex call after it -- does
+                // not hang the guest for good.
+                const auto slice = std::chrono::milliseconds(20);
+                if (timed) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline) {
+                        return FailLinux(110); // ETIMEDOUT
+                    }
+                    FutexQueue().changed.wait_for(lock, std::min<std::chrono::steady_clock::duration>(slice, deadline - now));
+                } else {
+                    FutexQueue().changed.wait_for(lock, slice);
+                }
+            }
+        }
+        default:
             return 0;
         }
-        return 0;
     }
 
     case kSysExit:
@@ -3063,12 +3465,35 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (host_ == nullptr) {
             return FailLinux(38);
         }
-        // Threads -- clone with a shared address space -- are a different thing and are
-        // not supported yet. A shell only ever asks for a process.
+        if (number == kSysClone3) {
+            // clone3 moved every argument into a structure, whose fields are 64-bit on
+            // both architectures. `stack` is its lowest address rather than its top,
+            // which is the opposite of what clone takes.
+            const auto* arguments = static_cast<const uint64_t*>(GuestPointer(arg1, 64, false));
+            if (arguments == nullptr) {
+                return FailLinux(14);
+            }
+            const uint64_t flags = arguments[0];
+            const uint64_t child_tid = arguments[2];
+            const uint64_t parent_tid = arguments[3];
+            const uint64_t stack = arguments[5] + arguments[6];
+            const uint64_t tls = arguments[7];
+            if ((flags & guest::kCloneVm) != 0) {
+                return static_cast<uint64_t>(
+                    host_->CreateThread(pid_, flags, stack, parent_tid, child_tid, tls));
+            }
+            return static_cast<uint64_t>(host_->ForkProcess(pid_));
+        }
+
+        // A clone that shares the address space is a thread, not a process, and goes
+        // somewhere else entirely: no memory is copied and no borrow is taken.
         if (number == kSysClone && (arg1 & guest::kCloneVm) != 0) {
-            FATHOM_WARN("guest asked for a thread (clone flags %#llx), which Fathom cannot make yet",
-                        static_cast<unsigned long long>(arg1));
-            return FailLinux(38);
+            // The argument order is not the same on the two architectures: i386 puts the
+            // TLS descriptor where x86-64 puts the child's tid pointer, so a thread
+            // created with the wrong one gets a tid written over its thread-local block.
+            const uint64_t tls = config_.guest_is_32bit ? arg4 : arg5;
+            const uint64_t child_tid = config_.guest_is_32bit ? arg5 : arg4;
+            return static_cast<uint64_t>(host_->CreateThread(pid_, arg1, arg2, arg3, child_tid, tls));
         }
         return static_cast<uint64_t>(host_->ForkProcess(pid_));
     }
@@ -3133,7 +3558,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         int result = 0;
         if (path.empty() && (flags & guest::kAtEmptyPath) != 0) {
             const int host_fd = HostFdFor(dirfd);
-            result = host_fd >= 0 ? fstat(host_fd, &host) : stat(ResolveGuestPath(cwd_).c_str(), &host);
+            result = host_fd >= 0 ? fstat(host_fd, &host) : stat(ResolveGuestPath(shared_->cwd).c_str(), &host);
         } else {
             const std::string host_path = ResolveAt(dirfd, path.c_str(), nullptr);
             result = (flags & guest::kAtSymlinkNoFollow) != 0 ? lstat(host_path.c_str(), &host)
@@ -3205,7 +3630,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         int on = 1;
         setsockopt(host_fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
 
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         return static_cast<uint64_t>(RegisterFile(host_fd, "socket"));
     }
 
@@ -3220,7 +3645,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             return FailLinux(14);
         }
         sockaddr_storage host_address {};
-        const socklen_t length = fathom::net::ToHostAddress(address, arg3, &host_address);
+        const socklen_t length = ToHostSocketAddress(address, arg3, &host_address);
         if (length == 0) {
             return FailLinux(97);
         }
@@ -3266,7 +3691,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (arg5 != 0 && arg6 != 0) {
             const void* address = GuestPointer(arg5, arg6, false);
             if (address != nullptr) {
-                length = fathom::net::ToHostAddress(address, arg6, &host_address);
+                length = ToHostSocketAddress(address, arg6, &host_address);
             }
         }
         const ssize_t sent = sendto(host_fd, buffer, arg3, HostMessageFlags(static_cast<int>(arg4)),
@@ -3296,7 +3721,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             if (out_length != nullptr) {
                 void* out = GuestPointer(arg5, *out_length, true);
                 if (out != nullptr) {
-                    *out_length = fathom::net::ToGuestAddress(reinterpret_cast<sockaddr*>(&from), out,
+                    *out_length = ToGuestSocketAddress(&from, out,
                                                               *out_length);
                 }
             }
@@ -3326,7 +3751,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (result < 0) {
             return Fail(errno);
         }
-        *out_length = fathom::net::ToGuestAddress(reinterpret_cast<sockaddr*>(&address), out, *out_length);
+        *out_length = ToGuestSocketAddress(&address, out, *out_length);
         return 0;
     }
 
@@ -3393,12 +3818,12 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             if (out_length != nullptr) {
                 void* out = GuestPointer(arg2, *out_length, true);
                 if (out != nullptr) {
-                    *out_length = fathom::net::ToGuestAddress(reinterpret_cast<sockaddr*>(&address), out,
+                    *out_length = ToGuestSocketAddress(&address, out,
                                                               *out_length);
                 }
             }
         }
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         return static_cast<uint64_t>(RegisterFile(accepted, "socket"));
     }
 
@@ -3419,7 +3844,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             close(pair[1]);
             return FailLinux(14);
         }
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         out[0] = static_cast<int32_t>(RegisterFile(pair[0], "socketpair"));
         out[1] = static_cast<int32_t>(RegisterFile(pair[1], "socketpair"));
         return 0;
@@ -3562,7 +3987,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         // The working directory is tracked as a guest path, not as a host descriptor, so
         // this is answered from the path the descriptor was opened with rather than by
         // calling the host's fchdir.
-        std::scoped_lock lock {mutex_};
+        std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(static_cast<int>(arg1));
         if (file == nullptr) {
             return FailLinux(9);
@@ -3570,7 +3995,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (file->guest_path.empty() || file->guest_path.front() != '/') {
             return FailLinux(22); // EINVAL
         }
-        cwd_ = file->guest_path;
+        shared_->cwd = file->guest_path;
         return 0;
     }
 
@@ -3613,7 +4038,36 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
 
         // Linux's struct statfs is 120 bytes of 64-bit fields in an order all its own,
         // and nothing about Darwin's matches, so it is written out field by field.
-        auto* out = static_cast<uint8_t*>(GuestPointer(number == kSysFstatfs ? arg2 : arg2, 120, true));
+        //
+        // i386's statfs64 is a different structure again: 84 bytes, with everything except
+        // the block and inode counts narrowed to 32 bits. Writing the 64-bit layout into
+        // it overruns the caller's buffer and puts the block size where the free-block
+        // count belongs, which a guest reports as a filesystem with no free space.
+        // i386's statfs64 and fstatfs64 take the structure's size as their second
+        // argument, so the buffer is the third. Writing to the second puts a filesystem
+        // description over the size the caller passed, and leaves the buffer as it was --
+        // which a guest reads back as a filesystem with no free space.
+        if (config_.guest_is_32bit) {
+            auto* out = static_cast<uint8_t*>(GuestPointer(arg3, 84, true));
+            if (out == nullptr) {
+                return FailLinux(14);
+            }
+            std::memset(out, 0, 84);
+            const auto put32 = [&](size_t offset, uint32_t value) { std::memcpy(out + offset, &value, 4); };
+            const auto put64 = [&](size_t offset, uint64_t value) { std::memcpy(out + offset, &value, 8); };
+            put32(0, 0x858458f6);           // f_type: report RAMFS_MAGIC
+            put32(4, static_cast<uint32_t>(host.f_bsize));
+            put64(8, host.f_blocks);
+            put64(16, host.f_bfree);
+            put64(24, host.f_bavail);
+            put64(32, host.f_files);
+            put64(40, host.f_ffree);
+            put32(56, 255);                 // f_namelen
+            put32(60, static_cast<uint32_t>(host.f_bsize));  // f_frsize
+            return 0;
+        }
+
+        auto* out = static_cast<uint8_t*>(GuestPointer(arg2, 120, true));
         if (out == nullptr) {
             return FailLinux(14);
         }
@@ -3628,6 +4082,32 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         put(48, host.f_ffree);
         put(64, 255);                       // f_namelen
         put(72, host.f_bsize);              // f_frsize
+        return 0;
+    }
+
+    // An interval timer delivers SIGALRM, and Fathom delivers no signals to the guest at
+    // all, so arming one would be a promise this cannot keep. The value is remembered and
+    // handed back, which is what a caller that reads it expects, and no timer runs. An X
+    // server uses this for its screen saver; refusing it outright made it retry forever.
+    case kSysSetitimer:
+    case kSysGetitimer: {
+        const size_t width = config_.guest_is_32bit ? 4 : 8;
+        const size_t size = width * 4;  // Two timevals: interval, then value.
+        if (number == kSysSetitimer) {
+            if (arg3 != 0) {
+                auto* previous = static_cast<unsigned char*>(GuestPointer(arg3, size, true));
+                if (previous == nullptr) {
+                    return FailLinux(14);
+                }
+                std::memset(previous, 0, size);
+            }
+            return 0;
+        }
+        auto* out = static_cast<unsigned char*>(GuestPointer(arg2, size, true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        std::memset(out, 0, size);  // Disarmed, which is the truth.
         return 0;
     }
 
@@ -3661,7 +4141,51 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return DoEpollWait(static_cast<int>(arg1), arg2, static_cast<int>(arg3),
                            static_cast<int>(arg4));
 
-    case kSysSysinfo:
+    case kSysSysinfo: {
+        // Every field is a long, so the whole structure is half the width for an i386
+        // guest: 64 bytes rather than 112.
+        const bool narrow = config_.guest_is_32bit;
+        const size_t width = narrow ? 4 : 8;
+        const size_t size = narrow ? 64 : 112;
+        auto* out = static_cast<uint8_t*>(GuestPointer(arg1, size, true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        std::memset(out, 0, size);
+
+        uint64_t total_ram = 0;
+        size_t length = sizeof(total_ram);
+        if (sysctlbyname("hw.memsize", &total_ram, &length, nullptr, 0) != 0) {
+            total_ram = 0;
+        }
+        uint32_t free_pages = 0;
+        length = sizeof(free_pages);
+        if (sysctlbyname("vm.page_free_count", &free_pages, &length, nullptr, 0) != 0) {
+            free_pages = 0;
+        }
+        const uint64_t page_size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+        uint64_t free_ram = static_cast<uint64_t>(free_pages) * page_size;
+        if (narrow) {
+            // A 32-bit guest cannot hold more than 4GB in an unsigned long, and reporting
+            // a wrapped value is worse than reporting a ceiling.
+            total_ram = std::min<uint64_t>(total_ram, 0xFFFF'FFFFULL);
+            free_ram = std::min<uint64_t>(free_ram, 0xFFFF'FFFFULL);
+        }
+
+        struct timespec uptime {};
+        clock_gettime(CLOCK_MONOTONIC, &uptime);
+
+        const auto put = [&](size_t offset, uint64_t value) { std::memcpy(out + offset, &value, width); };
+        put(0, static_cast<uint64_t>(uptime.tv_sec));                    // uptime
+        put(width * 4, total_ram);                                       // totalram
+        put(width * 5, free_ram);                                        // freeram
+        const uint16_t processes = 1;
+        std::memcpy(out + width * 10, &processes, 2);                    // procs
+        const uint32_t unit = 1;
+        std::memcpy(out + (narrow ? 52 : 104), &unit, 4);                // mem_unit
+        return 0;
+    }
+
     case kSysMemfdCreate:
         return FailLinux(38);
 

@@ -667,7 +667,7 @@ std::unique_ptr<GuestThread> FexEngine::StartThread(uint64_t rip, uint64_t rsp, 
 }
 
 std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, LinuxSyscalls& syscalls,
-                                                   std::string& error) {
+                                                   std::string& error, uint64_t new_rsp) {
     const auto& parent_state = parent.impl_->thread->CurrentFrame->State;
 
     auto impl = std::make_unique<GuestThread::Impl>(impl_->context.get(), syscalls, impl_->guest_is_32bit);
@@ -686,9 +686,15 @@ std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, Li
     // The x86-64 syscall instruction puts its own return address in RCX, and FEX honours
     // that, so RCX is the instruction after the syscall: exactly where a returning fork
     // belongs. sysret does the same thing on real hardware.
-    const uint64_t resume = parent_state.gregs[FEXCore::X86State::REG_RCX] != 0
-                                ? parent_state.gregs[FEXCore::X86State::REG_RCX]
-                                : parent_state.rip + 2; // 0F 05, for a guest that got here via int 0x80
+    //
+    // An i386 guest has no such thing: it arrives through `int 0x80` or `sysenter`,
+    // neither of which records a return address, and RCX is that ABI's *third syscall
+    // argument*. Both instructions are two bytes, so the instruction after is all there
+    // is to go on -- and reading RCX there would resume at whatever the caller happened
+    // to pass, which for clone is the new thread's stack pointer.
+    const uint64_t resume = impl_->guest_is_32bit || parent_state.gregs[FEXCore::X86State::REG_RCX] == 0
+                                ? parent_state.rip + 2  // CD 80, or 0F 05
+                                : parent_state.gregs[FEXCore::X86State::REG_RCX];
 
     // Handed to CreateThread rather than memcpy'd in afterwards. FEX copies the state
     // first and *then* does its own per-thread setup on top -- InitializeCompiler, and
@@ -699,6 +705,9 @@ std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, Li
     std::memcpy(&child_state, &parent_state, sizeof(child_state));
     child_state.rip = resume;
     child_state.gregs[FEXCore::X86State::REG_RAX] = 0;
+    if (new_rsp != 0) {
+        child_state.gregs[FEXCore::X86State::REG_RSP] = new_rsp;
+    }
 
     impl->thread = impl_->context->CreateThread(resume, child_state.gregs[FEXCore::X86State::REG_RSP],
                                                 &child_state);

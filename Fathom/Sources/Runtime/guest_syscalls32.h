@@ -30,6 +30,10 @@ constexpr uint64_t kI386Fstatat64 = 300;
 constexpr uint64_t kI386SetThreadArea = 243;
 constexpr uint64_t kI386Llseek = 140;
 constexpr uint64_t kI386Socketcall = 102; ///< One entry point for all sixteen socket calls.
+/// True for the i386 syscalls that predate 64-bit time_t and still take a 32-bit one.
+/// The _time64 variants map to the same x86-64 numbers but carry wider structures.
+bool IsI386NarrowTime(uint64_t i386_number);
+
 constexpr uint64_t kI386Ipc = 117;        ///< The same idea for System V semaphores and shared memory.
 
 } // namespace fathom

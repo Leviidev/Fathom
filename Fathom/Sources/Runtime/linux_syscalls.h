@@ -18,7 +18,9 @@
 #include "guest_console.h"
 #include "guest_memory.h"
 
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 
 #include <atomic>
 #include <memory>
@@ -78,6 +80,13 @@ public:
 
     /// Blocks until a child exits. Returns the reaped pid, or a negated errno.
     virtual int64_t WaitForChild(int caller_pid, int wanted_pid, int* exit_status, int options) = 0;
+
+    /// Creates a thread of the calling process: same memory, same descriptors, same pid,
+    /// running from the same instruction on a stack of its own. Returns the new thread
+    /// id, or a negated errno.
+    virtual int64_t CreateThread(int caller_pid, uint64_t flags, uint64_t stack,
+                                 uint64_t parent_tid_address, uint64_t child_tid_address,
+                                 uint64_t tls) = 0;
 };
 
 struct SyscallConfig {
@@ -97,9 +106,31 @@ public:
     void SetProcess(int pid, int ppid, ProcessHost* host);
     int Pid() const { return pid_; }
 
+    /// Distinguishes a thread from the process it belongs to. getpid reports the process,
+    /// gettid this; for a process's first thread they are the same number.
+    void SetThreadId(int tid) { tid_ = tid; }
+    int Tid() const { return tid_ != 0 ? tid_ : pid_; }
+
+    /// Where the guest asked for this thread's id to be cleared when it exits, which is
+    /// how pthread_join learns the thread is gone. Zero when it asked for nothing.
+    uint64_t ClearChildTid() const { return clear_child_tid_; }
+    void SetClearChildTid(uint64_t address) { clear_child_tid_ = address; }
+
+    /// Clears that word and wakes anything waiting on it. Called as a thread ends.
+    void ReleaseThreadId();
+
+    /// Wakes every guest thread waiting on `address`. Used by thread teardown, which has
+    /// to do what the kernel does on the way out.
+    static void WakeFutex(uint64_t host_address);
+
     /// Duplicates this process's open files, working directory and heap into `child`,
     /// which is what a fork inherits.
     void CloneInto(LinuxSyscalls& child) const;
+
+    /// Points `thread` at this process's own descriptor table and heap rather than a copy.
+    /// This is the difference between a fork and a thread, and it is the whole of it as
+    /// far as this layer is concerned.
+    void ShareInto(LinuxSyscalls& thread) const;
 
     /// Points the process at a new program image after an execve.
     void AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const std::string& path);
@@ -143,7 +174,7 @@ public:
     void ReleaseDescriptors() { CloseAll(); }
 
     /// How far brk has grown: the part of the heap a fork actually has to preserve.
-    uint64_t HeapBreak() const { return heap_break_; }
+    uint64_t HeapBreak() const;
 
     /// Where the guest's heap starts; established once the program image is loaded.
     void InitialiseHeap(uint64_t base, uint64_t reserved);
@@ -179,6 +210,12 @@ private:
         std::map<int, EpollInterest> interests;
     };
 
+    /// What the threads of one process share, and what a fork duplicates instead.
+    ///
+    /// Every guest thread gets its own LinuxSyscalls, because each needs its own thread
+    /// id, its own GuestThreadControl and its own exit status. Linux gives all of them
+    /// one descriptor table and one heap, though, and a program that opens a file on one
+    /// thread and reads it on another depends on precisely that.
     struct OpenFile {
         int host_fd {-1};
         std::string guest_path;
@@ -191,6 +228,23 @@ private:
         /// Set when this descriptor is an eventfd or an epoll set rather than a file.
         std::shared_ptr<EventCounter> event;
         std::shared_ptr<EpollSet> epoll;
+    };
+
+    /// What the threads of one process share, and what a fork duplicates instead.
+    ///
+    /// Every guest thread gets its own LinuxSyscalls, because each needs its own thread
+    /// id, its own GuestThreadControl and its own exit status. Linux gives all of them
+    /// one descriptor table and one heap, though, and a program that opens a file on one
+    /// thread and reads it on another depends on precisely that.
+    struct ProcessFiles {
+        mutable std::mutex mutex;
+        std::map<int, OpenFile> files;
+        std::string cwd {"/"};
+        uint64_t heap_base {};
+        uint64_t heap_limit {};
+        uint64_t heap_break {};
+        /// Address and length of each live mmap the process made.
+        std::vector<std::pair<uint64_t, uint64_t>> mappings;
     };
 
     /// Lowest unused guest descriptor, which is the number open() and pipe() must return:
@@ -241,6 +295,13 @@ private:
     uint64_t DoUname(uint64_t address);
     uint64_t DoSetThreadArea(uint64_t descriptor_address);
     uint64_t DoSocketcall(uint64_t call, uint64_t arguments_address);
+    /// Translates a guest socket address, resolving a unix socket's path against the
+    /// guest root. Returns 0 and sets errno on failure.
+    uint32_t ToHostSocketAddress(const void* guest_address, uint64_t guest_length,
+                                 sockaddr_storage* out) const;
+    /// The reverse, for getsockname, getpeername and accept.
+    uint32_t ToGuestSocketAddress(sockaddr_storage* host_address, void* guest_address,
+                                  uint64_t capacity) const;
     uint64_t DoIpc(uint64_t call, uint64_t first, uint64_t second, uint64_t third, uint64_t pointer);
     uint64_t DoSemget(int32_t key, int count, int flags);
     uint64_t DoSemop(int id, uint64_t operations_address, uint64_t count);
@@ -258,6 +319,12 @@ private:
     uint64_t DoFramebufferIoctl(uint64_t request, uint64_t argument);
     bool EnsureFramebuffer();
     uint64_t DoClockGettime(int clock, uint64_t address);
+    /// How wide the time_t in a struct timespec or timeval is for the call being handled.
+    /// Eight bytes everywhere except an i386 guest's original time32 syscalls, which it
+    /// still uses alongside the _time64 ones it gained later.
+    size_t TimeWidth() const { return narrow_time_ ? 4 : 8; }
+    bool ReadGuestTimespec(uint64_t address, int64_t* seconds, int64_t* nanoseconds) const;
+    bool WriteGuestTimespec(uint64_t address, int64_t seconds, int64_t nanoseconds) const;
     uint64_t DoReadlinkAt(int dirfd, uint64_t path_address, uint64_t buffer, uint64_t size);
 
     OpenFile* FindFile(int fd);
@@ -269,23 +336,15 @@ private:
     GuestConsole& console_;
     SyscallConfig config_;
 
-    /// Address and length of each live mmap this process made.
-    std::vector<std::pair<uint64_t, uint64_t>> mappings_;
-
     int pid_ {1};
+    int tid_ {0};
     int ppid_ {0};
     ProcessHost* host_ {};
 
-    mutable std::mutex mutex_;
-    std::map<int, OpenFile> files_;
-    std::string cwd_ {"/"};
+    std::shared_ptr<ProcessFiles> shared_;
 
     /// Per-process: what this process passed to exit, and where set_tid_address pointed.
     int exit_status_ {};
-
-    uint64_t heap_base_ {};
-    uint64_t heap_limit_ {};
-    uint64_t heap_break_ {};
 
     /// Guest address passed to set_tid_address, cleared on exit the way Linux does.
     uint64_t clear_child_tid_ {};
@@ -294,6 +353,9 @@ private:
     /// userspace TLS and hands them out in order; glibc asks for one and remembers the
     /// number it was given.
     uint32_t next_tls_entry_ {12};
+
+    /// Set for the duration of one i386 time32 syscall. See TimeWidth.
+    bool narrow_time_ {};
 
     /// What prctl(PR_SET_NAME) was told to call this thread.
     std::string thread_name_;

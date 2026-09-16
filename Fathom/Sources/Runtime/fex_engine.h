@@ -113,9 +113,10 @@ public:
                                              std::string& error);
 
     /// A thread whose registers are a copy of `parent`'s, except that RAX is zero: that
-    /// difference is the whole of what fork returns to a child.
+    /// difference is the whole of what fork returns to a child. A non-zero `new_rsp` puts
+    /// it on a stack of its own, which is what clone does for a thread and fork does not.
     std::unique_ptr<GuestThread> ForkThread(const GuestThread& parent, LinuxSyscalls& syscalls,
-                                            std::string& error);
+                                            std::string& error, uint64_t new_rsp = 0);
 
     static const char* FexRevision();
 

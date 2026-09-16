@@ -948,6 +948,13 @@ std::string LinuxSyscalls::NormaliseGuestPath(const std::string& path) const {
 }
 
 std::string LinuxSyscalls::ResolveGuestPath(const std::string& path, bool follow_final) const {
+    // An empty path is ENOENT on Linux for every syscall that takes one (the AT_EMPTY_PATH
+    // callers check for it before they get here). Normalising it to "/" instead hands the
+    // caller the root directory, and a program that unlinks an uninitialised buffer is told
+    // it may not delete a directory rather than that there is nothing there.
+    if (path.empty()) {
+        return {};
+    }
     const std::string guest_path = NormaliseGuestPath(path);
 
     // The character devices every Unix program assumes exist. A minirootfs ships no /dev
@@ -977,6 +984,12 @@ std::string LinuxSyscalls::ResolveAt(int dirfd, const char* path, std::string* g
         if (entry != shared_->files.end()) {
             request = entry->second.guest_path + "/" + request;
         }
+    }
+    if (request.empty()) {
+        if (guest_path_out != nullptr) {
+            guest_path_out->clear();
+        }
+        return {};
     }
     const std::string guest_path = NormaliseGuestPath(request);
     if (guest_path_out != nullptr) {

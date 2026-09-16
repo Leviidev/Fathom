@@ -118,21 +118,24 @@ ln -sf busybox32 "$OUT_DIR/bin/sh"
 #
 # The list is written out rather than read from `busybox --list`, because busybox32 is a
 # guest binary and nothing on the build host can run it. These are the applets a shell
-# script actually reaches for; the system-level ones busybox also carries (init, mount,
-# modprobe and friends) are deliberately left out, since a stand-in for those would be
-# answering for something it does not own.
+# script actually reaches for. The archive tools are deliberately absent: busybox's tar
+# has no --blocking-factor and its xz has no --robot, and steam.sh asks for both when it
+# unpacks the runtime, so it is the real GNU ones that have to be on PATH -- a 64-bit
+# build of them now runs happily from a 32-bit shell. The system-level applets busybox
+# also carries (init, mount, modprobe and friends) are left out too, since a stand-in for
+# those would be answering for something it does not own.
 echo "==> linking busybox's applets into /usr/local/bin for 32-bit sessions"
 mkdir -p "$OUT_DIR/usr/local/bin"
 for applet in \
     '[' ar arch awk base64 basename bunzip2 bzcat bzip2 cat chgrp chmod chown chroot cmp \
     cp cpio cut date dd df diff dirname dos2unix du echo ed egrep env expand expr factor \
-    fallocate false fgrep find fold free getopt grep groups gunzip gzip head hexdump \
+    fallocate false fgrep find fold free getopt grep groups head hexdump \
     hostname id ipcalc kill killall less link ln logname ls md5sum mkdir mkfifo mknod \
     mktemp more mv nl nproc nslookup od paste patch pidof printf ps pwd readlink realpath \
     rev rm rmdir sed seq setsid sha1sum sha256sum sha512sum shuf sleep sort stat strings \
-    stty sync tac tail tar tee test time timeout touch tr true truncate tty uname \
-    uncompress unexpand uniq unlink unlzma unxz unzip uptime usleep wc wget which who \
-    whoami xargs xxd xz xzcat yes zcat; do
+    stty sync tac tail tee test time timeout touch tr true truncate tty uname \
+    uncompress unexpand uniq unlink unzip uptime usleep wc wget which who \
+    whoami xargs xxd yes; do
     ln -sf /bin/busybox32 "$OUT_DIR/usr/local/bin/$applet"
 done
 

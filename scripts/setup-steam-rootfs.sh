@@ -40,9 +40,51 @@ echo "==> installing over the root filesystem, following its symlinks"
 mkdir -p "$ROOT/root" "$ROOT/tmp"
 chmod 1777 "$ROOT/tmp"
 
+echo "==> installing the launcher"
+# One entry point for both the app and the host runner. Steam draws into an X server, so
+# something has to be listening on :0 before the client starts -- and it has to be the
+# same session, because the client finds the server through a socket inside this root.
+mkdir -p "$ROOT/usr/local/bin"
+cat > "$ROOT/usr/local/bin/fathom-steam" <<'LAUNCHER'
+#!/bin/bash
+# Starts a display, then Steam on it.
+export HOME="${HOME:-/root}"
+export USER="${USER:-root}"
+export DISPLAY="${DISPLAY:-:0}"
+export PATH=/usr/local/bin:/usr/bin:/bin
+export LANG="${LANG:-C}"
+# Steam's own runtime is a second copy of a distribution, and this root already is one.
+export STEAMOS=0
+export STEAM_RUNTIME="${STEAM_RUNTIME:-0}"
+
+# Starting a session is starting a machine: the X server's lock, its socket and Steam's
+# pid file all describe a process from the last run that is no longer there. Left alone,
+# the server refuses to start and Steam decides it is already running and exits.
+rm -rf /tmp/.X0-lock /tmp/.X11-unix /tmp/fb /tmp/.fathom-abstract
+rm -f "$HOME/.steampid" "$HOME/.steam/steam.pid" "$HOME/.steam/steam.pipe"
+mkdir -p /tmp/fb /tmp/.X11-unix /tmp/.ICE-unix
+chmod 1777 /tmp/.X11-unix /tmp/.ICE-unix
+
+# -fbdir puts the framebuffer in a file, which is how the host gets the picture: it maps
+# the same file and every pixel X draws is already in its address space.
+Xvfb :0 -ac -screen 0 "${FATHOM_SCREEN:-1280x720x24}" -fbdir /tmp/fb &
+
+for _ in $(seq 1 400); do
+    [ -e /tmp/.X11-unix/X0 ] && break
+    usleep 25000 2>/dev/null || sleep 1
+done
+if [ ! -e /tmp/.X11-unix/X0 ]; then
+    echo "fathom-steam: the X server did not start" >&2
+    exit 1
+fi
+
+exec /root/.local/share/Steam/steam.sh "$@"
+LAUNCHER
+chmod +x "$ROOT/usr/local/bin/fathom-steam"
+
 echo "==> checking the root filesystem still works"
 if [[ ! -L "$ROOT/lib" ]]; then
     echo "warning: /lib is no longer a symlink; libraries will not be found" >&2
 fi
 printf '==> ready: %s\n' "$ROOT"
-printf '    run with: build/host/fathom-run --root %s --env HOME=/root /bin/bash /usr/bin/steam\n' "$ROOT"
+printf '    run with: build/host/fathom-run --root %s --env HOME=/root /usr/local/bin/fathom-steam\n' "$ROOT"

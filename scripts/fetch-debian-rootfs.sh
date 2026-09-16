@@ -19,9 +19,20 @@ if ! docker info >/dev/null 2>&1; then
     colima start
 fi
 
-echo "==> exporting $IMAGE"
-docker rm -f fathom-debian-export >/dev/null 2>&1 || true
-docker create --platform linux/amd64 --name fathom-debian-export "$IMAGE" /bin/true >/dev/null
+# Steam's own Depends line names these. xz-utils matters most: Debian's tar shells out to
+# an external xz for a .tar.xz, and the Steam bootstrap is exactly that -- without it tar
+# reports "xz: Cannot exec" and the installation stops before it starts.
+PACKAGES="${PACKAGES:-xz-utils python3 ca-certificates file}"
+
+echo "==> building an image from $IMAGE with: $PACKAGES"
+docker rm -f fathom-debian-build fathom-debian-export >/dev/null 2>&1 || true
+docker run --platform linux/amd64 --name fathom-debian-build "$IMAGE" \
+    sh -c "apt-get update -qq && apt-get install -y --no-install-recommends $PACKAGES" >/dev/null
+docker commit fathom-debian-build fathom-debian:latest >/dev/null
+docker rm -f fathom-debian-build >/dev/null 2>&1 || true
+
+echo "==> exporting"
+docker create --platform linux/amd64 --name fathom-debian-export fathom-debian:latest /bin/true >/dev/null
 trap 'docker rm -f fathom-debian-export >/dev/null 2>&1 || true' EXIT
 
 rm -rf "$OUT_DIR"

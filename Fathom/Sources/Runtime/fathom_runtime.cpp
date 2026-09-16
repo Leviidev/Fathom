@@ -597,6 +597,12 @@ void* RunChildThread(void* raw) {
 
     FATHOM_INFO("pid %d: running", process->pid);
     const auto result = session->RunProcess(process);
+
+    // Before anything else: a process that has stopped running must not still be holding
+    // file descriptors. Its copy of a pipe's write end would keep that pipe open, and the
+    // parent reading the other end would wait for an end-of-file that can never come.
+    process->syscalls->ReleaseDescriptors();
+
     // If this child exited without ever execing, the parent is still waiting and its
     // stack is still borrowed.
     session->ReleaseParent(process);

@@ -182,6 +182,17 @@ enum : uint64_t {
     kSysExit = 60,
     kSysWait4 = 61,
     kSysFlock = 73,
+    kSysFchdir = 81,
+    kSysGetxattr = 191,
+    kSysLgetxattr = 192,
+    kSysFgetxattr = 193,
+    kSysListxattr = 194,
+    kSysLlistxattr = 195,
+    kSysFlistxattr = 196,
+    kSysChown = 92,
+    kSysFchown = 93,
+    kSysFchownat = 260,
+    kSysLchown = 94,
     kSysRenameat2 = 316,
     kSysMount = 165,
     kSysUmount2 = 166,
@@ -487,6 +498,17 @@ const char* SyscallName(uint64_t number) {
     case kSysFchmod: return "fchmod";
     case kSysFchmodat: return "fchmodat";
     case kSysUtimensat: return "utimensat";
+    case kSysGetxattr: return "getxattr";
+    case kSysLgetxattr: return "lgetxattr";
+    case kSysFgetxattr: return "fgetxattr";
+    case kSysListxattr: return "listxattr";
+    case kSysLlistxattr: return "llistxattr";
+    case kSysFlistxattr: return "flistxattr";
+    case kSysFchdir: return "fchdir";
+    case kSysChown: return "chown";
+    case kSysFchown: return "fchown";
+    case kSysFchownat: return "fchownat";
+    case kSysLchown: return "lchown";
     case kSysFlock: return "flock";
     case kSysStatfs: return "statfs";
     case kSysFstatfs: return "fstatfs";
@@ -604,6 +626,12 @@ void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
 void LinuxSyscalls::AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const std::string& path) {
     InitialiseHeap(heap_base, heap_reserved);
     config_.work_dir = path;
+    // An exec replaces the whole address space, so nothing the old program mapped is
+    // this process's any more. Keeping the list would make a later fork snapshot and
+    // then restore regions that have since been released and handed to somebody else --
+    // which corrupts whichever process is now living there.
+    std::scoped_lock lock {mutex_};
+    mappings_.clear();
 }
 
 void LinuxSyscalls::InitialiseHeap(uint64_t base, uint64_t reserved) {
@@ -1727,21 +1755,17 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return DoOpenAt(guest::kAtFdCwd, arg1, guest::kOCreat | guest::kOTrunc | 1, static_cast<int>(arg2));
 
     case kSysClose: {
+        // Closing stdio has to really close it. A program redirects by closing fd 1 and
+        // then dup'ing a pipe onto it, relying on dup returning the lowest free number:
+        // leaving fd 1 occupied hands back some other descriptor, the program finds its
+        // output is not where it put it, and it aborts. The console entries carry no host
+        // descriptor, so removing one costs the app nothing.
         const int fd = static_cast<int>(arg1);
-        if (fd >= 0 && fd <= 2) {
-            return 0; // The guest closing its own stdio must not close the app's.
-        }
         std::scoped_lock lock {mutex_};
-        auto* file = FindFile(fd);
-        if (file == nullptr) {
+        if (FindFile(fd) == nullptr) {
             return FailLinux(9);
         }
-        if (file->directory != nullptr) {
-            closedir(static_cast<DIR*>(file->directory));
-        } else {
-            close(file->host_fd);
-        }
-        files_.erase(fd);
+        CloseFd(fd);
         return 0;
     }
 
@@ -2325,9 +2349,62 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return FailLinux(38);
 
     case kSysStatx: {
-        // Answered through fstatat and reshaped, rather than left unimplemented: a
-        // recent glibc reaches for statx first and only falls back if it returns ENOSYS.
-        return FailLinux(38);
+        // Answered properly rather than refused. glibc falls back to fstatat when this
+        // returns ENOSYS, but GNU coreutils calls statx directly and does not -- so with
+        // it unimplemented, `ls -l` reports "Function not implemented" for every file.
+        const int dirfd = static_cast<int>(arg1);
+        const int flags = static_cast<int>(arg3);
+        std::string path;
+        if (!ReadGuestString(arg2, &path)) {
+            return FailLinux(14);
+        }
+
+        struct stat host {};
+        int result = 0;
+        if (path.empty() && (flags & guest::kAtEmptyPath) != 0) {
+            const int host_fd = HostFdFor(dirfd);
+            result = host_fd >= 0 ? fstat(host_fd, &host) : stat(ResolveGuestPath(cwd_).c_str(), &host);
+        } else {
+            const std::string host_path = ResolveAt(dirfd, path.c_str(), nullptr);
+            result = (flags & guest::kAtSymlinkNoFollow) != 0 ? lstat(host_path.c_str(), &host)
+                                                              : stat(host_path.c_str(), &host);
+        }
+        if (result != 0) {
+            return Fail(errno);
+        }
+
+        auto* out = static_cast<uint8_t*>(GuestPointer(arg5, 256, true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        std::memset(out, 0, 256);
+        const auto put32 = [&](size_t offset, uint32_t value) { std::memcpy(out + offset, &value, 4); };
+        const auto put64 = [&](size_t offset, uint64_t value) { std::memcpy(out + offset, &value, 8); };
+        const auto put16 = [&](size_t offset, uint16_t value) { std::memcpy(out + offset, &value, 2); };
+        const auto put_time = [&](size_t offset, int64_t seconds, uint32_t nanoseconds) {
+            put64(offset, static_cast<uint64_t>(seconds));
+            put32(offset + 8, nanoseconds);
+        };
+
+        constexpr uint32_t kStatxBasicStats = 0x07ff;
+        put32(0, kStatxBasicStats);                            // stx_mask: what is filled in
+        put32(4, static_cast<uint32_t>(host.st_blksize));
+        put32(16, static_cast<uint32_t>(host.st_nlink));
+        put32(20, host.st_uid);
+        put32(24, host.st_gid);
+        put16(28, static_cast<uint16_t>(host.st_mode));
+        put64(32, host.st_ino);
+        put64(40, static_cast<uint64_t>(host.st_size));
+        put64(48, static_cast<uint64_t>(host.st_blocks));
+        put_time(64, host.st_atimespec.tv_sec, static_cast<uint32_t>(host.st_atimespec.tv_nsec));
+        put_time(80, host.st_birthtimespec.tv_sec, static_cast<uint32_t>(host.st_birthtimespec.tv_nsec));
+        put_time(96, host.st_ctimespec.tv_sec, static_cast<uint32_t>(host.st_ctimespec.tv_nsec));
+        put_time(112, host.st_mtimespec.tv_sec, static_cast<uint32_t>(host.st_mtimespec.tv_nsec));
+        put32(128, static_cast<uint32_t>(major(host.st_rdev)));
+        put32(132, static_cast<uint32_t>(minor(host.st_rdev)));
+        put32(136, static_cast<uint32_t>(major(host.st_dev)));
+        put32(140, static_cast<uint32_t>(minor(host.st_dev)));
+        return 0;
     }
 
     case kSysPoll:
@@ -2697,6 +2774,44 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         // Nothing here is mountable, and this is not root. EPERM is the truthful answer,
         // and unlike ENOSYS it is one callers are written to expect.
         return FailLinux(1);
+
+    case kSysGetxattr:
+    case kSysLgetxattr:
+    case kSysFgetxattr:
+        // "This file has no such attribute" rather than "this system has no attributes".
+        // ls asks every file whether it carries a security label, and handles ENODATA
+        // quietly while reporting ENOSYS as an error against the file itself.
+        return FailLinux(61); // ENODATA
+
+    case kSysListxattr:
+    case kSysLlistxattr:
+    case kSysFlistxattr:
+        return 0;  // An empty list of attributes.
+
+    case kSysFchdir: {
+        // The working directory is tracked as a guest path, not as a host descriptor, so
+        // this is answered from the path the descriptor was opened with rather than by
+        // calling the host's fchdir.
+        std::scoped_lock lock {mutex_};
+        auto* file = FindFile(static_cast<int>(arg1));
+        if (file == nullptr) {
+            return FailLinux(9);
+        }
+        if (file->guest_path.empty() || file->guest_path.front() != '/') {
+            return FailLinux(22); // EINVAL
+        }
+        cwd_ = file->guest_path;
+        return 0;
+    }
+
+    case kSysChown:
+    case kSysLchown:
+    case kSysFchown:
+    case kSysFchownat:
+        // There is one user here and everything already belongs to it, so ownership
+        // changes are accepted and ignored. Refusing them stops installers that are only
+        // tidying up permissions they do not actually need.
+        return 0;
 
     case kSysFlock: {
         const int host_fd = HostFdFor(static_cast<int>(arg1));

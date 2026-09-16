@@ -126,6 +126,11 @@ public:
     /// would sweep up the memory of unrelated ones.
     std::vector<std::pair<uint64_t, uint64_t>> Mappings() const;
 
+    /// Closes everything this process had open. Called when it *exits*, not when it is
+    /// reaped: a pipe reaches end-of-file only once every copy of its write end is gone,
+    /// and a parent blocked reading that pipe is in no position to reap anybody.
+    void ReleaseDescriptors() { CloseAll(); }
+
     /// How far brk has grown: the part of the heap a fork actually has to preserve.
     uint64_t HeapBreak() const { return heap_break_; }
 

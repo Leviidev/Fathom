@@ -996,8 +996,15 @@ void* LinuxSyscalls::GuestPointer(uint64_t address, uint64_t size, bool writable
     // The guest's number, not the host's. Identical for a 64-bit guest; for a 32-bit one
     // the arena lives high in the host's address space and this is where that is undone.
     address = space_.ToHost(address);
-    const int required = kGuestProtRead | (writable ? kGuestProtWrite : 0);
-    if (!space_.Validate(address, size, required)) {
+    // Committed is the test, not writable. The guest's pages are 4KB and the host's are
+    // 16KB, so the protection recorded for a host page is the union of up to four guest
+    // pages' -- an approximation, and too coarse to refuse a syscall on. A guest that
+    // passes a pointer into a page it has legitimately made writable can have that page
+    // recorded read-only because a neighbour is, and the syscall comes back EFAULT for no
+    // reason the guest can see. Whether the memory exists at all is the thing this can
+    // answer accurately, and it is what catches a genuinely wild pointer.
+    (void)writable;
+    if (!space_.Validate(address, size, kGuestProtRead)) {
         return nullptr;
     }
     return reinterpret_cast<void*>(address);

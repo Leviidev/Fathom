@@ -346,7 +346,7 @@ ElfInspection InspectElf(const std::string& path) {
 }
 
 bool LoadElf(const std::string& path, GuestAddressSpace& space, uint64_t preferred_base,
-             LoadedImage* out_image, std::string& error) {
+             uint64_t guest_base, LoadedImage* out_image, std::string& error) {
     Elf64Ehdr header {};
     std::vector<Elf64Phdr> segments;
     if (!ReadHeaders(path, &header, &segments, error)) {
@@ -383,16 +383,16 @@ bool LoadElf(const std::string& path, GuestAddressSpace& space, uint64_t preferr
             return false;
         }
         load_base = placed - image_begin;
-    } else if (space.GuestBase() != 0) {
+    } else if (guest_base != 0) {
         // ET_EXEC inside a relocated guest, which is the ordinary case for i386: the file
         // insists on 0x08048000 or similar, and that address is perfectly available --
         // inside the arena, where the guest's address space starts at zero. No host
         // mapping at a fixed low address is needed, or possible.
-        if (!space.CommitFixed(space.ToHost(image_begin), span, kGuestProtRead | kGuestProtWrite)) {
+        if (!space.CommitFixed(image_begin + guest_base, span, kGuestProtRead | kGuestProtWrite)) {
             error = "guest address space could not hold the program at its fixed address";
             return false;
         }
-        load_base = space.ToHost(0);
+        load_base = guest_base;
     } else {
         // ET_EXEC: the addresses in the file are the addresses it must run at.
         void* fixed = mmap(reinterpret_cast<void*>(image_begin), span, PROT_READ | PROT_WRITE,
@@ -477,7 +477,7 @@ bool LoadElf(const std::string& path, GuestAddressSpace& space, uint64_t preferr
     return true;
 }
 
-bool BuildInitialStack(GuestAddressSpace& space, const LoadedImage& image,
+bool BuildInitialStack(GuestAddressSpace& space, uint64_t guest_base, const LoadedImage& image,
                        const std::vector<std::string>& argv, const std::vector<std::string>& envp,
                        const std::string& exec_path, uint64_t interpreter_base, uint64_t stack_size,
                        StackImage* out_stack, std::string& error) {
@@ -508,7 +508,7 @@ bool BuildInitialStack(GuestAddressSpace& space, const LoadedImage& image,
     const uint64_t random_address = push_bytes(random_bytes, sizeof(random_bytes));
 
     // The guest's own name for the machine it thinks it is on.
-    const uint64_t platform_address = push_string(space.GuestBase() != 0 ? "i686" : "x86_64");
+    const uint64_t platform_address = push_string(guest_base != 0 ? "i686" : "x86_64");
     const uint64_t execfn_address = push_string(exec_path);
 
     std::vector<uint64_t> env_addresses;
@@ -555,7 +555,7 @@ bool BuildInitialStack(GuestAddressSpace& space, const LoadedImage& image,
     // layout is otherwise the same -- argc, then argv, then envp, then the auxiliary
     // vector -- but writing 64-bit words into it puts every entry at twice its offset and
     // the guest reads its own arguments as garbage.
-    const bool narrow = space.GuestBase() != 0;
+    const bool narrow = guest_base != 0;
     const size_t word_size = narrow ? 4 : 8;
 
     const size_t word_count = 1                        // argc
@@ -589,11 +589,11 @@ bool BuildInitialStack(GuestAddressSpace& space, const LoadedImage& image,
 
     put(arg_addresses.size());
     for (const auto address : arg_addresses) {
-        put(space.ToGuest(address));
+        put(address - guest_base);
     }
     put(0);
     for (const auto address : env_addresses) {
-        put(space.ToGuest(address));
+        put(address - guest_base);
     }
     put(0);
     for (const auto& [key, value] : auxv) {
@@ -602,12 +602,12 @@ bool BuildInitialStack(GuestAddressSpace& space, const LoadedImage& image,
         // AT_PHDR, AT_BASE and AT_ENTRY came from the loaded image and are already in the
         // guest's numbering; converting them twice would subtract the base twice.
         const bool from_this_stack = key == kAtRandom || key == kAtPlatform || key == kAtExecfn;
-        put(from_this_stack && value != 0 ? space.ToGuest(value) : value);
+        put(from_this_stack && value != 0 ? value - guest_base : value);
     }
 
     out_stack->stack_base = base;
     out_stack->stack_size = stack_size;
-    out_stack->rsp = space.ToGuest(rsp);
+    out_stack->rsp = rsp - guest_base;
     FATHOM_INFO("guest stack: %#llx..%#llx, rsp=%#llx, %zu argv, %zu envp",
                 static_cast<unsigned long long>(base), static_cast<unsigned long long>(top),
                 static_cast<unsigned long long>(rsp), argv.size(), envp.size());

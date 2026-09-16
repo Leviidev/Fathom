@@ -753,7 +753,7 @@ void LinuxSyscalls::ReleaseThreadId() {
     }
     // What the kernel does for CLONE_CHILD_CLEARTID, and what pthread_join waits for.
     auto* slot = static_cast<uint32_t*>(GuestPointer(clear_child_tid_, sizeof(uint32_t), true));
-    const uint64_t address = space_.ToHost(clear_child_tid_);
+    const uint64_t address = ToHost(clear_child_tid_);
     clear_child_tid_ = 0;
     if (slot != nullptr) {
         *slot = 0;
@@ -995,7 +995,7 @@ void* LinuxSyscalls::GuestPointer(uint64_t address, uint64_t size, bool writable
     }
     // The guest's number, not the host's. Identical for a 64-bit guest; for a 32-bit one
     // the arena lives high in the host's address space and this is where that is undone.
-    address = space_.ToHost(address);
+    address = ToHost(address);
     // Committed is the test, not writable. The guest's pages are 4KB and the host's are
     // 16KB, so the protection recorded for a host page is the union of up to four guest
     // pages' -- an approximation, and too coarse to refuse a syscall on. A guest that
@@ -1045,7 +1045,7 @@ bool LinuxSyscalls::ReadGuestString(uint64_t address, std::string* out, size_t l
     // guest does not own.
     // Guest numbering, like every other pointer a syscall is handed. GuestPointer does
     // this for fixed-size buffers; a string has to do it itself because it walks.
-    const uint64_t host_address = space_.ToHost(address);
+    const uint64_t host_address = ToHost(address);
     std::string value;
     value.reserve(64);
     for (size_t offset = 0; offset < limit; ++offset) {
@@ -1956,7 +1956,7 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
     // The guest's hint comes in guest-numbered and the result goes back out the same way;
     // for a 1:1 (64-bit) guest both conversions are the identity.
     if (address != 0) {
-        address = space_.ToHost(address);
+        address = ToHost(address);
     }
 
     int guest_protection = 0;
@@ -2020,7 +2020,7 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
             }
             FATHOM_INFO("guest mapped the display at %#llx",
                         static_cast<unsigned long long>(display.address));
-            return space_.ToGuest(display.address);
+            return ToGuest(display.address);
         }
         // MAP_SHARED means the guest's writes must be visible in the file, and to
         // everything else that mapped it. That is not something a copy can imitate, and
@@ -2060,7 +2060,7 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
             if (mapped != MAP_FAILED) {
                 // The table's lock is already held by the block this sits in.
                 shared_->mappings.emplace_back(placed, length);
-                return space_.ToGuest(placed);
+                return ToGuest(placed);
             }
             FATHOM_WARN("shared mapping of %s failed (%s); falling back to a private copy",
                         file->guest_path.c_str(), std::strerror(errno));
@@ -2086,8 +2086,8 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         std::scoped_lock lock {shared_->mutex};
         if (auto* file = FindFile(fd)) {
             FATHOM_INFO("mapped %s code at %#llx..%#llx", file->guest_path.c_str(),
-                        static_cast<unsigned long long>(space_.ToGuest(placed)),
-                        static_cast<unsigned long long>(space_.ToGuest(placed) + length));
+                        static_cast<unsigned long long>(ToGuest(placed)),
+                        static_cast<unsigned long long>(ToGuest(placed) + length));
         }
     }
     if ((guest_protection & kGuestProtWrite) == 0) {
@@ -2097,7 +2097,7 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         std::scoped_lock lock {shared_->mutex};
         shared_->mappings.emplace_back(placed, length);
     }
-    return space_.ToGuest(placed);
+    return ToGuest(placed);
 }
 
 uint64_t LinuxSyscalls::DoBrk(uint64_t requested) {
@@ -2119,7 +2119,7 @@ uint64_t LinuxSyscalls::DoBrk(uint64_t requested) {
         // allocated before exec'ing, most often. Left dirty, the parent's next malloc
         // reads that as a chunk header and glibc aborts with an assertion about the top
         // chunk, a long way from anything that looks related.
-        std::memset(reinterpret_cast<void*>(space_.ToHost(shared_->heap_break)), 0,
+        std::memset(reinterpret_cast<void*>(ToHost(shared_->heap_break)), 0,
                     requested - shared_->heap_break);
     }
     shared_->heap_break = requested;
@@ -3247,7 +3247,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                       static_cast<int>(arg5), static_cast<int64_t>(arg6));
 
     case kSysMunmap: {
-        const uint64_t host_address = space_.ToHost(arg1);
+        const uint64_t host_address = ToHost(arg1);
         {
             std::scoped_lock lock {shared_->mutex};
             std::erase_if(shared_->mappings, [&](const auto& entry) {
@@ -3262,12 +3262,12 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if ((arg3 & guest::kProtRead) != 0) guest_protection |= kGuestProtRead;
         if ((arg3 & guest::kProtWrite) != 0) guest_protection |= kGuestProtWrite;
         if ((arg3 & guest::kProtExec) != 0) guest_protection |= kGuestProtExec;
-        return space_.Protect(space_.ToHost(arg1), arg2, guest_protection) ? 0 : FailLinux(22);
+        return space_.Protect(ToHost(arg1), arg2, guest_protection) ? 0 : FailLinux(22);
     }
 
     case kSysMremap: {
         constexpr uint64_t kMremapMayMove = 1;
-        const uint64_t old_address = space_.ToHost(arg1);
+        const uint64_t old_address = ToHost(arg1);
         const uint64_t old_size = arg2;
         const uint64_t new_size = arg3;
         const uint64_t flags = arg4;
@@ -3292,7 +3292,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         // reads as zero.
         std::memset(reinterpret_cast<uint8_t*>(placed) + old_size, 0, new_size - old_size);
         space_.Release(old_address, old_size);
-        return space_.ToGuest(placed);
+        return ToGuest(placed);
     }
 
     case kSysBrk:
@@ -3972,10 +3972,10 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             // Requeue moves waiters from one futex to another. Waking them instead is
             // allowed -- a futex waiter must re-check its own condition on waking -- and
             // it avoids keeping a queue per address.
-            const uint64_t host_address = space_.ToHost(arg1);
+            const uint64_t host_address = ToHost(arg1);
             WakeFutex(host_address);
             if (operation == kFutexRequeue || operation == kFutexCmpRequeue) {
-                WakeFutex(space_.ToHost(arg5));
+                WakeFutex(ToHost(arg5));
             }
             return arg3;  // How many were woken; the caller only checks for an error.
         }

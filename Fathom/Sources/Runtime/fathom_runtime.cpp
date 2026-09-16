@@ -40,15 +40,15 @@ constexpr uint64_t k32BitAddressSpace = 4ULL * 1024 * 1024 * 1024;
 /// Converts an image's outward-facing addresses -- the ones that end up in registers and
 /// in the auxiliary vector -- from the host's numbering to the guest's. Identity for a
 /// 64-bit guest, where the two are the same.
-void ToGuestAddresses(const fathom::GuestAddressSpace& space, fathom::LoadedImage* image) {
-    if (space.GuestBase() == 0) {
+void ToGuestAddresses(uint64_t guest_base, fathom::LoadedImage* image) {
+    if (guest_base == 0) {
         return;
     }
     const uint64_t host_begin = image->image_begin;
-    image->entry = space.ToGuest(image->entry);
-    image->phdr_address = image->phdr_address != 0 ? space.ToGuest(image->phdr_address) : 0;
-    image->image_begin = space.ToGuest(image->image_begin);
-    image->image_end = space.ToGuest(image->image_end);
+    image->entry -= guest_base;
+    image->phdr_address = image->phdr_address != 0 ? image->phdr_address - guest_base : 0;
+    image->image_begin -= guest_base;
+    image->image_end -= guest_base;
     // load_base is an addend applied to p_vaddr, not an address, so it shifts by however
     // much the image's start moved.
     image->load_base -= (host_begin - image->image_begin);
@@ -142,22 +142,25 @@ struct LoadedProgram {
     bool dynamic {};
     uint64_t heap {};
     uint64_t entry {};
+    /// Carried with the program so that releasing it does not need the process that ran it.
+    bool is_32bit {};
+    uint64_t guest_base {};
 };
 
-bool LoadProgram(fathom::GuestAddressSpace& space, const std::string& guest_root,
-                 const std::string& host_path, const std::vector<std::string>& argv,
-                 const std::vector<std::string>& envp, uint64_t stack_size, LoadedProgram* out,
-                 std::string& error) {
+bool LoadProgram(fathom::GuestAddressSpace& space, uint64_t guest_base,
+                 const std::string& guest_root, const std::string& host_path,
+                 const std::vector<std::string>& argv, const std::vector<std::string>& envp,
+                 uint64_t stack_size, LoadedProgram* out, std::string& error) {
     const auto inspection = fathom::InspectElf(host_path);
     if (!inspection.ok) {
         error = inspection.error;
         return false;
     }
 
-    if (!fathom::LoadElf(host_path, space, 0, &out->image, error)) {
+    if (!fathom::LoadElf(host_path, space, 0, guest_base, &out->image, error)) {
         return false;
     }
-    ToGuestAddresses(space, &out->image);
+    ToGuestAddresses(guest_base, &out->image);
 
     // A dynamically linked program does not begin at its own entry point. The kernel maps
     // its interpreter -- ld.so -- alongside it and enters *that*; ld.so then loads the
@@ -175,15 +178,16 @@ bool LoadProgram(fathom::GuestAddressSpace& space, const std::string& guest_root
                     ", which the guest root filesystem does not provide.";
             return false;
         }
-        if (!fathom::LoadElf(loader, space, space.ToHost(out->image.image_end), &out->interpreter, error)) {
+        if (!fathom::LoadElf(loader, space, out->image.image_end + guest_base, guest_base,
+                             &out->interpreter, error)) {
             error = "could not load the dynamic loader " + inspection.interpreter + ": " + error;
             return false;
         }
-        ToGuestAddresses(space, &out->interpreter);
+        ToGuestAddresses(guest_base, &out->interpreter);
         out->dynamic = true;
     }
 
-    if (!fathom::BuildInitialStack(space, out->image, argv, envp, host_path,
+    if (!fathom::BuildInitialStack(space, guest_base, out->image, argv, envp, host_path,
                                    out->dynamic ? out->interpreter.load_base : 0, stack_size,
                                    &out->stack, error)) {
         return false;
@@ -193,15 +197,17 @@ bool LoadProgram(fathom::GuestAddressSpace& space, const std::string& guest_root
     // the layout it expects. Reserved, not touched: nothing is paged in until the guest
     // actually writes to it.
     const uint64_t images_end = std::max(out->image.image_end, out->interpreter.image_end);
-    const uint64_t heap_host = space.Allocate(kHeapReservation, space.ToHost(images_end),
+    const uint64_t heap_host = space.Allocate(kHeapReservation, images_end + guest_base,
                                               fathom::kGuestProtRead | fathom::kGuestProtWrite);
     if (heap_host == 0) {
         error = "could not reserve the guest heap";
         return false;
     }
-    out->heap = space.ToGuest(heap_host);
+    out->heap = heap_host - guest_base;
 
     out->entry = out->dynamic ? out->interpreter.entry : out->image.entry;
+    out->is_32bit = inspection.is_32bit;
+    out->guest_base = guest_base;
     return true;
 }
 
@@ -220,7 +226,7 @@ void ReleaseProgramData(fathom::GuestAddressSpace& space, const LoadedProgram& p
         space.Release(program.stack.stack_base, program.stack.stack_size);
     }
     if (program.heap != 0) {
-        space.Release(space.ToHost(program.heap), kHeapReservation);
+        space.Release(program.heap + program.guest_base, kHeapReservation);
     }
     // The images are deliberately not released here. They are a few megabytes against the
     // heap's hundred and twenty-eight, and a program's code can still be reached after it
@@ -234,6 +240,11 @@ void ReleaseProgramData(fathom::GuestAddressSpace& space, const LoadedProgram& p
 struct GuestProcess {
     int pid {};
     int ppid {};
+    /// This process's word size, and where its address space starts in the host's. Both
+    /// belong to the process rather than the session: Steam's client is i386 and the
+    /// process that draws its interface is x86-64, and they run side by side.
+    bool is_32bit {};
+    uint64_t guest_base {};
     std::string path;
 
     std::unique_ptr<DeferredThreadControl> control;
@@ -311,7 +322,14 @@ struct fathom_session final : fathom::ProcessHost {
     fathom::GuestConsole console;
 
     std::unique_ptr<fathom::GuestAddressSpace> space;
-    std::unique_ptr<fathom::FexEngine> engine;
+    /// One JIT context per word size. FEXCore decides how to decode and where the guest's
+    /// memory starts when the context is created, so a session that runs both needs both.
+    /// They share the one address space.
+    std::unique_ptr<fathom::FexEngine> engine32;
+    std::unique_ptr<fathom::FexEngine> engine64;
+    fathom::EngineOptions engine_options;
+
+    fathom::FexEngine* EngineFor(bool is_32bit, std::string& error);
 
     std::string program_path;
     std::string guest_root;
@@ -321,6 +339,8 @@ struct fathom_session final : fathom::ProcessHost {
     /// be told: its syscalls are numbered differently, and a child that is not told
     /// dispatches its parent's numbers as though they were x86-64's.
     bool guest_is_32bit {};
+    /// The arena's base, used by 32-bit processes. A 64-bit one runs at zero.
+    uint64_t guest_base {};
 
     // The process table. pid 1 is the program the session was created for; everything
     // else got here through a fork.
@@ -389,6 +409,26 @@ void* RunChildThread(void* raw);
 
 } // namespace
 
+fathom::FexEngine* fathom_session::EngineFor(bool is_32bit, std::string& error) {
+    auto& slot = is_32bit ? engine32 : engine64;
+    if (slot == nullptr) {
+        fathom::EngineOptions options = engine_options;
+        options.guest_is_32bit = is_32bit;
+        // A 32-bit guest's pointers cannot reach where the arena actually lives, so its
+        // addresses are offset into it. A 64-bit guest needs no such trick -- the arena's
+        // addresses fit in its pointers -- so it runs one to one.
+        options.guest_memory_base = is_32bit ? guest_base : 0;
+        slot = fathom::FexEngine::Create(*space, options, error);
+        if (slot == nullptr) {
+            FATHOM_ERROR("could not start a %d-bit JIT context: %s", is_32bit ? 32 : 64,
+                         error.c_str());
+        } else {
+            FATHOM_INFO("started a %d-bit JIT context", is_32bit ? 32 : 64);
+        }
+    }
+    return slot.get();
+}
+
 fathom::RunResult fathom_session::RunProcess(GuestProcess* process) {
     fathom::RunResult result;
     for (;;) {
@@ -401,8 +441,10 @@ fathom::RunResult fathom_session::RunProcess(GuestProcess* process) {
         // image behind. The thread is replaced only now, once Run() has returned and the
         // old thread's frames are gone from this host stack.
         std::string reason;
-        auto fresh = engine->StartThread(process->exec_entry, process->exec_rsp, *process->syscalls,
-                                         reason);
+        auto* engine = EngineFor(process->is_32bit, reason);
+        auto fresh = engine == nullptr ? nullptr
+                                       : engine->StartThread(process->exec_entry, process->exec_rsp,
+                                                             *process->syscalls, reason);
         if (fresh == nullptr) {
             FATHOM_ERROR("execve could not start the new image: %s", reason.c_str());
             result.outcome = fathom::RunOutcome::Faulted;
@@ -557,7 +599,8 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
         thread_config.guest_root = guest_root;
         thread_config.work_dir = "/";
         thread_config.trace = trace;
-        thread_config.guest_is_32bit = guest_is_32bit;
+        thread_config.guest_is_32bit = process->is_32bit;
+        thread_config.guest_base = process->guest_base;
         record->syscalls = std::make_unique<fathom::LinuxSyscalls>(*space, *record->control, console,
                                                                    thread_config);
         // Shared rather than copied: this is the entire difference between a thread and a
@@ -579,7 +622,10 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
         }
 
         std::string reason;
-        record->thread = engine->ForkThread(*caller, *record->syscalls, reason, stack);
+        auto* engine = EngineFor(process->is_32bit, reason);
+        record->thread = engine == nullptr
+                             ? nullptr
+                             : engine->ForkThread(*caller, *record->syscalls, reason, stack);
         if (record->thread == nullptr) {
             FATHOM_ERROR("could not create a guest thread: %s", reason.c_str());
             return -11; // -EAGAIN
@@ -592,8 +638,9 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
             if (address == 0) {
                 return;
             }
-            auto* slot = reinterpret_cast<int32_t*>(space->ToHost(address));
-            if (space->Validate(space->ToHost(address), sizeof(int32_t), fathom::kGuestProtWrite)) {
+            auto* slot = reinterpret_cast<int32_t*>(address + process->guest_base);
+            if (space->Validate(address + process->guest_base, sizeof(int32_t),
+                                fathom::kGuestProtRead)) {
                 *slot = tid;
             }
         };
@@ -609,8 +656,8 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
         // set_thread_area takes, and expects %gs to be loaded from it afterwards.
         if ((flags & kCloneSettls) != 0 && tls != 0) {
             if (guest_is_32bit) {
-                auto* descriptor = reinterpret_cast<uint32_t*>(space->ToHost(tls));
-                if (space->Validate(space->ToHost(tls), 16, fathom::kGuestProtRead)) {
+                auto* descriptor = reinterpret_cast<uint32_t*>(tls + process->guest_base);
+                if (space->Validate(tls + process->guest_base, 16, fathom::kGuestProtRead)) {
                     const uint32_t entry = descriptor[0] == 0xFFFF'FFFFU ? 12 : descriptor[0];
                     record->control->SetTlsDescriptor(static_cast<int>(entry), descriptor[1],
                                                       descriptor[2] >> 12);
@@ -668,6 +715,8 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         // Shared, not owned: until this child execs it is running inside its parent's
         // image and on its parent's stack.
         child->program = parent->program;
+        child->is_32bit = parent->is_32bit;
+        child->guest_base = parent->guest_base;
         child->owns_program = false;
         child->control = std::make_unique<DeferredThreadControl>();
 
@@ -677,7 +726,8 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         // Inherited, or a forked child's syscalls are invisible in the log exactly when
         // the interesting thing is what the child did.
         child_config.trace = trace;
-        child_config.guest_is_32bit = guest_is_32bit;
+        child_config.guest_is_32bit = parent->is_32bit;
+        child_config.guest_base = parent->guest_base;
         child->syscalls = std::make_unique<fathom::LinuxSyscalls>(*space, *child->control, console,
                                                                   child_config);
         parent->syscalls->CloneInto(*child->syscalls);
@@ -691,7 +741,9 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         }
 
         std::string reason;
-        child->thread = engine->ForkThread(*caller, *child->syscalls, reason);
+        auto* engine = EngineFor(parent->is_32bit, reason);
+        child->thread = engine == nullptr ? nullptr
+                                          : engine->ForkThread(*caller, *child->syscalls, reason);
         if (child->thread == nullptr) {
             FATHOM_ERROR("fork failed: %s", reason.c_str());
             return -11; // -EAGAIN
@@ -720,11 +772,12 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         uint64_t held = 0;
         const uint64_t stack_low = parent->program.stack.stack_base;
         const uint64_t stack_top = stack_low + parent->program.stack.stack_size;
-        const uint64_t rsp = space->ToHost(parent->thread->Rsp());
-        const uint64_t heap_low = parent->program.heap == 0 ? 0 : space->ToHost(parent->program.heap);
+        const uint64_t rsp = parent->thread->Rsp() + parent->guest_base;
+        const uint64_t heap_low =
+            parent->program.heap == 0 ? 0 : parent->program.heap + parent->guest_base;
         const uint64_t heap_used = parent->syscalls->HeapBreak() == 0
                                        ? 0
-                                       : space->ToHost(parent->syscalls->HeapBreak());
+                                       : parent->syscalls->HeapBreak() + parent->guest_base;
 
         const uint64_t heap_top = heap_low + kHeapReservation;
         const auto overlaps = [](uint64_t a1, uint64_t a2, uint64_t b1, uint64_t b2) {
@@ -737,10 +790,10 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         std::vector<std::pair<uint64_t, uint64_t>> owned = parent->syscalls->Mappings();
         // ToGuestAddresses put an image's bounds into the guest's numbering, because that
         // is what the guest is told about them. Copying needs the host's.
-        owned.emplace_back(space->ToHost(parent->program.image.image_begin),
+        owned.emplace_back(parent->program.image.image_begin + parent->guest_base,
                            parent->program.image.image_end - parent->program.image.image_begin);
         if (parent->program.dynamic) {
-            owned.emplace_back(space->ToHost(parent->program.interpreter.image_begin),
+            owned.emplace_back(parent->program.interpreter.image_begin + parent->guest_base,
                                parent->program.interpreter.image_end - parent->program.interpreter.image_begin);
         }
         owned.emplace_back(stack_low, stack_top - stack_low);
@@ -878,21 +931,23 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& path,
         }
     }
 
-    // A session's word size is fixed when it starts: the JIT decodes for one or the other,
-    // and the guest's address space is laid out to match. A binary of the other width
-    // cannot run here, and letting it try is worse than refusing -- its first instructions
-    // decode as something else entirely and it spins forever with no output, which looks
-    // exactly like a hang in whatever launched it.
+    // exec is where a process's word size is decided, and it need not match the one that
+    // called it: Steam's client is i386 and the process that draws its interface is
+    // x86-64. The new image gets whichever JIT context matches it, and an address space
+    // offset only if it is 32-bit.
     const auto inspection = fathom::InspectElf(host_path);
-    if (inspection.ok && inspection.is_32bit != guest_is_32bit) {
-        FATHOM_WARN("execve %s: this is a %d-bit binary and the session is running %d-bit code; "
-                    "install the %d-bit build of it in the guest root",
-                    path.c_str(), inspection.is_32bit ? 32 : 64, guest_is_32bit ? 32 : 64,
-                    guest_is_32bit ? 32 : 64);
+    if (!inspection.ok) {
+        FATHOM_WARN("execve %s: %s", path.c_str(), inspection.error.c_str());
         return -8; // -ENOEXEC
     }
+    const uint64_t new_base = inspection.is_32bit ? this->guest_base : 0;
+    if (EngineFor(inspection.is_32bit, reason) == nullptr) {
+        FATHOM_WARN("execve %s: no %d-bit JIT context: %s", path.c_str(),
+                    inspection.is_32bit ? 32 : 64, reason.c_str());
+        return -8;
+    }
 
-    if (!LoadProgram(*space, guest_root, host_path, argv, envp, stack_size, &loaded, reason)) {
+    if (!LoadProgram(*space, new_base, guest_root, host_path, argv, envp, stack_size, &loaded, reason)) {
         FATHOM_WARN("execve %s: %s", path.c_str(), reason.c_str());
         return -8; // -ENOEXEC
     }
@@ -901,6 +956,9 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& path,
     process->has_previous = process->owns_program;
     process->program = loaded;
     process->owns_program = true;
+    process->is_32bit = inspection.is_32bit;
+    process->guest_base = new_base;
+    process->syscalls->AdoptWordSize(inspection.is_32bit, new_base);
     process->path = path;
     process->exec_entry = loaded.entry;
     process->exec_rsp = loaded.stack.rsp;
@@ -1104,6 +1162,9 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     }
     if (guest_is_32bit) {
         // The guest sees its address space starting at zero; it really starts here.
+        // Recorded on the session as well, because a 64-bit process started later by this
+        // 32-bit one runs one to one and must not use it.
+        session->guest_base = session->space->Base();
         session->space->SetGuestBase(session->space->Base());
         FATHOM_INFO("i386 guest: 4GB arena at %#llx, which the guest sees as 0",
                     static_cast<unsigned long long>(session->space->Base()));
@@ -1137,7 +1198,8 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     process->path = session->program_path;
     process->owns_program = true;
 
-    if (!LoadProgram(*session->space, session->guest_root, session->program_path, argv, envp,
+    if (!LoadProgram(*session->space, session->guest_base, session->guest_root,
+                     session->program_path, argv, envp,
                      session->stack_size, &process->program, reason)) {
         return fail(reason);
     }
@@ -1152,7 +1214,10 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     syscall_config.work_dir = config->work_dir == nullptr ? "/" : config->work_dir;
     syscall_config.trace = config->trace_syscalls;
     syscall_config.guest_is_32bit = guest_is_32bit;
+    syscall_config.guest_base = guest_is_32bit ? session->guest_base : 0;
     session->guest_is_32bit = guest_is_32bit;
+    process->is_32bit = guest_is_32bit;
+    process->guest_base = syscall_config.guest_base;
 
     process->control = std::make_unique<DeferredThreadControl>();
     process->syscalls = std::make_unique<fathom::LinuxSyscalls>(*session->space, *process->control,
@@ -1173,15 +1238,17 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     options.disassemble = false;
     options.disable_avx = config->disable_avx;
     options.guest_is_32bit = guest_is_32bit;
-    options.guest_memory_base = session->space->GuestBase();
+    // Kept so a second context can be made later on the same terms: a 32-bit program can
+    // start a 64-bit one, and each needs a JIT told which it is.
+    session->engine_options = options;
 
-    session->engine = fathom::FexEngine::Create(*session->space, options, reason);
-    if (session->engine == nullptr) {
+    auto* engine = session->EngineFor(guest_is_32bit, reason);
+    if (engine == nullptr) {
         return fail(reason);
     }
 
-    process->thread = session->engine->StartThread(process->program.entry, process->program.stack.rsp,
-                                                   *process->syscalls, reason);
+    process->thread = engine->StartThread(process->program.entry, process->program.stack.rsp,
+                                          *process->syscalls, reason);
     if (process->thread == nullptr) {
         return fail(reason);
     }
@@ -1302,7 +1369,7 @@ void fathom_session_get_status(fathom_session* session, fathom_session_status* o
 
     out_status->state = static_cast<fathom_session_state>(session->state.load());
     out_status->exit_code = session->exit_code.load();
-    if (session->engine != nullptr) {
+    if (session->engine32 != nullptr || session->engine64 != nullptr) {
         auto* init = const_cast<fathom_session*>(session)->Find(1);
         out_status->rip = init == nullptr ? 0 : init->thread->Rip();
         out_status->rsp = init == nullptr ? 0 : init->thread->Rsp();
@@ -1340,7 +1407,8 @@ void fathom_session_destroy(fathom_session* session) {
     }
     session->processes.clear();
     session->syscalls = nullptr;
-    session->engine.reset();
+    session->engine32.reset();
+    session->engine64.reset();
     session->space.reset();
     delete session;
 }

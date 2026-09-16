@@ -62,8 +62,11 @@ struct LoadedImage {
 
 /// Maps every PT_LOAD of `path` into `space`.
 /// `preferred_base` is only a hint, and only consulted for ET_DYN images.
+/// `guest_base` is where this process's address space starts in the host's: zero for a
+/// 64-bit image, which is mapped one to one, and the arena's base for a 32-bit one. It is
+/// passed in rather than read from the space because one session can run both.
 bool LoadElf(const std::string& path, GuestAddressSpace& space, uint64_t preferred_base,
-             LoadedImage* out_image, std::string& error);
+             uint64_t guest_base, LoadedImage* out_image, std::string& error);
 
 struct StackImage {
     uint64_t stack_base {};  ///< Lowest address of the stack allocation.
@@ -77,7 +80,7 @@ struct StackImage {
 /// The auxv is not optional decoration -- a C runtime reads AT_RANDOM to seed its stack
 /// guard and AT_PHDR/AT_PHNUM to find its own program headers, and crashes very early
 /// and very confusingly without them.
-bool BuildInitialStack(GuestAddressSpace& space, const LoadedImage& image,
+bool BuildInitialStack(GuestAddressSpace& space, uint64_t guest_base, const LoadedImage& image,
                        const std::vector<std::string>& argv, const std::vector<std::string>& envp,
                        const std::string& exec_path, uint64_t interpreter_base, uint64_t stack_size,
                        StackImage* out_stack, std::string& error);

@@ -95,6 +95,13 @@ struct SyscallConfig {
     bool trace {};
     /// True when the guest is an i386 binary, whose syscalls are numbered differently.
     bool guest_is_32bit {};
+    /// Where this process's address space starts in the host's. Zero for a 64-bit guest,
+    /// which is mapped one to one; the arena's base for a 32-bit one, whose pointers are
+    /// only 32 bits wide and cannot reach where the arena actually lives. It is a
+    /// property of the process rather than of the address space, because a 32-bit program
+    /// can start a 64-bit one -- Steam's client is i386 and the process that draws its
+    /// interface is x86-64.
+    uint64_t guest_base {};
 };
 
 class LinuxSyscalls {
@@ -134,6 +141,13 @@ public:
 
     /// Points the process at a new program image after an execve.
     void AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const std::string& path);
+
+    /// An exec can change the process's word size -- a 32-bit program can exec a 64-bit
+    /// one -- and with it where its address space sits in the host's.
+    void AdoptWordSize(bool is_32bit, uint64_t base) {
+        config_.guest_is_32bit = is_32bit;
+        config_.guest_base = base;
+    }
 
     /// The guest path of the program this process is running. Reported through
     /// /proc/self/exe, which a program uses to find and re-run its own binary.
@@ -287,6 +301,10 @@ private:
     bool ReadGuestString(uint64_t address, std::string* out, size_t limit = 4096) const;
     bool ReadGuestStringArray(uint64_t address, std::vector<std::string>* out) const;
     void* GuestPointer(uint64_t address, uint64_t size, bool writable) const;
+
+    /// This process's view of the address space. Identity for a 64-bit guest.
+    uint64_t ToHost(uint64_t guest_address) const { return guest_address + config_.guest_base; }
+    uint64_t ToGuest(uint64_t host_address) const { return host_address - config_.guest_base; }
 
     /// The switch itself. Split out from Handle so tracing can wrap it and log what
     /// each call actually returned.

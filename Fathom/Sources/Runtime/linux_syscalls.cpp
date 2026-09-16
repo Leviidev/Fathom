@@ -736,6 +736,9 @@ void* LinuxSyscalls::GuestPointer(uint64_t address, uint64_t size, bool writable
     if (address == 0 || size == 0) {
         return nullptr;
     }
+    // The guest's number, not the host's. Identical for a 64-bit guest; for a 32-bit one
+    // the arena lives high in the host's address space and this is where that is undone.
+    address = space_.ToHost(address);
     const int required = kGuestProtRead | (writable ? kGuestProtWrite : 0);
     if (!space_.Validate(address, size, required)) {
         return nullptr;

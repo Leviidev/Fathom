@@ -26,8 +26,14 @@ PACKAGES="${PACKAGES:-xz-utils python3 ca-certificates file}"
 
 echo "==> building an image from $IMAGE with: $PACKAGES"
 docker rm -f fathom-debian-build fathom-debian-export >/dev/null 2>&1 || true
+# i386 as well as amd64: Steam's client is a 32-bit binary and asks for
+# /lib/ld-linux.so.2 and the rest of the 32-bit glibc, none of which an amd64-only
+# installation carries.
+I386_PACKAGES="${I386_PACKAGES:-libc6:i386 libstdc++6:i386}"
 docker run --platform linux/amd64 --name fathom-debian-build "$IMAGE" \
-    sh -c "apt-get update -qq && apt-get install -y --no-install-recommends $PACKAGES" >/dev/null
+    sh -c "apt-get update -qq && apt-get install -y --no-install-recommends $PACKAGES \
+           && dpkg --add-architecture i386 && apt-get update -qq \
+           && apt-get install -y --no-install-recommends $I386_PACKAGES" >/dev/null
 docker commit fathom-debian-build fathom-debian:latest >/dev/null
 docker rm -f fathom-debian-build >/dev/null 2>&1 || true
 

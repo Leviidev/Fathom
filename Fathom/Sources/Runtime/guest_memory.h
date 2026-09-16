@@ -57,6 +57,20 @@ public:
     uint64_t Size() const { return size_; }
     uint64_t HostPageSize() const { return page_size_; }
 
+    /// Where the guest believes this arena starts.
+    ///
+    /// A 64-bit guest is mapped 1:1 and this is zero, so a guest address and a host
+    /// address are the same number. A 32-bit guest cannot be: its pointers are 32 bits and
+    /// the low 4GB of this process cannot be mapped, so the arena sits high in the host's
+    /// address space while the guest sees it starting at zero. Everything crossing that
+    /// boundary -- a pointer handed to a syscall, an address written into the auxiliary
+    /// vector -- has to be converted.
+    void SetGuestBase(uint64_t base) { guest_base_ = base; }
+    uint64_t GuestBase() const { return guest_base_; }
+
+    uint64_t ToHost(uint64_t guest_address) const { return guest_address + guest_base_; }
+    uint64_t ToGuest(uint64_t host_address) const { return host_address - guest_base_; }
+
     /// Reserves and commits `size` bytes, honouring `hint` when it is inside the arena
     /// and free. Returns 0 when the arena cannot satisfy it.
     uint64_t Allocate(uint64_t size, uint64_t hint, int protection);
@@ -119,6 +133,7 @@ private:
     uint64_t size_ {};
     uint64_t page_size_ {};
     std::vector<Extent> free_;        ///< Sorted, coalesced, never overlapping.
+    uint64_t guest_base_ {};            ///< 0 for a 1:1 (64-bit) guest.
     std::vector<GuestRange> committed_; ///< Sorted by begin.
     std::vector<Extent> external_;    ///< Mappings outside the arena, unmapped on destruction.
 };

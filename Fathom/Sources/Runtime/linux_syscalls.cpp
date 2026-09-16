@@ -1,6 +1,7 @@
 #include "linux_syscalls.h"
 
 #include "guest_net.h"
+#include "guest_syscalls32.h"
 #include "guest_path.h"
 
 #include <poll.h>
@@ -1705,6 +1706,23 @@ uint64_t LinuxSyscalls::DoReadlinkAt(int dirfd, uint64_t path_address, uint64_t 
 
 uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3,
                                uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    // An i386 guest numbers its syscalls entirely differently -- its 4 is write, where
+    // x86-64's 4 is stat -- so the number is translated before anything looks at it, and
+    // one implementation of each syscall serves both.
+    if (config_.guest_is_32bit) {
+        if (number == kI386Mmap2) {
+            // The only argument difference that matters here: mmap2 counts its offset in
+            // 4096-byte pages so that a 32-bit register can address a large file.
+            arg6 *= 4096;
+        }
+        const int64_t translated = X86_64SyscallForI386(number);
+        if (translated < 0) {
+            FATHOM_WARN("unimplemented i386 syscall %llu", static_cast<unsigned long long>(number));
+            return FailLinux(38);
+        }
+        number = static_cast<uint64_t>(translated);
+    }
+
     console_.NoteSyscall();
 
     if (console_.StopRequested()) {

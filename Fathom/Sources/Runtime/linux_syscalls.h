@@ -75,6 +75,8 @@ struct SyscallConfig {
     std::string guest_root;  ///< Host directory presented to the guest as "/".
     std::string work_dir {"/"};
     bool trace {};
+    /// True when the guest is an i386 binary, whose syscalls are numbered differently.
+    bool guest_is_32bit {};
 };
 
 class LinuxSyscalls {

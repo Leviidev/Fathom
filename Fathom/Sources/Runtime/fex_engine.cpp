@@ -157,7 +157,7 @@ private:
 /// obvious failure.
 class GuestSegments {
 public:
-    void Initialise(FEXCore::Core::CPUState& state) {
+    void Initialise(FEXCore::Core::CPUState& state, bool guest_is_32bit = false) {
         state.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = gdt_.data();
         state.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = gdt_.data();
         state.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
@@ -165,8 +165,13 @@ public:
         FEXCore::Core::CPUState::SetGDTBase(code_segment, 0);
         FEXCore::Core::CPUState::SetGDTLimit(code_segment, 0xF'FFFFU);
         state.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(*code_segment);
-        code_segment->L = 1; // 64-bit code segment.
-        code_segment->D = 0;
+        // These two bits are how the guest's word size is actually decided. FEXCore's
+        // decoder reads the mode straight off this descriptor -- `Is64BitMode = CSSegment->L`
+        // -- and not from any configuration value, so leaving L set here makes a 32-bit
+        // program get decoded as x86-64 no matter what else has been configured. The
+        // symptom is an `int 0x80` refused as "32-bit syscall from a 64-bit process".
+        code_segment->L = guest_is_32bit ? 0 : 1;
+        code_segment->D = guest_is_32bit ? 1 : 0;
     }
 
 private:
@@ -301,11 +306,15 @@ size_t DescribeGuestState(char* buffer, size_t capacity) {
 
 class FathomSyscallHandler final : public FEXCore::HLE::SyscallHandler {
 public:
-    explicit FathomSyscallHandler(GuestAddressSpace& space)
+    FathomSyscallHandler(GuestAddressSpace& space, bool guest_is_32bit)
         : space_ {space} {
-        // OS_LINUX64 tells the JIT the guest's syscall ABI, so it hands the arguments
-        // over in registers rather than spilling the entire CPU state on every call.
-        OSABI = FEXCore::HLE::SyscallOSABI::OS_LINUX64;
+        // Which ABI the JIT hands syscall arguments over in, so it passes them in
+        // registers rather than spilling the whole CPU state on every call. It also
+        // decides whether `int 0x80` is legal: with OS_LINUX64 declared, a 32-bit guest's
+        // first syscall is refused with "trying to execute 32-bit syscall from a 64-bit
+        // process" and the guest goes no further.
+        OSABI = guest_is_32bit ? FEXCore::HLE::SyscallOSABI::OS_LINUX32
+                               : FEXCore::HLE::SyscallOSABI::OS_LINUX64;
     }
 
     uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* frame, FEXCore::HLE::SyscallArguments* args) override {
@@ -368,6 +377,7 @@ public:
 
     FEXCore::HostFeatures host_features {};
     fextl::unique_ptr<FEXCore::Context::Context> context;
+    bool guest_is_32bit {};
     std::unique_ptr<FathomSignalDelegator> signals;
     std::unique_ptr<FathomSyscallHandler> handler;
     bool config_held {};
@@ -379,9 +389,10 @@ public:
 
 class GuestThread::Impl {
 public:
-    Impl(FEXCore::Context::Context* context, LinuxSyscalls& syscalls)
+    Impl(FEXCore::Context::Context* context, LinuxSyscalls& syscalls, bool guest_is_32bit)
         : context {context}
-        , syscalls {syscalls} {}
+        , syscalls {syscalls}
+        , guest_is_32bit {guest_is_32bit} {}
 
     ~Impl() {
         if (context != nullptr && thread != nullptr) {
@@ -392,6 +403,7 @@ public:
 
     FEXCore::Context::Context* context {};
     LinuxSyscalls& syscalls;
+    bool guest_is_32bit {};
 
     // Per thread, all of it. The call/return stack and the segment table are pointed at
     // from the register file, so a forked child needs its own rather than the copies it
@@ -469,7 +481,7 @@ void GuestThread::ResetTo(uint64_t rip, uint64_t rsp) {
     // is what "a fresh set of registers" actually means here.
     auto& state = impl_->thread->CurrentFrame->State;
     std::memset(&state, 0, sizeof(state));
-    impl_->segments.Initialise(state);
+    impl_->segments.Initialise(state, impl_->guest_is_32bit);
     impl_->callret->Attach(impl_->thread);
     state.rip = rip;
     state.gregs[FEXCore::X86State::REG_RSP] = rsp;
@@ -566,7 +578,8 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
     }
 
     impl->signals = std::make_unique<FathomSignalDelegator>();
-    impl->handler = std::make_unique<FathomSyscallHandler>(space);
+    impl->guest_is_32bit = options.guest_is_32bit;
+    impl->handler = std::make_unique<FathomSyscallHandler>(space, options.guest_is_32bit);
     impl->context->SetSignalDelegator(impl->signals.get());
     impl->context->SetSyscallHandler(impl->handler.get());
 
@@ -592,7 +605,7 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
 
 std::unique_ptr<GuestThread> FexEngine::StartThread(uint64_t rip, uint64_t rsp, LinuxSyscalls& syscalls,
                                                     std::string& error) {
-    auto impl = std::make_unique<GuestThread::Impl>(impl_->context.get(), syscalls);
+    auto impl = std::make_unique<GuestThread::Impl>(impl_->context.get(), syscalls, impl_->guest_is_32bit);
 
     impl->callret = std::make_unique<CallRetStack>();
     if (!impl->callret->valid()) {
@@ -608,7 +621,7 @@ std::unique_ptr<GuestThread> FexEngine::StartThread(uint64_t rip, uint64_t rsp, 
     }
 
     auto& state = impl->thread->CurrentFrame->State;
-    impl->segments.Initialise(state);
+    impl->segments.Initialise(state, impl->guest_is_32bit);
     impl->callret->Attach(impl->thread);
     state.rip = rip;
     state.gregs[FEXCore::X86State::REG_RSP] = rsp;
@@ -631,7 +644,7 @@ std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, Li
                                                    std::string& error) {
     const auto& parent_state = parent.impl_->thread->CurrentFrame->State;
 
-    auto impl = std::make_unique<GuestThread::Impl>(impl_->context.get(), syscalls);
+    auto impl = std::make_unique<GuestThread::Impl>(impl_->context.get(), syscalls, impl_->guest_is_32bit);
     impl->callret = std::make_unique<CallRetStack>();
     if (!impl->callret->valid()) {
         error = std::string {"could not reserve the child's call/return stack: "} +
@@ -671,7 +684,7 @@ std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, Li
     // The call/return stack and the segment table are reached through the register file,
     // and the child must not share its parent's.
     auto& state = impl->thread->CurrentFrame->State;
-    impl->segments.Initialise(state);
+    impl->segments.Initialise(state, impl->guest_is_32bit);
     impl->callret->Attach(impl->thread);
 
     FATHOM_INFO("forked guest thread: rip=%#llx rsp=%#llx",

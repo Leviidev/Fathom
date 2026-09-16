@@ -839,6 +839,7 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     syscall_config.guest_root = session->guest_root;
     syscall_config.work_dir = config->work_dir == nullptr ? "/" : config->work_dir;
     syscall_config.trace = config->trace_syscalls;
+    syscall_config.guest_is_32bit = guest_is_32bit;
 
     process->control = std::make_unique<DeferredThreadControl>();
     process->syscalls = std::make_unique<fathom::LinuxSyscalls>(*session->space, *process->control,

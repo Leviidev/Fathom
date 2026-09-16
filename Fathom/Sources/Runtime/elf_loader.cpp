@@ -383,6 +383,16 @@ bool LoadElf(const std::string& path, GuestAddressSpace& space, uint64_t preferr
             return false;
         }
         load_base = placed - image_begin;
+    } else if (space.GuestBase() != 0) {
+        // ET_EXEC inside a relocated guest, which is the ordinary case for i386: the file
+        // insists on 0x08048000 or similar, and that address is perfectly available --
+        // inside the arena, where the guest's address space starts at zero. No host
+        // mapping at a fixed low address is needed, or possible.
+        if (!space.CommitFixed(space.ToHost(image_begin), span, kGuestProtRead | kGuestProtWrite)) {
+            error = "guest address space could not hold the program at its fixed address";
+            return false;
+        }
+        load_base = space.ToHost(0);
     } else {
         // ET_EXEC: the addresses in the file are the addresses it must run at.
         void* fixed = mmap(reinterpret_cast<void*>(image_begin), span, PROT_READ | PROT_WRITE,

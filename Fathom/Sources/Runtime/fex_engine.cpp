@@ -276,6 +276,10 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
 /// context to go on.
 thread_local GuestThread* g_current_guest_thread = nullptr;
 
+/// The guest's arena, so that a signal handler can tell a guest address from any other.
+std::atomic<uint64_t> g_arena_begin {0};
+std::atomic<uint64_t> g_arena_end {0};
+
 /// Ends the guest process whose code just faulted, instead of the whole session.
 ///
 /// A fault in guest code is the guest's own bug, and on Linux it kills that process and
@@ -291,7 +295,6 @@ thread_local GuestThread* g_current_guest_thread = nullptr;
 /// continue.
 bool EndFaultedGuestThread(int signal, siginfo_t* info, void* raw_context) {
 #if defined(__aarch64__) && defined(__APPLE__)
-    (void)info;
     if (raw_context == nullptr || g_current_guest_thread == nullptr) {
         return false;
     }
@@ -301,7 +304,17 @@ bool EndFaultedGuestThread(int signal, siginfo_t* info, void* raw_context) {
     auto* context = static_cast<ucontext_t*>(raw_context);
     const auto pc = static_cast<uintptr_t>(arm_thread_state64_get_pc(context->uc_mcontext->__ss));
     if (!g_active.context->IsAddressInCodeBuffer(g_active.thread, pc)) {
-        return false;
+        // Not in generated code -- but a guest that jumps to an address with nothing at it
+        // faults inside FEXCore's instruction decoder rather than in the code it was
+        // about to run, because the decoder is what reads guest memory first. The address
+        // being inside the guest's own arena is what says this is still the guest's fault
+        // and not ours.
+        const auto address = info == nullptr ? 0 : reinterpret_cast<uint64_t>(info->si_addr);
+        const uint64_t begin = g_arena_begin.load(std::memory_order_acquire);
+        const uint64_t end = g_arena_end.load(std::memory_order_acquire);
+        if (begin == 0 || address < begin || address >= end) {
+            return false;
+        }
     }
     return g_current_guest_thread->EndOnFault(signal);
 #else
@@ -662,6 +675,8 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
     }
 
     // Told before any code is compiled, because it changes every address the JIT emits.
+    g_arena_begin.store(space.Base(), std::memory_order_release);
+    g_arena_end.store(space.Base() + space.Size(), std::memory_order_release);
     impl->context->SetGuestMemoryBase(options.guest_memory_base);
     if (options.guest_memory_base != 0) {
         FATHOM_INFO("32-bit guest: its address space is placed at %#llx in this process",

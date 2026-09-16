@@ -315,6 +315,9 @@ struct GuestProcess {
         std::unique_ptr<fathom::GuestThread> thread;
         pthread_t host_thread {};
         bool started {};
+        /// The top of the stack clone was given, so that a fork made from this thread
+        /// knows which stack the child is about to run on.
+        uint64_t stack_top {};
         /// Set when the thread's run loop returns. Read without the process lock, which
         /// is why it is atomic: fork asks whether this process still has other threads
         /// running, and the answer changes underneath it.
@@ -650,6 +653,7 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
 
         auto record = std::make_unique<GuestProcess::GuestThreadRecord>();
         record->tid = tid;
+        record->stack_top = stack;
         record->control = std::make_unique<DeferredThreadControl>();
 
         fathom::SyscallConfig thread_config;
@@ -853,9 +857,28 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         // guest register -- and for a relocated 32-bit guest the two are nowhere near
         // each other. Copying from a guest address here reads unmapped memory.
         uint64_t held = 0;
-        const uint64_t stack_low = parent->program.stack.stack_base;
-        const uint64_t stack_top = stack_low + parent->program.stack.stack_size;
-        const uint64_t rsp = parent->thread->Rsp() + parent->guest_base;
+        // Whose stack, and how far down it: the calling thread's, which in a process with
+        // more than one is usually not the first. Taking the main thread's bounds here
+        // held a region the child never touches and left the frames it does touch -- the
+        // ones the calling thread is parked in, waiting for the exec -- to be overwritten
+        // and never put back. The thread woke up in frames the child had rewritten, with
+        // whatever the child left in them for a stack pointer and a return address.
+        uint64_t stack_low = parent->program.stack.stack_base;
+        uint64_t stack_top = stack_low + parent->program.stack.stack_size;
+        for (const auto& thread : parent->threads) {
+            if (thread->thread.get() == caller && thread->stack_top != 0) {
+                stack_top = thread->stack_top + parent->guest_base;
+                // A cloned thread's stack is the guest's own allocation and its extent is
+                // not reported to us, so the low bound is the calling thread's stack
+                // pointer itself: everything live is above it.
+                stack_low = 0;
+                break;
+            }
+        }
+        const uint64_t rsp = caller->Rsp() + parent->guest_base;
+        if (stack_low == 0) {
+            stack_low = rsp;
+        }
         const uint64_t heap_low =
             parent->program.heap == 0 ? 0 : parent->program.heap + parent->guest_base;
         const uint64_t heap_used = parent->syscalls->HeapBreak() == 0

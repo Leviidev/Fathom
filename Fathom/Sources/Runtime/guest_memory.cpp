@@ -213,14 +213,6 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
         return false;
     }
 
-    // Drop the physical pages but keep the reservation: the arena has to stay one
-    // contiguous mapping, so this is mprotect+madvise rather than munmap.
-    if (mprotect(reinterpret_cast<void*>(begin), end - begin, PROT_NONE) != 0) {
-        FATHOM_WARN("release protect at %#llx failed: %s", static_cast<unsigned long long>(begin),
-                    std::strerror(errno));
-    }
-    madvise(reinterpret_cast<void*>(begin), end - begin, MADV_FREE);
-
     std::vector<GuestRange> survivors;
     survivors.reserve(committed_.size());
     for (const auto& range : committed_) {
@@ -235,7 +227,32 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
             survivors.push_back(GuestRange {end, range.end() - end, range.protection});
         }
     }
-    committed_ = std::move(survivors);
+    // Only the host pages nothing else is still living in.
+    //
+    // The guest's pages are 4KB and the host's are 16KB, so one host page can hold four
+    // guest mappings. Protecting the whole rounded span takes a neighbour's memory with
+    // it, and the neighbour finds out by faulting on an ordinary store -- a thread stack
+    // sharing its last host page with something being freed dies sixteen bytes below its
+    // own stack pointer. So each host page in the span is protected only if nothing that
+    // survived this release still overlaps it.
+    for (uint64_t page = begin; page < end; page += page_size_) {
+        bool occupied = false;
+        for (const auto& range : committed_) {
+            if (range.begin < page + page_size_ && range.end() > page) {
+                occupied = true;
+                break;
+            }
+        }
+        if (occupied) {
+            continue;
+        }
+        if (mprotect(reinterpret_cast<void*>(page), page_size_, PROT_NONE) != 0) {
+            FATHOM_WARN("release protect at %#llx failed: %s",
+                        static_cast<unsigned long long>(page), std::strerror(errno));
+        }
+        madvise(reinterpret_cast<void*>(page), page_size_, MADV_FREE);
+    }
+
     ReturnFreeExtent(begin, end - begin);
     return true;
 }

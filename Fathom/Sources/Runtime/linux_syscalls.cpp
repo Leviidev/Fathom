@@ -1519,6 +1519,7 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
     const size_t name_length_offset = width;
     const size_t iov_offset = narrow ? 8 : 16;
     const size_t iov_count_offset = narrow ? 12 : 24;
+    const size_t control_offset = narrow ? 16 : 32;
     const size_t control_length_offset = narrow ? 20 : 40;
     const size_t flags_offset = narrow ? 24 : 48;
     const uint64_t header_size = narrow ? 28 : 56;
@@ -1532,11 +1533,13 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
     uint32_t name_length = 0;
     uint64_t iov_address = 0;
     uint64_t iov_count = 0;
+    uint64_t control_address = 0;
     uint64_t control_length = 0;
     std::memcpy(&name_address, header + name_offset, width);
     std::memcpy(&name_length, header + name_length_offset, 4);
     std::memcpy(&iov_address, header + iov_offset, width);
     std::memcpy(&iov_count, header + iov_count_offset, width);
+    std::memcpy(&control_address, header + control_offset, width);
     std::memcpy(&control_length, header + control_length_offset, width);
 
     if (iov_count > 1024) {
@@ -1557,18 +1560,66 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
         }
         vectors.push_back({data, static_cast<size_t>(length)});
     }
-    if (control_length != 0) {
-        // Ancillary data is laid out differently again, and nothing Fathom runs yet passes
-        // any. Dropping it is better than misreading it.
-        FATHOM_WARN("%s with %llu bytes of control data, which is being ignored",
-                    sending ? "sendmsg" : "recvmsg",
-                    static_cast<unsigned long long>(control_length));
-    }
-
     sockaddr_storage address {};
     msghdr host_header {};
     host_header.msg_iov = vectors.empty() ? nullptr : vectors.data();
     host_header.msg_iovlen = static_cast<int>(vectors.size());
+
+    // Ancillary data. The only kind that carries meaning across is SCM_RIGHTS -- an array
+    // of open file descriptors sent over a unix socket -- and it has to be translated in
+    // both directions, because a descriptor number belongs to the process holding it.
+    // Steam's client and its web helper pass descriptors to each other constantly; with
+    // them dropped, the receiver gets a message referring to a descriptor it never got.
+    //
+    // struct cmsghdr is a length, a level and a type: twelve bytes on i386 where the
+    // length is a 32-bit size_t, sixteen here. Darwin numbers SOL_SOCKET 0xFFFF where
+    // Linux numbers it 1.
+    constexpr uint32_t kGuestSolSocket = 1;
+    constexpr uint32_t kScmRights = 1;
+    const size_t guest_cmsg_header = narrow ? 12 : 16;
+    std::vector<unsigned char> host_control;
+
+    if (sending && control_address != 0 && control_length >= guest_cmsg_header) {
+        const auto* control = static_cast<const unsigned char*>(
+            GuestPointer(control_address, control_length, false));
+        if (control == nullptr) {
+            return FailLinux(14);
+        }
+        std::vector<int> host_fds;
+        uint64_t at = 0;
+        while (at + guest_cmsg_header <= control_length) {
+            uint64_t length = 0;
+            uint32_t level = 0;
+            uint32_t type = 0;
+            std::memcpy(&length, control + at, width);
+            std::memcpy(&level, control + at + width, 4);
+            std::memcpy(&type, control + at + width + 4, 4);
+            if (length < guest_cmsg_header || at + length > control_length) {
+                break;
+            }
+            if (level == kGuestSolSocket && type == kScmRights) {
+                const uint64_t count = (length - guest_cmsg_header) / sizeof(int32_t);
+                for (uint64_t index = 0; index < count; ++index) {
+                    int32_t guest_fd = 0;
+                    std::memcpy(&guest_fd, control + at + guest_cmsg_header + index * 4, 4);
+                    const int translated = HostFdFor(guest_fd);
+                    if (translated >= 0) {
+                        host_fds.push_back(translated);
+                    }
+                }
+            }
+            // Each entry is padded out to the architecture's word size.
+            at += (length + width - 1) & ~(width - 1);
+        }
+        if (!host_fds.empty()) {
+            host_control.resize(CMSG_SPACE(host_fds.size() * sizeof(int)));
+            auto* cmsg = reinterpret_cast<cmsghdr*>(host_control.data());
+            cmsg->cmsg_len = CMSG_LEN(host_fds.size() * sizeof(int));
+            cmsg->cmsg_level = SOL_SOCKET;
+            cmsg->cmsg_type = SCM_RIGHTS;
+            std::memcpy(CMSG_DATA(cmsg), host_fds.data(), host_fds.size() * sizeof(int));
+        }
+    }
 
     if (sending) {
         if (name_address != 0 && name_length != 0) {
@@ -1581,6 +1632,10 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
                 }
             }
         }
+        if (!host_control.empty()) {
+            host_header.msg_control = host_control.data();
+            host_header.msg_controllen = static_cast<socklen_t>(host_control.size());
+        }
         const ssize_t sent = sendmsg(host_fd, &host_header, HostMessageFlags(flags));
         return sent < 0 ? Fail(errno) : static_cast<uint64_t>(sent);
     }
@@ -1589,10 +1644,52 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
         host_header.msg_name = &address;
         host_header.msg_namelen = sizeof(address);
     }
+    // Room for whatever descriptors arrive; the guest's own buffer is a different shape
+    // and gets written afterwards.
+    std::vector<unsigned char> received_control;
+    if (control_address != 0 && control_length >= guest_cmsg_header) {
+        received_control.resize(CMSG_SPACE(sizeof(int) * 64));
+        host_header.msg_control = received_control.data();
+        host_header.msg_controllen = static_cast<socklen_t>(received_control.size());
+    }
     const ssize_t received = recvmsg(host_fd, &host_header, HostMessageFlags(flags));
     if (received < 0) {
         return Fail(errno);
     }
+
+    uint64_t control_written = 0;
+    if (!received_control.empty() && host_header.msg_controllen > 0) {
+        std::vector<int32_t> guest_fds;
+        for (cmsghdr* cmsg = CMSG_FIRSTHDR(&host_header); cmsg != nullptr;
+             cmsg = CMSG_NXTHDR(&host_header, cmsg)) {
+            if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+                continue;
+            }
+            const size_t count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            const int* arriving = reinterpret_cast<const int*>(CMSG_DATA(cmsg));
+            std::scoped_lock lock {shared_->mutex};
+            for (size_t index = 0; index < count; ++index) {
+                guest_fds.push_back(static_cast<int32_t>(RegisterFile(arriving[index], "socket:[fd]")));
+            }
+        }
+        if (!guest_fds.empty()) {
+            const uint64_t needed = guest_cmsg_header + guest_fds.size() * sizeof(int32_t);
+            auto* out_control = static_cast<unsigned char*>(
+                GuestPointer(control_address, std::min(needed, control_length), true));
+            if (out_control != nullptr && needed <= control_length) {
+                const uint64_t length = needed;
+                const uint32_t level = kGuestSolSocket;
+                const uint32_t type = kScmRights;
+                std::memcpy(out_control, &length, width);
+                std::memcpy(out_control + width, &level, 4);
+                std::memcpy(out_control + width + 4, &type, 4);
+                std::memcpy(out_control + guest_cmsg_header, guest_fds.data(),
+                            guest_fds.size() * sizeof(int32_t));
+                control_written = needed;
+            }
+        }
+    }
+    std::memcpy(header + control_length_offset, &control_written, width);
     if (host_header.msg_name != nullptr && host_header.msg_namelen != 0) {
         void* guest_name = GuestPointer(name_address, name_length, true);
         if (guest_name != nullptr) {

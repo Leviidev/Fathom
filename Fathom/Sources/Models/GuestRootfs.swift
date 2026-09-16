@@ -25,6 +25,14 @@ enum GuestRootfs {
         (try? String(contentsOf: stampURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) == version
     }
 
+    /// Whether this root filesystem has Steam in it. Steam is not part of the root
+    /// filesystem itself -- it is installed into it -- so the launcher's presence is what
+    /// says whether there is anything to show.
+    static var hasSteam: Bool {
+        FileManager.default.isReadableFile(
+            atPath: ProgramLibrary.guestRootDirectory.appendingPathComponent("usr/local/bin/fathom-steam").path)
+    }
+
     /// Unpacks the bundled root filesystem unless the installed one is already current.
     /// Cheap to call on every launch; it does nothing once the stamp matches.
     static func installIfNeeded() throws {

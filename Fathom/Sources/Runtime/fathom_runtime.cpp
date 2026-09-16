@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -1169,6 +1170,13 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     if (config == nullptr || config->program_path == nullptr) {
         return fail("no program was given");
     }
+
+    // A guest process writing to a pipe whose reader has gone is ordinary -- Steam does
+    // it every time a helper exits -- and on Linux the signal goes to that process alone.
+    // Here every guest process is a thread of this one, so the default action would take
+    // the whole session down with it. Ignored, the write returns EPIPE, which is what the
+    // guest's own libc is expecting to see.
+    signal(SIGPIPE, SIG_IGN);
 
     auto session = std::make_unique<fathom_session>();
     session->program_path = config->program_path;

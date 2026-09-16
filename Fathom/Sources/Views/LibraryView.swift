@@ -32,6 +32,13 @@ struct LibraryView: View {
                     } label: {
                         Label("Linux Shell", systemImage: "terminal")
                     }
+                    if GuestRootfs.hasSteam {
+                        NavigationLink {
+                            SteamView()
+                        } label: {
+                            Label("Steam", systemImage: "gamecontroller")
+                        }
+                    }
                 } header: {
                     Text("Linux")
                 } footer: {

@@ -37,6 +37,13 @@ final class EmulatorSession: ObservableObject {
     /// True once the guest is drawing a screen or asking for individual keypresses.
     @Published private(set) var isInteractive = false
 
+    /// The guest's graphical screen, for a session that runs an X server. Empty and
+    /// detached unless the run was started with `runGraphical`.
+    let display = GuestDisplay()
+    /// Pointer and keyboard events on their way back to that X server.
+    let input = GuestInput()
+    private var inputTimer: Timer?
+
     /// Watchdog state. A guest that stops making syscalls has either wedged in a loop or
     /// died, and those two look identical from outside -- the log simply stops. Sampling
     /// RIP while nothing else is happening tells them apart, and an RIP that never moves
@@ -95,6 +102,40 @@ final class EmulatorSession: ObservableObject {
         launch(hostPath: hostPath, argv: [guestPath] + arguments, name: guestPath,
                settings: settings) { [weak self] exitCode in
             self?.finish(exitCode: exitCode, program: nil, library: nil)
+        }
+    }
+
+    /// Runs something in the guest that draws with X rather than printing.
+    ///
+    /// The picture and the input both go through the guest root: the X server writes its
+    /// framebuffer to a file there and listens on a socket there, and both are ordinary
+    /// host files as far as this process is concerned. So there is nothing to connect
+    /// until the server inside the guest has started, and both sides simply keep trying.
+    func runGraphical(path guestPath: String, arguments: [String] = [],
+                      settings: EmulatorSettings) {
+        let root = ProgramLibrary.guestRootDirectory
+        display.attach(path: root.appendingPathComponent("tmp/fb/Xvfb_screen0").path)
+        startConnectingInput(socketPath: root.appendingPathComponent("tmp/.X11-unix/X0").path)
+        runInGuest(path: guestPath, arguments: arguments, settings: settings)
+    }
+
+    private func startConnectingInput(socketPath: String) {
+        inputTimer?.invalidate()
+        inputTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                guard self.state.isActive else {
+                    timer.invalidate()
+                    return
+                }
+                if self.input.connect(socketPath: socketPath) {
+                    timer.invalidate()
+                    self.inputTimer = nil
+                }
+            }
+        }
+        if let inputTimer {
+            RunLoop.main.add(inputTimer, forMode: .common)
         }
     }
 
@@ -327,6 +368,10 @@ final class EmulatorSession: ObservableObject {
     private func finish(exitCode: Int, program: Program?, library: ProgramLibrary?) {
         statusTimer?.invalidate()
         statusTimer = nil
+        inputTimer?.invalidate()
+        inputTimer = nil
+        input.disconnect()
+        display.detach()
         tick()
         flushOutput()
 

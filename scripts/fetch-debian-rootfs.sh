@@ -22,8 +22,10 @@ fi
 
 # Steam's own Depends line names these. xz-utils matters most: Debian's tar shells out to
 # an external xz for a .tar.xz, and the Steam bootstrap is exactly that -- without it tar
-# reports "xz: Cannot exec" and the installation stops before it starts.
-PACKAGES="${PACKAGES:-xz-utils python3 ca-certificates file}"
+# reports "xz: Cannot exec" and the installation stops before it starts. zenity is the
+# other one that is not optional in practice: steam.sh pipes tar into it to show unpack
+# progress, and with nothing on the other end of that pipe the unpack reports failure.
+PACKAGES="${PACKAGES:-xz-utils python3 ca-certificates file zenity}"
 
 echo "==> building an image from $IMAGE with: $PACKAGES"
 docker rm -f fathom-debian-build fathom-debian-export >/dev/null 2>&1 || true

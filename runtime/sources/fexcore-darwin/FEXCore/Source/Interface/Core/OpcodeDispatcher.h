@@ -2566,6 +2566,47 @@ private:
     return _StoreMemPairAutoTSO(RegClass::FPR, Size, A, Value1, Value2, Align);
   }
 
+  /// Turns a guest address into the host address holding those bytes.
+  ///
+  /// Most memory operands reach the JIT through LoadEffectiveAddress or
+  /// AppendSegmentOffset, both of which relocate on the way. A handful of instructions
+  /// instead ask for the operand's *address* with LoadData = false -- the same request
+  /// LEA makes, which must stay a guest value -- and then dereference it themselves.
+  /// Those are the call sites this is for.
+  [[nodiscard]]
+  Ref RelocateForAccess(Ref GuestAddress) {
+    if (GuestMemoryBase == 0) {
+      return GuestAddress;
+    }
+    return _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, GuestAddress), _Constant(GuestMemoryBase));
+  }
+
+  /// Builds the read-modify-write stack handle the two-argument Pop works on.
+  ///
+  /// The Pop IR op dereferences this value and increments it in place, in one register,
+  /// so there is nowhere to add a base in between: for a relocated guest the handle has
+  /// to hold a *host* address from the start. StackHandleToGuest turns it back into
+  /// something that can be written to a guest register, and StackHandleOffset adjusts it
+  /// without truncating the base away.
+  Ref StackHandle(Ref GuestAddress) {
+    if (GuestMemoryBase != 0) {
+      GuestAddress = _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, GuestAddress), _Constant(GuestMemoryBase));
+    }
+    return _RMWHandle(GuestAddress);
+  }
+
+  Ref StackHandleToGuest(Ref Address) {
+    if (GuestMemoryBase != 0) {
+      return _Sub(IR::OpSize::i64Bit, Address, _Constant(GuestMemoryBase));
+    }
+    return Address;
+  }
+
+  template<typename T>
+  Ref StackHandleOffset(IR::OpSize GPRSize, Ref Address, T Offset) {
+    return Add(GuestMemoryBase != 0 ? IR::OpSize::i64Bit : GPRSize, Address, Offset);
+  }
+
   Ref Pop(IR::OpSize Size, Ref SP_RMW) {
     Ref Value = _AllocateGPR(false);
     _Pop(Size, SP_RMW, Value);

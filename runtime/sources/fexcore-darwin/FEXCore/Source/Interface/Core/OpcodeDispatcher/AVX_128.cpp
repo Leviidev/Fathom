@@ -356,7 +356,7 @@ void OpDispatchBuilder::AVX128_MOVVectorNT(OpcodeArgs) {
   if (Op->Dest.IsGPR()) {
     ///< MOVNTDQA load non-temporal comes from SSE4.1 and is extended by AVX/AVX2.
     RefPair Src {};
-    Ref SrcAddr = LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.LoadData = false});
+    Ref SrcAddr = RelocateForAccess(LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.LoadData = false}));
     Src.Low = _VLoadNonTemporal(OpSize::i128Bit, SrcAddr, 0);
 
     if (Is128Bit) {
@@ -367,7 +367,7 @@ void OpDispatchBuilder::AVX128_MOVVectorNT(OpcodeArgs) {
     AVX128_StoreResult_WithOpSize(Op, Op->Dest, Src);
   } else {
     auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, !Is128Bit, MemoryAccessType::STREAM);
-    Ref Dest = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false});
+    Ref Dest = RelocateForAccess(LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false}));
 
     if (Is128Bit) {
       // Single store non-temporal for 128-bit operations.
@@ -734,7 +734,7 @@ void OpDispatchBuilder::AVX128_MOVBetweenGPR_FPR(OpcodeArgs) {
       StoreResultGPR(Op, Op->Dest, Src.Low);
     } else {
       // Storing first element to memory.
-      Ref Dest = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false});
+      Ref Dest = RelocateForAccess(LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false}));
       _StoreMemFPR(OpSizeFromDst(Op), Dest, Src.Low, OpSize::i8Bit);
     }
   }

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "Interface/Core/Addressing.h"
 
+#include <FEXCore/Utils/LogManager.h>
+
 #include "Interface/IR/IREmitter.h"
 #include "FEXCore/Utils/MathUtils.h"
 #include "Interface/IR/IR.h"

@@ -47,7 +47,7 @@ void OpDispatchBuilder::MOVVectorNTOp(OpcodeArgs, bool IsAVX) {
 
   if (Op->Dest.IsGPR() && Size >= OpSize::i128Bit) {
     ///< MOVNTDQA load non-temporal comes from SSE4.1 and is extended by AVX/AVX2.
-    Ref SrcAddr = LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.LoadData = false});
+    Ref SrcAddr = RelocateForAccess(LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.LoadData = false}));
     auto Src = _VLoadNonTemporal(Size, SrcAddr, 0);
 
     if (IsAVX) {
@@ -72,7 +72,7 @@ void OpDispatchBuilder::MOVVectorNTOp(OpcodeArgs, bool IsAVX) {
       // MMX 64-bit comes from MOVNTQ
       StoreResultFPR(Op, Src, OpSize::i8Bit, MemoryAccessType::STREAM);
     } else {
-      Ref Dest = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false});
+      Ref Dest = RelocateForAccess(LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false}));
 
       // Single store non-temporal for larger operations.
       _VStoreNonTemporal(Size, Src, Dest, 0);
@@ -2869,7 +2869,7 @@ void OpDispatchBuilder::MOVBetweenGPR_FPR(OpcodeArgs, VectorOpType VectorType) {
       const auto DstSize = std::max(OpSize::i32Bit, OpSizeFromDst(Op));
 
       // Storing first element to memory.
-      Ref Dest = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false});
+      Ref Dest = RelocateForAccess(LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false}));
       _StoreMemFPR(DstSize, Dest, Src, OpSize::i8Bit);
     }
   }

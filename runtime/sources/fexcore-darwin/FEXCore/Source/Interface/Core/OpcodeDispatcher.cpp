@@ -150,34 +150,16 @@ void OpDispatchBuilder::NOPOp(OpcodeArgs) {}
 void OpDispatchBuilder::RETOp(OpcodeArgs) {
   const auto GPRSize = GetGPROpSize();
 
-  // A relocated guest takes the long way round: the read-modify-write form of Pop goes
-  // through the Pop IR op, whose JIT handler treats the stack pointer as a host address.
-  if (GuestMemoryBase != 0) {
-    Ref OldSP = LoadGPRRegister(X86State::REG_RSP);
-    Ref HostAddress = _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, OldSP), _Constant(GuestMemoryBase));
-    Ref ReturnAddress = _LoadMem(RegClass::GPR, GPRSize, HostAddress, Invalid(), IR::OpSize::i8Bit, MemOffsetType::SXTX, 1);
-
-    Ref NewSP = _Add(GPRSize, OldSP, _Constant(IR::OpSizeToSize(GPRSize)));
-    if (Op->OP == 0xC2) {
-      NewSP = Add(GPRSize, NewSP, LoadSourceGPR(Op, Op->Src[0], Op->Flags));
-    }
-    StoreGPRRegister(X86State::REG_RSP, NewSP);
-
-    ExitFunction(ReturnAddress, BranchHint::Return);
-    BlockSetRIP = true;
-    return;
-  }
-
-  Ref SP = _RMWHandle(LoadGPRRegister(X86State::REG_RSP));
+  Ref SP = StackHandle(LoadGPRRegister(X86State::REG_RSP));
   Ref NewRIP = Pop(GPRSize, SP);
 
   if (Op->OP == 0xC2) {
     auto Offset = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
-    SP = Add(GPRSize, SP, Offset);
+    SP = StackHandleOffset(GPRSize, SP, Offset);
   }
 
   // Store the new stack pointer
-  StoreGPRRegister(X86State::REG_RSP, SP);
+  StoreGPRRegister(X86State::REG_RSP, StackHandleToGuest(SP));
 
   // Store the new RIP
   ExitFunction(NewRIP, BranchHint::Return);
@@ -203,7 +185,7 @@ void OpDispatchBuilder::IRETOp(OpcodeArgs) {
 
   const auto GPRSize = GetGPROpSize();
 
-  Ref SP = _RMWHandle(LoadGPRRegister(X86State::REG_RSP));
+  Ref SP = StackHandle(LoadGPRRegister(X86State::REG_RSP));
 
   // RIP (64/32/16 bits)
   auto NewRIP = Pop(GPRSize, SP);
@@ -226,7 +208,7 @@ void OpDispatchBuilder::IRETOp(OpcodeArgs) {
     UpdatePrefixFromSegment(NewSegmentSS, FEXCore::X86Tables::DecodeFlags::FLAG_SS_PREFIX);
   } else {
     // Store the stack in 32-bit mode
-    StoreGPRRegister(X86State::REG_RSP, SP);
+    StoreGPRRegister(X86State::REG_RSP, StackHandleToGuest(SP));
   }
 
   ExitFunction(NewRIP);
@@ -460,13 +442,14 @@ void OpDispatchBuilder::POPAOp(OpcodeArgs) {
   // 32bit only
   const auto Size = OpSizeFromSrc(Op);
 
-  Ref SP = _RMWHandle(LoadGPRRegister(X86State::REG_RSP));
+  Ref SP = StackHandle(LoadGPRRegister(X86State::REG_RSP));
 
   StoreGPRRegister(X86State::REG_RDI, Pop(Size, SP), Size);
   StoreGPRRegister(X86State::REG_RSI, Pop(Size, SP), Size);
   StoreGPRRegister(X86State::REG_RBP, Pop(Size, SP), Size);
 
-  // Skip loading RSP because it'll be correct at the end
+  // Skip loading RSP because it'll be correct at the end. Not StackHandle: SP is already
+  // whichever space the handle above put it in, and a 64-bit add keeps it there.
   SP = _RMWHandle(Add(OpSize::i64Bit, SP, IR::OpSizeToSize(Size)));
 
   StoreGPRRegister(X86State::REG_RBX, Pop(Size, SP), Size);
@@ -475,7 +458,7 @@ void OpDispatchBuilder::POPAOp(OpcodeArgs) {
   StoreGPRRegister(X86State::REG_RAX, Pop(Size, SP), Size);
 
   // Store the new stack pointer
-  StoreGPRRegister(X86State::REG_RSP, SP);
+  StoreGPRRegister(X86State::REG_RSP, StackHandleToGuest(SP));
 }
 
 void OpDispatchBuilder::POPSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
@@ -516,11 +499,11 @@ void OpDispatchBuilder::LEAVEOp(OpcodeArgs) {
   const auto OperandSize = (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_OPERAND_SIZE) ? OpSize::i16Bit : GPRSize;
 
   // First we move RBP in to RSP and then behave effectively like a pop
-  auto SP = _RMWHandle(LoadGPRRegister(X86State::REG_RBP));
+  auto SP = StackHandle(LoadGPRRegister(X86State::REG_RBP));
   auto NewGPR = Pop(OperandSize, SP);
 
   // Store the new stack pointer
-  StoreGPRRegister(X86State::REG_RSP, SP, GPRSize);
+  StoreGPRRegister(X86State::REG_RSP, StackHandleToGuest(SP), GPRSize);
 
   // Store what we loaded to RBP
   StoreGPRRegister(X86State::REG_RBP, NewGPR, OperandSize);
@@ -1000,17 +983,17 @@ void OpDispatchBuilder::RETFARIndirectOp(OpcodeArgs) {
   const auto GPRSize = GetGPROpSize();
   const auto SrcSize = Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_REX_WIDENING ? OpSize::i64Bit : OpSize::i32Bit;
 
-  Ref SP = _RMWHandle(LoadGPRRegister(X86State::REG_RSP));
+  Ref SP = StackHandle(LoadGPRRegister(X86State::REG_RSP));
   Ref NewRIP = Pop(SrcSize, SP);
   Ref NewSegmentCS = Pop(SrcSize, SP);
 
   // Optional SP offset.
   if (Op->Src[0].IsLiteral()) {
-    SP = Add(GPRSize, SP, Op->Src[0].Literal());
+    SP = StackHandleOffset(GPRSize, SP, Op->Src[0].Literal());
   }
 
   // Store the new stack pointer
-  StoreGPRRegister(X86State::REG_RSP, SP);
+  StoreGPRRegister(X86State::REG_RSP, StackHandleToGuest(SP));
 
   _StoreContextGPR(OpSize::i16Bit, NewSegmentCS, offsetof(FEXCore::Core::CPUState, cs_idx));
   UpdatePrefixFromSegment(NewSegmentCS, FEXCore::X86Tables::DecodeFlags::FLAG_CS_PREFIX);
@@ -3008,13 +2991,11 @@ void OpDispatchBuilder::EnterOp(OpcodeArgs) {
   const uint16_t AllocSpace = Value & 0xFFFF;
   const uint8_t Level = (Value >> 16) & 0x1F;
 
+  // Push already lowers itself for a relocated guest, and reading the stack pointer back
+  // out is how that lowering reports where it left it.
   const auto PushValue = [&](IR::OpSize Size, Ref Src) -> Ref {
-    auto OldSP = LoadGPRRegister(X86State::REG_RSP);
-    auto NewSP = _Push(GPRSize, Size, Src, OldSP);
-
-    // Store the new stack pointer
-    StoreGPRRegister(X86State::REG_RSP, NewSP);
-    return NewSP;
+    Push(Size, Src);
+    return LoadGPRRegister(X86State::REG_RSP);
   };
 
   auto OldBP = LoadGPRRegister(X86State::REG_RBP);
@@ -3024,6 +3005,9 @@ void OpDispatchBuilder::EnterOp(OpcodeArgs) {
   if (Level > 0) {
     for (uint8_t i = 1; i < Level; ++i) {
       auto MemLoc = Sub(GPRSize, OldBP, i * IR::OpSizeToSize(OperandSize));
+      if (GuestMemoryBase != 0) {
+        MemLoc = _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, MemLoc), _Constant(GuestMemoryBase));
+      }
       auto Mem = _LoadMemGPR(OperandSize, MemLoc, OperandSize);
       NewSP = PushValue(OperandSize, Mem);
     }
@@ -3259,6 +3243,15 @@ void OpDispatchBuilder::STOSOp(OpcodeArgs) {
 
     Ref Counter = LoadGPRRegister(X86State::REG_RCX);
 
+    // A relocated guest rides in on the prefix. The JIT forms its working address as
+    // prefix + register but computes its *result* from the register alone, so RDI comes
+    // back as a guest address without any correction here.
+    if (GuestMemoryBase != 0) {
+      Ref Base = _Constant(GuestMemoryBase);
+      Segment = Segment ? Add(IR::OpSize::i64Bit, Segment, Base) : Base;
+      Dest = _Bfe(IR::OpSize::i64Bit, 32, 0, Dest);
+    }
+
     auto Result = _MemSet(CTX->IsAtomicTSOEnabled(), Size, Segment ?: InvalidNode, Dest, Src, Counter, LoadDir(1));
     StoreGPRRegister(X86State::REG_RCX, Constant(0));
     StoreGPRRegister(X86State::REG_RDI, Result);
@@ -3291,9 +3284,21 @@ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
       SrcAddr = Add(OpSize::i64Bit, SrcAddr, SrcSegment);
     }
 
+    if (GuestMemoryBase != 0) {
+      Ref Base = _Constant(GuestMemoryBase);
+      DstAddr = Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, DstAddr), Base);
+      SrcAddr = Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, SrcAddr), Base);
+    }
+
     Ref Result_Src = _AllocateGPR(false);
     Ref Result_Dst = _AllocateGPR(false);
     _MemCpy(CTX->IsAtomicTSOEnabled(), Size, DstAddr, SrcAddr, Counter, LoadDir(1), Result_Dst, Result_Src);
+
+    if (GuestMemoryBase != 0) {
+      Ref Base = _Constant(GuestMemoryBase);
+      Result_Dst = Sub(IR::OpSize::i64Bit, Result_Dst, Base);
+      Result_Src = Sub(IR::OpSize::i64Bit, Result_Src, Base);
+    }
 
     if (DstSegment) {
       Result_Dst = Sub(OpSize::i64Bit, Result_Dst, DstSegment);
@@ -5043,7 +5048,7 @@ void OpDispatchBuilder::CLZeroOp(OpcodeArgs) {
     UnimplementedOp(Op);
     return;
   }
-  Ref DestMem = LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.LoadData = false});
+  Ref DestMem = RelocateForAccess(LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.LoadData = false}));
   _CacheLineZero(DestMem);
 }
 
@@ -5053,7 +5058,7 @@ void OpDispatchBuilder::Prefetch(OpcodeArgs, bool ForStore, bool Stream, uint8_t
     return;
   }
 
-  Ref DestMem = LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.LoadData = false});
+  Ref DestMem = RelocateForAccess(LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.LoadData = false}));
   _Prefetch(ForStore, Stream, Level, DestMem, Invalid(), MemOffsetType::SXTX, 1);
 }
 

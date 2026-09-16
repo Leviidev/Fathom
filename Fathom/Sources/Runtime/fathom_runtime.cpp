@@ -1019,6 +1019,10 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
                                                                 session->console, syscall_config);
     process->syscalls->InitialiseHeap(process->program.heap, kHeapReservation);
     process->syscalls->SetCommandLine(argv);
+    // The guest's own name for the binary, not the host path it lives at: it is what
+    // /proc/self/exe has to report, and what an exec of that link has to resolve.
+    process->syscalls->SetProgramPath(
+        fathom::GuestPathForHostPath(session->guest_root, session->program_path));
     process->syscalls->SetProcess(1, 0, session.get());
 
     fathom::EngineOptions options;

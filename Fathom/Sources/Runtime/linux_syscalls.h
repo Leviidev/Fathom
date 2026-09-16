@@ -134,6 +134,11 @@ public:
 
     /// Points the process at a new program image after an execve.
     void AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const std::string& path);
+
+    /// The guest path of the program this process is running. Reported through
+    /// /proc/self/exe, which a program uses to find and re-run its own binary.
+    void SetProgramPath(std::string path) { program_path_ = std::move(path); }
+    const std::string& ProgramPath() const { return program_path_; }
     ~LinuxSyscalls();
 
     /// Entry point from FEXCore. `number` is RAX; the arguments are RDI, RSI, RDX, R10,
@@ -254,6 +259,8 @@ private:
     /// The host descriptor behind a guest one, or -1.
     int HostFdFor(int guest_fd);
     uint64_t DoMessage(int fd, uint64_t header_address, int flags, bool sending);
+    /// sendmmsg and recvmmsg: an array of msghdrs, each with the byte count written back.
+    uint64_t DoMultiMessage(int fd, uint64_t vector_address, uint64_t count, int flags, bool sending);
     int DuplicateTo(const OpenFile& file, int target);
     void CloseFd(int fd);
 
@@ -362,6 +369,10 @@ private:
 
     /// argv as the process was started with, so /proc/self/cmdline can answer.
     std::vector<std::string> command_line_;
+
+    /// The guest path of the program this process is running, which is what
+    /// /proc/self/exe names. Steam's launcher re-executes itself through it.
+    std::string program_path_;
 
 };
 

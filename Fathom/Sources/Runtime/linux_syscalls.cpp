@@ -17,8 +17,10 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <arpa/inet.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
+#include <sys/ioctl.h>
 #include <sys/ipc.h>
 #include <sys/sem.h>
 #include <sys/param.h>
@@ -287,6 +289,8 @@ enum : uint64_t {
     kSysGetRobustList = 274,
     kSysPrctl = 157,
     kSysSemget = 64,
+    kSysRecvmmsg = 299,
+    kSysSendmmsg = 307,
     kSysGetitimer = 36,
     kSysSetitimer = 38,
     kSysSetpgid = 109,
@@ -362,9 +366,58 @@ int64_t ToLinuxErrno(int host_errno) {
     case ENOTEMPTY: return 39;
     case ELOOP: return 40;
     case EOVERFLOW: return 75;
+    case ENOMSG: return 42;
+    case EIDRM: return 43;
+    case ENOSTR: return 60;
+    case ENODATA: return 61;
+    case ETIME: return 62;
+    case ENOLINK: return 67;
+    case EPROTO: return 71;
+    case EMULTIHOP: return 72;
+    case EBADMSG: return 74;
+    case EILSEQ: return 84;
+    case ENOTSOCK: return 88;
+    case EDESTADDRREQ: return 89;
+    case EMSGSIZE: return 90;
+    case EPROTOTYPE: return 91;
+    case ENOPROTOOPT: return 92;
+    case EPROTONOSUPPORT: return 93;
+    case ESOCKTNOSUPPORT: return 94;
     case ENOTSUP: return 95;
+    case EPFNOSUPPORT: return 96;
+    case EAFNOSUPPORT: return 97;
+    case EADDRINUSE: return 98;
+    case EADDRNOTAVAIL: return 99;
+    case ENETDOWN: return 100;
+    case ENETUNREACH: return 101;
+    case ENETRESET: return 102;
+    case ECONNABORTED: return 103;
+    case ECONNRESET: return 104;
+    case ENOBUFS: return 105;
+    case EISCONN: return 106;
+    case ENOTCONN: return 107;
+    case ESHUTDOWN: return 108;
+    case ETOOMANYREFS: return 109;
     case ETIMEDOUT: return 110;
-    default: return 22; // EINVAL
+    case ECONNREFUSED: return 111;
+    case EHOSTDOWN: return 112;
+    case EHOSTUNREACH: return 113;
+    case EALREADY: return 114;
+    // The one that matters most of all. A non-blocking connect reports EINPROGRESS, and a
+    // caller checks for exactly that value before waiting for the connection to complete.
+    // Reported as anything else -- and the default below used to make it EINVAL -- the
+    // caller concludes the address was bad and gives up, which a program describes to its
+    // user as having no network at all.
+    case EINPROGRESS: return 115;
+    case ESTALE: return 116;
+    case EDQUOT: return 122;
+    case ECANCELED: return 125;
+    default:
+        // Worth saying out loud: a wrong errno sends a guest down a path meant for a
+        // different failure, and that is far harder to recognise than a missing syscall.
+        FATHOM_WARN("no Linux errno for host errno %d (%s); reporting EINVAL", host_errno,
+                    std::strerror(host_errno));
+        return 22; // EINVAL
     }
 }
 
@@ -600,6 +653,8 @@ const char* SyscallName(uint64_t number) {
     case kSysPipe2: return "pipe2";
     case kSysPrctl: return "prctl";
     case kSysSemget: return "semget";
+    case kSysRecvmmsg: return "recvmmsg";
+    case kSysSendmmsg: return "sendmmsg";
     case kSysGetitimer: return "getitimer";
     case kSysSetitimer: return "setitimer";
     case kSysSetpgid: return "setpgid";
@@ -791,6 +846,7 @@ void LinuxSyscalls::ShareInto(LinuxSyscalls& thread) const {
 void LinuxSyscalls::AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const std::string& path) {
     InitialiseHeap(heap_base, heap_reserved);
     config_.work_dir = path;
+    program_path_ = path;
     // An exec replaces the whole address space, so nothing the old program mapped is
     // this process's any more. Keeping the list would make a later fork snapshot and
     // then restore regions that have since been released and handed to somebody else --
@@ -813,6 +869,14 @@ void LinuxSyscalls::InitialiseHeap(uint64_t base, uint64_t reserved) {
 // ---------------------------------------------------------------------------
 
 std::string LinuxSyscalls::NormaliseGuestPath(const std::string& path) const {
+    // /proc/self/exe is the program's own binary, and programs do more with it than read
+    // the link: Steam's launcher execs it to restart itself. Substituted here so that
+    // open, exec, stat and readlink all agree about what it means.
+    if (!program_path_.empty() &&
+        (path == "/proc/self/exe" || path == "/proc/" + std::to_string(pid_) + "/exe")) {
+        return program_path_;
+    }
+
     std::string absolute = path;
     if (absolute.empty()) {
         absolute = shared_->cwd;
@@ -1279,11 +1343,21 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
         return FailLinux(14);
     }
 
+    // Short enough that a stop request is still noticed promptly, long enough that waiting
+    // costs nothing.
+    constexpr int kSliceMilliseconds = 50;
+    std::vector<struct pollfd> host_fds;
+    std::vector<LinuxPollfd*> host_owners;
+
     for (;;) {
         if (console_.StopRequested()) {
             exit_status_ = -1;
             control_.ExitGuest(-1);
         }
+
+        host_fds.clear();
+        host_owners.clear();
+        bool watches_console = false;
 
         uint64_t ready = 0;
         for (uint64_t index = 0; index < count; ++index) {
@@ -1294,6 +1368,7 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
             }
 
             if (entry.fd == 0) {
+                watches_console = true;
                 if ((entry.events & kPollIn) != 0 && console_.InputAvailable()) {
                     entry.revents |= kPollIn;
                 }
@@ -1314,18 +1389,40 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
                 if (host_fd < 0) {
                     entry.revents |= kPollNval;
                 } else {
-                    // Ask the host about its own descriptor; a regular file is always ready.
-                    struct pollfd probe {};
-                    probe.fd = host_fd;
-                    probe.events = static_cast<short>(entry.events);
-                    if (poll(&probe, 1, 0) > 0) {
-                        entry.revents = static_cast<int16_t>(probe.revents);
-                    }
+                    host_fds.push_back({host_fd, static_cast<short>(entry.events), 0});
+                    host_owners.push_back(&entry);
                 }
             }
 
             if (entry.revents != 0) {
                 ++ready;
+            }
+        }
+
+        // One host poll for all of them, and -- when nothing else needs watching -- with a
+        // real timeout rather than zero. Polling each descriptor with a zero timeout and
+        // then sleeping turns a guest that is waiting quietly for a socket into a process
+        // burning a whole core, which is what an X client waiting for its server did.
+        if (!host_fds.empty()) {
+            const bool can_block = !watches_console && ready == 0 && timeout_ms != 0;
+            int slice = 0;
+            if (can_block) {
+                slice = kSliceMilliseconds;
+                if (timeout_ms > 0) {
+                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               deadline - std::chrono::steady_clock::now())
+                                               .count();
+                    slice = static_cast<int>(std::clamp<int64_t>(remaining, 0, kSliceMilliseconds));
+                }
+            }
+            const int answered = poll(host_fds.data(), static_cast<nfds_t>(host_fds.size()), slice);
+            if (answered > 0) {
+                for (size_t index = 0; index < host_fds.size(); ++index) {
+                    if (host_fds[index].revents != 0) {
+                        host_owners[index]->revents = static_cast<int16_t>(host_fds[index].revents);
+                        ++ready;
+                    }
+                }
             }
         }
 
@@ -1336,8 +1433,11 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
             return 0;
         }
 
-        // Sleep until a key arrives, in slices so a stop request is still noticed.
-        console_.WaitForInput(10);
+        // Only reached when the console is part of the set, or there is nothing to poll at
+        // all: the host poll above has already done the waiting otherwise.
+        if (watches_console || host_fds.empty()) {
+            console_.WaitForInput(kSliceMilliseconds);
+        }
     }
 }
 
@@ -1829,6 +1929,17 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         }
     }
 
+    if (!anonymous && (protection & guest::kProtExec) != 0) {
+        // Where a shared library's code actually landed. Without this, a guest address in
+        // a crash report or a JIT trace cannot be attributed to any file at all: the
+        // loader maps its libraries itself, so nothing else in this process knows.
+        std::scoped_lock lock {shared_->mutex};
+        if (auto* file = FindFile(fd)) {
+            FATHOM_INFO("mapped %s code at %#llx..%#llx", file->guest_path.c_str(),
+                        static_cast<unsigned long long>(space_.ToGuest(placed)),
+                        static_cast<unsigned long long>(space_.ToGuest(placed) + length));
+        }
+    }
     if ((guest_protection & kGuestProtWrite) == 0) {
         space_.Protect(placed, length, guest_protection);
     }
@@ -1982,12 +2093,12 @@ uint64_t LinuxSyscalls::DoReadlinkAt(int dirfd, uint64_t path_address, uint64_t 
     std::string guest_path;
     const std::string host_path = ResolveAt(dirfd, path.c_str(), &guest_path);
 
-    // /proc/self/exe is how a program finds its own binary, and enough real programs
-    // depend on it that answering it is worth the special case.
-    if (guest_path == "/proc/self/exe" || guest_path == "/proc/curproc/file") {
-        const std::string answer = config_.work_dir;
-        const size_t copied = std::min(static_cast<size_t>(size), answer.size());
-        std::memcpy(out, answer.data(), copied);
+    // NormaliseGuestPath has already turned /proc/self/exe into the program's own path,
+    // so what arrives here is the answer -- the link just has to report it rather than
+    // being followed on the host, where no such file exists.
+    if (!program_path_.empty() && guest_path == program_path_) {
+        const size_t copied = std::min(static_cast<size_t>(size), program_path_.size());
+        std::memcpy(out, program_path_.data(), copied);
         return copied;
     }
 
@@ -2056,6 +2167,32 @@ uint32_t LinuxSyscalls::ToGuestSocketAddress(sockaddr_storage* host_address, voi
     }
     return fathom::net::ToGuestAddress(reinterpret_cast<sockaddr*>(host_address), guest_address,
                                        capacity);
+}
+
+uint64_t LinuxSyscalls::DoMultiMessage(int fd, uint64_t vector_address, uint64_t count, int flags,
+                                       bool sending) {
+    // struct mmsghdr is a msghdr followed by the count of bytes transferred for it, so its
+    // size follows the msghdr's: 32 bytes for an i386 guest, 64 here.
+    const uint64_t header_size = config_.guest_is_32bit ? 28 : 56;
+    const uint64_t entry_size = config_.guest_is_32bit ? 32 : 64;
+
+    uint64_t done = 0;
+    for (uint64_t index = 0; index < count; ++index) {
+        const uint64_t entry = vector_address + index * entry_size;
+        const uint64_t result = DoMessage(fd, entry, flags, sending);
+        if (static_cast<int64_t>(result) < 0) {
+            // Linux reports a failure only when nothing at all got through; otherwise it
+            // returns how many messages it managed and leaves the error for next time.
+            return done > 0 ? done : result;
+        }
+        auto* transferred = static_cast<uint32_t*>(GuestPointer(entry + header_size, 4, true));
+        if (transferred == nullptr) {
+            return done > 0 ? done : FailLinux(14);
+        }
+        *transferred = static_cast<uint32_t>(result);
+        ++done;
+    }
+    return done;
 }
 
 uint64_t LinuxSyscalls::DoSocketcall(uint64_t call, uint64_t arguments_address) {
@@ -2643,6 +2780,16 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
     // x86-64's 4 is stat -- so the number is translated before anything looks at it, and
     // one implementation of each syscall serves both.
     if (config_.guest_is_32bit) {
+        // Counted before the special cases below, not after: each of them returns without
+        // reaching the common path, so leaving this until later makes every socket and
+        // System V call invisible to the counter -- and a guest spinning on them looks
+        // like a guest making no syscalls at all, which is a very misleading thing to see
+        // while chasing a hang.
+        if (number == kI386SetThreadArea || number == kI386Socketcall || number == kI386Ipc) {
+            console_.NoteSyscall();
+            // The crash handler keeps its own copy, and it is the one a state dump reads.
+            NoteSyscall(number, arg1, console_.SyscallCount());
+        }
         if (number == kI386SetThreadArea) {
             // x86-64 has no equivalent: a 64-bit guest sets its TLS pointer with
             // arch_prctl, so there is no number to translate this into.
@@ -2699,6 +2846,20 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
     }
 
     const auto result = Dispatch(number, arg1, arg2, arg3, arg4, arg5, arg6);
+
+    if (!config_.trace) {
+        // Every refusal, without the volume of a full trace. A guest that gives up rather
+        // than crashing almost always did so because something answered it with an error,
+        // and the ones that are part of normal operation -- a would-block, a file that is
+        // meant to be absent -- are the only ones worth leaving out.
+        const auto failed = static_cast<int64_t>(result);
+        if (failed < 0 && failed > -4096 && failed != -11 && failed != -2 && failed != -17) {
+            FATHOM_INFO("[pid %d] %s(%#llx, %#llx, %#llx) failed: errno %lld", pid_,
+                        SyscallName(number), static_cast<unsigned long long>(arg1),
+                        static_cast<unsigned long long>(arg2),
+                        static_cast<unsigned long long>(arg3), static_cast<long long>(-failed));
+        }
+    }
 
     if (config_.trace) {
         // The return value is the half that actually explains a stall: a syscall that
@@ -2871,6 +3032,46 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         }
         if (is_display) {
             return DoFramebufferIoctl(arg2, arg3);
+        }
+
+        // The descriptor-level ioctls, which are not terminal ioctls at all and are
+        // numbered differently on the two systems. FIONBIO is the one that matters most:
+        // it is how a program that does not use fcntl puts a socket into non-blocking
+        // mode, and answering it with ENOTTY tells that program its socket is unusable.
+        // Steam sets up every connection this way and reports "needs to be online" when
+        // it fails.
+        constexpr uint64_t kGuestFionread = 0x541B;
+        constexpr uint64_t kGuestFionbio = 0x5421;
+        constexpr uint64_t kGuestFioasync = 0x5452;
+        constexpr uint64_t kGuestFioclex = 0x5451;
+        constexpr uint64_t kGuestFionclex = 0x5450;
+        if (arg2 == kGuestFionread || arg2 == kGuestFionbio || arg2 == kGuestFioasync ||
+            arg2 == kGuestFioclex || arg2 == kGuestFionclex) {
+            const int host_fd = HostFdFor(fd);
+            if (host_fd < 0) {
+                // The console has no host descriptor; it is never in a mode these change.
+                return IsConsole(fd) ? 0 : FailLinux(9);
+            }
+            if (arg2 == kGuestFioclex || arg2 == kGuestFionclex) {
+                return fcntl(host_fd, F_SETFD, arg2 == kGuestFioclex ? FD_CLOEXEC : 0) < 0 ? Fail(errno)
+                                                                                           : 0;
+            }
+            auto* value = static_cast<int32_t*>(
+                GuestPointer(arg3, sizeof(int32_t), arg2 == kGuestFionread));
+            if (value == nullptr) {
+                return FailLinux(14);
+            }
+            const unsigned long host_request = arg2 == kGuestFionread  ? FIONREAD
+                                               : arg2 == kGuestFionbio ? FIONBIO
+                                                                       : FIOASYNC;
+            int argument = *value;
+            if (ioctl(host_fd, host_request, &argument) < 0) {
+                return Fail(errno);
+            }
+            if (arg2 == kGuestFionread) {
+                *value = argument;
+            }
+            return 0;
         }
         if (IsConsole(fd) && arg2 == guest::kTcgets) {
             // Claiming the console is a terminal makes the guest's libc line-buffer its
@@ -3649,9 +3850,39 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (length == 0) {
             return FailLinux(97);
         }
-        const int result = number == kSysConnect
-                               ? connect(host_fd, reinterpret_cast<sockaddr*>(&host_address), length)
-                               : bind(host_fd, reinterpret_cast<sockaddr*>(&host_address), length);
+        int result = number == kSysConnect
+                         ? connect(host_fd, reinterpret_cast<sockaddr*>(&host_address), length)
+                         : bind(host_fd, reinterpret_cast<sockaddr*>(&host_address), length);
+
+        // Linux lets a datagram socket be connected to port 0 -- it only records a default
+        // destination -- and glibc leans on that. With no AF_NETLINK to enumerate
+        // interfaces, getaddrinfo's AI_ADDRCONFIG check falls back to opening a UDP socket
+        // and connecting it to a candidate address to see whether that family works at
+        // all. Darwin refuses port 0 with EADDRNOTAVAIL, so the check concludes there is
+        // no IPv4 connectivity, every lookup comes back empty, and the program reports
+        // itself offline while DNS is in fact working perfectly.
+        if (result < 0 && errno == EADDRNOTAVAIL && number == kSysConnect &&
+            host_address.ss_family == AF_INET &&
+            reinterpret_cast<const sockaddr_in*>(&host_address)->sin_port == 0) {
+            int socket_type = 0;
+            socklen_t option_size = sizeof(socket_type);
+            if (getsockopt(host_fd, SOL_SOCKET, SO_TYPE, &socket_type, &option_size) == 0 &&
+                socket_type == SOCK_DGRAM) {
+                result = 0;
+            }
+        }
+        if (result < 0) {
+            char text[64] = "?";
+            if (host_address.ss_family == AF_INET) {
+                const auto* in = reinterpret_cast<const sockaddr_in*>(&host_address);
+                inet_ntop(AF_INET, &in->sin_addr, text, sizeof(text));
+                FATHOM_WARN("%s fd %d -> %s:%u failed: %s", number == kSysConnect ? "connect" : "bind",
+                            static_cast<int>(arg1), text, ntohs(in->sin_port), std::strerror(errno));
+            } else {
+                FATHOM_WARN("%s fd %d family %u failed: %s", number == kSysConnect ? "connect" : "bind",
+                            static_cast<int>(arg1), host_address.ss_family, std::strerror(errno));
+            }
+        }
         return result < 0 ? Fail(errno) : 0;
     }
 
@@ -3692,6 +3923,27 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             const void* address = GuestPointer(arg5, arg6, false);
             if (address != nullptr) {
                 length = ToHostSocketAddress(address, arg6, &host_address);
+            }
+        }
+        // A DNS query, spelled out. Resolution failing is the single most common reason a
+        // guest decides it has no network, and the name it asked for is the first thing
+        // worth knowing about it.
+        if (arg3 > 12 && arg3 < 512) {
+            const auto* packet = static_cast<const unsigned char*>(buffer);
+            std::string name;
+            size_t at = 12;
+            while (at < arg3 && packet[at] != 0 && name.size() < 200) {
+                const size_t label = packet[at];
+                if (label > 63 || at + label >= arg3) {
+                    name.clear();
+                    break;
+                }
+                if (!name.empty()) name.push_back('.');
+                name.append(reinterpret_cast<const char*>(packet + at + 1), label);
+                at += label + 1;
+            }
+            if (!name.empty()) {
+                FATHOM_INFO("dns query for %s", name.c_str());
             }
         }
         const ssize_t sent = sendto(host_fd, buffer, arg3, HostMessageFlags(static_cast<int>(arg4)),
@@ -4110,6 +4362,14 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         std::memset(out, 0, size);  // Disarmed, which is the truth.
         return 0;
     }
+
+    case kSysSendmmsg:
+    case kSysRecvmmsg:
+        // glibc's resolver sends its A and AAAA queries with one sendmmsg, and it does not
+        // fall back when that fails -- it retries, forever. Without this, name resolution
+        // simply never completes and a program reports itself offline.
+        return DoMultiMessage(static_cast<int>(arg1), arg2, arg3, static_cast<int>(arg4),
+                              number == kSysSendmmsg);
 
     case kSysPrctl:
         return DoPrctl(arg1, arg2);

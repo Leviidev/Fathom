@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# Builds FEXCore (the x86-64 -> ARM64 JIT that Fathom runs guest code on) for
-# arm64 iOS, out of the AetherCore4 fexcore-darwin tree, and copies the resulting
-# static libraries into Fathom/Libs/ where generate_project.rb picks them up.
+# Builds FEXCore (the x86-64 -> ARM64 JIT that Fathom runs guest code on) for arm64 iOS
+# and copies the resulting static libraries into Fathom/Libs/ where generate_project.rb
+# picks them up.
 #
-# The source tree is *not* vendored into this repo: it lives in AetherCore4 and is
-# shared with the other projects that use it. FEXCORE_SRC below is the single place
-# that path is configured; scripts/generate_project.rb reads the same default for
-# its header search paths.
+# The source tree is not vendored into this repo. FEXCORE_SRC below is the single place
+# that path is configured; scripts/generate_project.rb reads the same default for its
+# header search paths.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FEXCORE_SRC="${FEXCORE_SRC:-$HOME/Documents/Coding/AetherCore4/aetherps4-public-release/runtime/sources/fexcore-darwin}"
+# Fathom builds against its own branch of FEXCore, not AetherPS4's checkout. The 32-bit
+# work adds a guest-memory base to the JIT, which AetherPS4 neither needs nor expects, so
+# it lives on the `fathom-32bit` branch in a git worktree. Both share one object store;
+# AetherPS4's tree stays on `main` and is untouched.
+FEXCORE_SRC="${FEXCORE_SRC:-$HOME/Documents/Coding/fathom-fexcore/runtime/sources/fexcore-darwin}"
 BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build/fexcore-ios}"
 LIBS_DIR="$REPO_ROOT/Fathom/Libs"
 # Must match IPHONEOS_DEPLOYMENT_TARGET in generate_project.rb -- some of FEXCore's

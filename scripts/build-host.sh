@@ -8,7 +8,11 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FEXCORE_SRC="${FEXCORE_SRC:-$HOME/Documents/Coding/AetherCore4/aetherps4-public-release/runtime/sources/fexcore-darwin}"
+# Fathom builds against its own branch of FEXCore, not AetherPS4's checkout. The 32-bit
+# work adds a guest-memory base to the JIT, which AetherPS4 neither needs nor expects, so
+# it lives on the `fathom-32bit` branch in a git worktree. Both share one object store;
+# AetherPS4's tree stays on `main` and is untouched.
+FEXCORE_SRC="${FEXCORE_SRC:-$HOME/Documents/Coding/fathom-fexcore/runtime/sources/fexcore-darwin}"
 FEX_BUILD="${FEX_BUILD:-$REPO_ROOT/build/fexcore-macos}"
 LIBS_DIR="$REPO_ROOT/build/fexcore-macos-libs"
 OUT_DIR="$REPO_ROOT/build/host"

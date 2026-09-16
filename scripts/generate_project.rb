@@ -19,7 +19,7 @@ DEPLOYMENT_TARGET = '18.0'
 
 FEXCORE_SRC = ENV.fetch(
   'FEXCORE_SRC',
-  File.join(Dir.home, 'Documents/Coding/AetherCore4/aetherps4-public-release/runtime/sources/fexcore-darwin')
+  File.join(Dir.home, 'Documents/Coding/fathom-fexcore/runtime/sources/fexcore-darwin')
 )
 FEXCORE_BUILD = ENV.fetch('FEXCORE_BUILD', File.join(REPO_ROOT, 'build/fexcore-ios'))
 

@@ -74,7 +74,8 @@ public:
         }
         ++users_;
 
-        FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
+        // The one setting that changes how every instruction is decoded.
+        FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, options.guest_is_32bit ? "0" : "1");
         FEXCore::Config::Set(FEXCore::Config::CONFIG_DISABLETELEMETRY, "1");
         FEXCore::Config::Set(FEXCore::Config::CONFIG_MULTIBLOCK, options.multiblock ? "1" : "0");
         FEXCore::Config::Set(FEXCore::Config::CONFIG_TSOENABLED, options.tso_enabled ? "1" : "0");
@@ -555,6 +556,13 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
     if (impl->context == nullptr) {
         error = "FEXCore refused to create a context";
         return nullptr;
+    }
+
+    // Told before any code is compiled, because it changes every address the JIT emits.
+    impl->context->SetGuestMemoryBase(options.guest_memory_base);
+    if (options.guest_memory_base != 0) {
+        FATHOM_INFO("32-bit guest: its address space is placed at %#llx in this process",
+                    static_cast<unsigned long long>(options.guest_memory_base));
     }
 
     impl->signals = std::make_unique<FathomSignalDelegator>();

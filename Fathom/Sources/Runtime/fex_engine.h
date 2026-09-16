@@ -31,6 +31,12 @@ struct EngineOptions {
     /// strcmp or the SSE2 one -- and therefore whether a JIT bug in the wide paths is
     /// reachable at all.
     bool disable_avx {false};
+
+    /// True when the guest is an i386 binary. Its pointers are 32 bits, so it cannot be
+    /// mapped 1:1 -- `guest_memory_base` is where its address space really lives, and
+    /// FEXCore adds it to every address the guest computes.
+    bool guest_is_32bit {false};
+    uint64_t guest_memory_base {0};
 };
 
 enum class RunOutcome {

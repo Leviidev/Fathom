@@ -71,8 +71,11 @@ printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$OUT_DIR/etc/resolv.conf"
 # client forks, and xkbcomp, which every X server execs while building its keymap. Both
 # are unpacked by hand and put in place over the amd64 build.
 #
-# busybox is used for the shell because dash has no static build and pulling a second
-# dynamic linker's worth of i386 libraries in for one program is not worth it.
+# busybox supplies the shell and the utilities, and it has to be the *position
+# independent* build rather than busybox-static. Every guest process shares one address
+# space here, so two processes running the same non-PIE binary would both insist on its
+# fixed load address and land on top of each other -- which a shell pipeline does
+# immediately, since both the shell and the utility it pipes into are the same binary.
 echo "==> installing 32-bit builds of the programs this session execs"
 docker run --platform linux/amd64 --rm -v "$OUT_DIR:/out" "$IMAGE" sh -c '
     set -e
@@ -80,12 +83,41 @@ docker run --platform linux/amd64 --rm -v "$OUT_DIR:/out" "$IMAGE" sh -c '
     apt-get update -qq
     mkdir -p /tmp/debs/partial /tmp/x
     apt-get install -y --no-install-recommends -o Dir::Cache::archives=/tmp/debs \
-        --download-only busybox-static:i386 x11-xkb-utils:i386 >/dev/null
+        --download-only busybox:i386 x11-xkb-utils:i386 >/dev/null
     for deb in /tmp/debs/*.deb; do dpkg-deb -x "$deb" /tmp/x; done
-    cp /tmp/x/bin/busybox /out/bin/busybox32
+    find /tmp/x -name busybox -type f -exec cp {} /out/bin/busybox32 \;
     cp /tmp/x/usr/bin/xkbcomp /out/usr/bin/xkbcomp
 ' >/dev/null
 ln -sf busybox32 "$OUT_DIR/bin/sh"
+
+# A 32-bit userland in front of the 64-bit one.
+#
+# Debian's coreutils, grep, sed and the rest are the amd64 builds, and they cannot be
+# co-installed alongside i386 copies -- one path, one architecture. A session started on a
+# 32-bit program can only run 32-bit code, so every one of those a shell script reaches for
+# is a program that cannot run. busybox has all of them in a single static i386 binary, so
+# they go into /usr/local/bin, which comes first on PATH: nothing is overwritten, and the
+# Debian binaries stay where they are for a 64-bit session to use.
+#
+# The list is written out rather than read from `busybox --list`, because busybox32 is a
+# guest binary and nothing on the build host can run it. These are the applets a shell
+# script actually reaches for; the system-level ones busybox also carries (init, mount,
+# modprobe and friends) are deliberately left out, since a stand-in for those would be
+# answering for something it does not own.
+echo "==> linking busybox's applets into /usr/local/bin for 32-bit sessions"
+mkdir -p "$OUT_DIR/usr/local/bin"
+for applet in \
+    '[' ar arch awk base64 basename bunzip2 bzcat bzip2 cat chgrp chmod chown chroot cmp \
+    cp cpio cut date dd df diff dirname dos2unix du echo ed egrep env expand expr factor \
+    fallocate false fgrep find fold free getopt grep groups gunzip gzip head hexdump \
+    hostname id ipcalc kill killall less link ln logname ls md5sum mkdir mkfifo mknod \
+    mktemp more mv nl nproc nslookup od paste patch pidof printf ps pwd readlink realpath \
+    rev rm rmdir sed seq setsid sha1sum sha256sum sha512sum shuf sleep sort stat strings \
+    stty sync tac tail tar tee test time timeout touch tr true truncate tty uname \
+    uncompress unexpand uniq unlink unlzma unxz unzip uptime usleep wc wget which who \
+    whoami xargs xxd xz xzcat yes zcat; do
+    ln -sf /bin/busybox32 "$OUT_DIR/usr/local/bin/$applet"
+done
 
 # X11 wants these to exist before any server or client starts.
 mkdir -p "$OUT_DIR/tmp/.X11-unix" "$OUT_DIR/tmp/.ICE-unix"

@@ -757,6 +757,20 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& path,
 
     LoadedProgram loaded;
     std::string reason;
+    // A session's word size is fixed when it starts: the JIT decodes for one or the other,
+    // and the guest's address space is laid out to match. A binary of the other width
+    // cannot run here, and letting it try is worse than refusing -- its first instructions
+    // decode as something else entirely and it spins forever with no output, which looks
+    // exactly like a hang in whatever launched it.
+    const auto inspection = fathom::InspectElf(host_path);
+    if (inspection.ok && inspection.is_32bit != guest_is_32bit) {
+        FATHOM_WARN("execve %s: this is a %d-bit binary and the session is running %d-bit code; "
+                    "install the %d-bit build of it in the guest root",
+                    path.c_str(), inspection.is_32bit ? 32 : 64, guest_is_32bit ? 32 : 64,
+                    guest_is_32bit ? 32 : 64);
+        return -8; // -ENOEXEC
+    }
+
     if (!LoadProgram(*space, guest_root, host_path, argv, envp, stack_size, &loaded, reason)) {
         FATHOM_WARN("execve %s: %s", path.c_str(), reason.c_str());
         return -8; // -ENOEXEC

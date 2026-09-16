@@ -830,6 +830,11 @@ void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
     child.shared_->heap_limit = shared_->heap_limit;
     child.shared_->heap_break = shared_->heap_break;
     child.config_.work_dir = config_.work_dir;
+    // A fork is running the same program as its parent until it execs, so it answers
+    // /proc/self/exe the same way -- which is how busybox re-runs itself as an applet.
+    child.program_path_ = program_path_;
+    child.command_line_ = command_line_;
+    child.thread_name_ = thread_name_;
 }
 
 uint64_t LinuxSyscalls::HeapBreak() const {
@@ -841,6 +846,7 @@ void LinuxSyscalls::ShareInto(LinuxSyscalls& thread) const {
     thread.config_.work_dir = config_.work_dir;
     thread.command_line_ = command_line_;
     thread.thread_name_ = thread_name_;
+    thread.program_path_ = program_path_;
 }
 
 void LinuxSyscalls::AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const std::string& path) {

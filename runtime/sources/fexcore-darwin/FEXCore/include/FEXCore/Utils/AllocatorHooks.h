@@ -198,16 +198,29 @@ constexpr int PlatformExecuteFlag = MAP_JIT;
 // longjmp back to a setjmp checkpoint *within* the same stack frame never runs destructors
 // for locals constructed before that checkpoint -- only an actual `return` (or exception)
 // unwinds this guard, which is exactly the "compilation attempt is over" boundary we want.
+// Reentrant, and it has to be: ClearCache runs from inside CompileCode when the code
+// buffer fills up, and it writes into the fresh buffer itself. A guard that flipped back
+// to execute-enabled on every destructor would re-protect the pages while the outer
+// emitter still had code to write, and the next store would take SIGBUS -- which only a
+// guest large enough to fill a whole 16MB buffer ever reaches.
 class ScopedJITWriteProtect final {
 public:
   ScopedJITWriteProtect() {
-    pthread_jit_write_protect_np(0);
+    if (Depth++ == 0) {
+      pthread_jit_write_protect_np(0);
+    }
   }
   ScopedJITWriteProtect(const ScopedJITWriteProtect&) = delete;
   ScopedJITWriteProtect& operator=(const ScopedJITWriteProtect&) = delete;
   ~ScopedJITWriteProtect() {
-    pthread_jit_write_protect_np(1);
+    if (--Depth == 0) {
+      pthread_jit_write_protect_np(1);
+    }
   }
+
+private:
+  // Per thread, because the W^X side this guards is per thread.
+  static inline thread_local int Depth {};
 };
 #else
 constexpr int PlatformExecuteFlag = 0;

@@ -744,6 +744,12 @@ void Arm64JITCore::ClearCache() {
 
   auto CodeBuffer = GetEmptyCodeBuffer();
   SetBuffer(CodeBuffer->Ptr, CodeBuffer->AllocatedSize);
+  // EmitDetectionString writes into the buffer, and on Apple Silicon a MAP_JIT page is
+  // writable only while this thread has its W^X side flipped -- the same guard every other
+  // emission path here carries. Without it the very first store into a newly allocated
+  // buffer takes SIGBUS, which only shows up once a guest is large enough to fill the
+  // first 16MB and ask for a second.
+  FEXCore::Allocator::ScopedJITWriteProtect WriteGuard;
   EmitDetectionString();
 
   ThreadState->LookupCache->ChangeGuestToHostMapping(*PrevCodeBuffer, *CurrentCodeBuffer->LookupCache, lk);

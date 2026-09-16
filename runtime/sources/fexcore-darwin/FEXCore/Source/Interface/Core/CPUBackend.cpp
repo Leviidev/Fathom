@@ -371,6 +371,18 @@ namespace CPU {
       while (SignalHandlerCodeBuffers.size() > kRetainedBufferCount) {
         SignalHandlerCodeBuffers.erase(SignalHandlerCodeBuffers.begin());
       }
+#elif defined(__APPLE__)
+      // Same reasoning as the iOS branch above, and confirmed on this build too: freeing
+      // the retired buffer the instant CurrentCodeBuffer moves on leaves any surviving
+      // branch into it pointing at unmapped memory, and the fault that follows is an
+      // instruction fetch from an address that no longer exists. Holding a few retired
+      // buffers gives those branches a grace period; the count is bounded so this is a
+      // delay, not a leak.
+      static constexpr size_t kRetainedBufferCount = 3;
+      SignalHandlerCodeBuffers.push_back(std::move(CodeBuffer));
+      while (SignalHandlerCodeBuffers.size() > kRetainedBufferCount) {
+        SignalHandlerCodeBuffers.erase(SignalHandlerCodeBuffers.begin());
+      }
 #else
       SignalHandlerCodeBuffers.clear();
 #endif

@@ -93,6 +93,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> env;
     bool trace = false;
     bool tso = true;
+    bool multiblock = true;
     uint64_t arena_mb = 0;
 
     int index = 1;
@@ -106,6 +107,10 @@ int main(int argc, char** argv) {
             env.emplace_back(argv[++index]);
         } else if (option == "--trace") {
             trace = true;
+        } else if (option == "--no-multiblock") {
+            // Changes how FEX stitches guest basic blocks together. If a fault goes away
+            // with this off, the problem is in the JIT rather than in the guest.
+            multiblock = false;
         } else if (option == "--no-tso") {
             // Emulating x86's memory ordering makes FEX emit store-release everywhere,
             // and every unaligned one is a recoverable fault. Harmless in normal running,
@@ -176,6 +181,7 @@ int main(int argc, char** argv) {
     config.envc = static_cast<int>(env_pointers.size());
     config.trace_syscalls = trace;
     config.tso_enabled = tso;
+    config.multiblock = multiblock;
     if (arena_mb != 0) {
         config.address_space_size = arena_mb * 1024 * 1024;
     }
@@ -211,8 +217,22 @@ int main(int argc, char** argv) {
 
     fathom_session_status final_status {};
     fathom_session_get_status(g_session, &final_status);
-    std::fprintf(stderr, "\n[fathom-run] exit %d after %llu syscalls\n", status,
-                 static_cast<unsigned long long>(final_status.syscall_count));
+
+    // Which of these it was matters: a guest that halted did not call exit, it ran off
+    // into memory that was not code. Reporting that as a clean exit 0 hides real crashes.
+    const char* outcome = "unknown";
+    switch (final_status.state) {
+    case FATHOM_STATE_EXITED: outcome = "exited"; break;
+    case FATHOM_STATE_STOPPED: outcome = "stopped"; break;
+    case FATHOM_STATE_FAULTED: outcome = "FAULTED"; break;
+    case FATHOM_STATE_RUNNING: outcome = "still running"; break;
+    default: break;
+    }
+    const char* message = final_status.message[0] != '\0' ? final_status.message : "";
+    std::fprintf(stderr, "\n[fathom-run] %s (status %d) after %llu syscalls at rip %#llx%s%s\n",
+                 outcome, status, static_cast<unsigned long long>(final_status.syscall_count),
+                 static_cast<unsigned long long>(final_status.rip),
+                 message[0] != '\0' ? ": " : "", message);
 
     fathom_session_destroy(g_session);
     return status;

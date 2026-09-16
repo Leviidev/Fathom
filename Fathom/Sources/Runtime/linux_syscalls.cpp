@@ -15,6 +15,9 @@
 #include <ctime>
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/file.h>
+#include <sys/param.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -172,6 +175,19 @@ enum : uint64_t {
     kSysExecve = 59,
     kSysExit = 60,
     kSysWait4 = 61,
+    kSysFlock = 73,
+    kSysRenameat2 = 316,
+    kSysMount = 165,
+    kSysUmount2 = 166,
+    kSysSymlink = 88,
+    kSysSymlinkat = 266,
+    kSysLink = 86,
+    kSysLinkat = 265,
+    kSysFchmod = 91,
+    kSysFchmodat = 268,
+    kSysUtimensat = 280,
+    kSysSelect = 23,
+    kSysPselect6 = 270,
     kSysSocket = 41,
     kSysConnect = 42,
     kSysAccept = 43,
@@ -452,6 +468,22 @@ const char* SyscallName(uint64_t number) {
     case kSysSocketpair: return "socketpair";
     case kSysSetsockopt: return "setsockopt";
     case kSysGetsockopt: return "getsockopt";
+    case kSysSelect: return "select";
+    case kSysPselect6: return "pselect6";
+    case kSysRename: return "rename";
+    case kSysRenameat: return "renameat";
+    case kSysRenameat2: return "renameat2";
+    case kSysSymlink: return "symlink";
+    case kSysSymlinkat: return "symlinkat";
+    case kSysLink: return "link";
+    case kSysLinkat: return "linkat";
+    case kSysChmod: return "chmod";
+    case kSysFchmod: return "fchmod";
+    case kSysFchmodat: return "fchmodat";
+    case kSysUtimensat: return "utimensat";
+    case kSysFlock: return "flock";
+    case kSysStatfs: return "statfs";
+    case kSysFstatfs: return "fstatfs";
     case kSysPipe: return "pipe";
     case kSysPipe2: return "pipe2";
     case kSysDup3: return "dup3";
@@ -873,6 +905,124 @@ constexpr int16_t kPollNval = 0x020;
 /// poll, which busybox's line editor depends on: after reading an ESC it polls stdin with
 /// a short timeout to decide whether an arrow key followed or the user really pressed
 /// escape. Returning ENOSYS here left the shell redrawing its prompt instead of reading.
+/// select, which apk's downloader uses in place of poll. The descriptor sets are bitmaps
+/// of *guest* descriptors, so every bit has to be mapped to the host's numbering and back
+/// again -- a host fd_set built from guest numbers would watch whatever this app happens
+/// to have open at those indices.
+uint64_t LinuxSyscalls::DoSelect(int count, uint64_t read_address, uint64_t write_address,
+                                 uint64_t except_address, int64_t timeout_us) {
+    constexpr int kMaxFds = 1024;
+    if (count < 0 || count > kMaxFds) {
+        return FailLinux(22); // EINVAL
+    }
+    const uint64_t set_bytes = ((static_cast<uint64_t>(count) + 63) / 64) * 8;
+
+    const auto load = [&](uint64_t address, std::vector<uint64_t>* out) -> bool {
+        out->assign((set_bytes + 7) / 8, 0);
+        if (address == 0 || set_bytes == 0) {
+            return true;
+        }
+        const void* bits = GuestPointer(address, set_bytes, true);
+        if (bits == nullptr) {
+            return false;
+        }
+        std::memcpy(out->data(), bits, set_bytes);
+        return true;
+    };
+    const auto store = [&](uint64_t address, const std::vector<uint64_t>& bits) {
+        if (address == 0 || set_bytes == 0) {
+            return;
+        }
+        void* out = GuestPointer(address, set_bytes, true);
+        if (out != nullptr) {
+            std::memcpy(out, bits.data(), set_bytes);
+        }
+    };
+    const auto is_set = [](const std::vector<uint64_t>& bits, int fd) {
+        return (bits[static_cast<size_t>(fd) / 64] >> (static_cast<size_t>(fd) % 64) & 1) != 0;
+    };
+
+    std::vector<uint64_t> want_read;
+    std::vector<uint64_t> want_write;
+    std::vector<uint64_t> want_except;
+    if (!load(read_address, &want_read) || !load(write_address, &want_write) ||
+        !load(except_address, &want_except)) {
+        return FailLinux(14);
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeout_us < 0 ? 0 : timeout_us);
+
+    for (;;) {
+        if (console_.StopRequested()) {
+            exit_status_ = -1;
+            control_.ExitGuest(-1);
+        }
+
+        std::vector<uint64_t> ready_read(want_read.size(), 0);
+        std::vector<uint64_t> ready_write(want_write.size(), 0);
+        uint64_t ready = 0;
+
+        for (int fd = 0; fd < count; ++fd) {
+            const bool wants_read = is_set(want_read, fd);
+            const bool wants_write = is_set(want_write, fd);
+            if (!wants_read && !wants_write) {
+                continue;
+            }
+
+            bool readable = false;
+            bool writable = false;
+            int console_stream = -1;
+            int host_fd = -1;
+            {
+                std::scoped_lock lock {mutex_};
+                auto* file = FindFile(fd);
+                if (file == nullptr) {
+                    return FailLinux(9); // EBADF
+                }
+                console_stream = file->console_stream;
+                host_fd = file->host_fd;
+            }
+
+            if (console_stream == 0) {
+                readable = console_.InputAvailable();
+            } else if (console_stream > 0) {
+                writable = true;  // The console never blocks a write.
+            } else if (host_fd >= 0) {
+                struct pollfd probe {};
+                probe.fd = host_fd;
+                probe.events = static_cast<short>((wants_read ? POLLIN : 0) | (wants_write ? POLLOUT : 0));
+                if (poll(&probe, 1, 0) > 0) {
+                    readable = (probe.revents & (POLLIN | POLLHUP | POLLERR)) != 0;
+                    writable = (probe.revents & POLLOUT) != 0;
+                }
+            }
+
+            if (wants_read && readable) {
+                ready_read[static_cast<size_t>(fd) / 64] |= 1ULL << (static_cast<size_t>(fd) % 64);
+                ++ready;
+            }
+            if (wants_write && writable) {
+                ready_write[static_cast<size_t>(fd) / 64] |= 1ULL << (static_cast<size_t>(fd) % 64);
+                ++ready;
+            }
+        }
+
+        if (ready > 0 || timeout_us == 0) {
+            store(read_address, ready_read);
+            store(write_address, ready_write);
+            store(except_address, std::vector<uint64_t>(want_except.size(), 0));
+            return ready;
+        }
+        if (timeout_us > 0 && std::chrono::steady_clock::now() >= deadline) {
+            store(read_address, std::vector<uint64_t>(want_read.size(), 0));
+            store(write_address, std::vector<uint64_t>(want_write.size(), 0));
+            store(except_address, std::vector<uint64_t>(want_except.size(), 0));
+            return 0;
+        }
+        console_.WaitForInput(5);
+    }
+}
+
 uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout_ms) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
 
@@ -1299,6 +1449,18 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         }
     }
 
+    if (anonymous) {
+        // Linux guarantees anonymous pages read as zero, and a dynamic loader depends on
+        // it completely: it maps a library's whole span from the file and then maps .bss
+        // anonymously on top. Skip this and .bss keeps the file bytes that happened to
+        // lie underneath, so a pointer that should be NULL holds whatever was there --
+        // which is how a library crashes on an address out of its own file offsets.
+        //
+        // Freshly reserved arena pages are already zero, but the arena is reused as
+        // processes come and go, so the zeroing has to be unconditional.
+        std::memset(reinterpret_cast<void*>(placed), 0, length);
+    }
+
     if (!anonymous) {
         std::scoped_lock lock {mutex_};
         auto* file = FindFile(fd);
@@ -1608,17 +1770,31 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     }
 
     case kSysMremap: {
+        constexpr uint64_t kMremapMayMove = 1;
         const uint64_t old_address = arg1;
         const uint64_t old_size = arg2;
         const uint64_t new_size = arg3;
+        const uint64_t flags = arg4;
+
         if (new_size <= old_size) {
             return old_address;
         }
+        // Without MREMAP_MAYMOVE the caller has said the mapping must not move, and Linux
+        // answers ENOMEM rather than relocating it. Moving anyway hands back an address
+        // the caller never agreed to, and anything still holding a pointer into the old
+        // mapping is now pointing at released memory.
+        if ((flags & kMremapMayMove) == 0) {
+            return FailLinux(12); // ENOMEM
+        }
+
         const uint64_t placed = space_.Allocate(new_size, 0, kGuestProtRead | kGuestProtWrite);
         if (placed == 0) {
             return FailLinux(12);
         }
         std::memcpy(reinterpret_cast<void*>(placed), reinterpret_cast<const void*>(old_address), old_size);
+        // The part past the old end is fresh anonymous memory, which Linux guarantees
+        // reads as zero.
+        std::memset(reinterpret_cast<uint8_t*>(placed) + old_size, 0, new_size - old_size);
         space_.Release(old_address, old_size);
         return placed;
     }
@@ -2366,9 +2542,175 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return 0;
     }
 
-    case kSysSysinfo:
+    case kSysSelect:
+    case kSysPselect6: {
+        int64_t timeout_us = -1;
+        if (arg5 != 0) {
+            if (number == kSysSelect) {
+                const auto* tv = static_cast<const int64_t*>(GuestPointer(arg5, 16, false));
+                if (tv != nullptr) {
+                    timeout_us = tv[0] * 1000000 + tv[1];
+                }
+            } else {
+                const auto* ts = static_cast<const int64_t*>(GuestPointer(arg5, 16, false));
+                if (ts != nullptr) {
+                    timeout_us = ts[0] * 1000000 + ts[1] / 1000;
+                }
+            }
+        }
+        return DoSelect(static_cast<int>(arg1), arg2, arg3, arg4, timeout_us);
+    }
+
+    case kSysRename:
+    case kSysRenameat:
+    case kSysRenameat2: {
+        // The three differ only in how the two paths are addressed, and renameat2 adds
+        // flags. RENAME_NOREPLACE is the one that matters: a package manager uses it to
+        // avoid clobbering a file it did not expect to be there.
+        constexpr uint64_t kRenameNoreplace = 1;
+        uint64_t old_path_address = arg1;
+        uint64_t new_path_address = arg2;
+        int old_dirfd = guest::kAtFdCwd;
+        int new_dirfd = guest::kAtFdCwd;
+        uint64_t flags = 0;
+        if (number != kSysRename) {
+            old_dirfd = static_cast<int>(arg1);
+            old_path_address = arg2;
+            new_dirfd = static_cast<int>(arg3);
+            new_path_address = arg4;
+            if (number == kSysRenameat2) {
+                flags = arg5;
+            }
+        }
+
+        std::string old_path;
+        std::string new_path;
+        if (!ReadGuestString(old_path_address, &old_path) ||
+            !ReadGuestString(new_path_address, &new_path)) {
+            return FailLinux(14);
+        }
+        const std::string from = ResolveAt(old_dirfd, old_path.c_str(), nullptr);
+        const std::string to = ResolveAt(new_dirfd, new_path.c_str(), nullptr);
+        if ((flags & kRenameNoreplace) != 0 && access(to.c_str(), F_OK) == 0) {
+            return FailLinux(17); // EEXIST
+        }
+        return rename(from.c_str(), to.c_str()) != 0 ? Fail(errno) : 0;
+    }
+
+    case kSysSymlink:
+    case kSysSymlinkat: {
+        std::string target;
+        std::string link_path;
+        const uint64_t target_address = arg1;
+        const uint64_t link_address = number == kSysSymlink ? arg2 : arg3;
+        const int dirfd = number == kSysSymlink ? guest::kAtFdCwd : static_cast<int>(arg2);
+        if (!ReadGuestString(target_address, &target) || !ReadGuestString(link_address, &link_path)) {
+            return FailLinux(14);
+        }
+        // The target is stored exactly as given: it is resolved later, by the guest,
+        // against the guest's root.
+        return symlink(target.c_str(), ResolveAt(dirfd, link_path.c_str(), nullptr).c_str()) != 0
+                   ? Fail(errno)
+                   : 0;
+    }
+
+    case kSysLink:
+    case kSysLinkat: {
+        const bool at = number == kSysLinkat;
+        std::string old_path;
+        std::string new_path;
+        if (!ReadGuestString(at ? arg2 : arg1, &old_path) ||
+            !ReadGuestString(at ? arg4 : arg2, &new_path)) {
+            return FailLinux(14);
+        }
+        const std::string from = ResolveAt(at ? static_cast<int>(arg1) : guest::kAtFdCwd,
+                                           old_path.c_str(), nullptr);
+        const std::string to = ResolveAt(at ? static_cast<int>(arg3) : guest::kAtFdCwd,
+                                         new_path.c_str(), nullptr);
+        return link(from.c_str(), to.c_str()) != 0 ? Fail(errno) : 0;
+    }
+
+    case kSysChmod:
+    case kSysFchmodat: {
+        std::string path;
+        const bool at = number == kSysFchmodat;
+        if (!ReadGuestString(at ? arg2 : arg1, &path)) {
+            return FailLinux(14);
+        }
+        const std::string host_path = ResolveAt(at ? static_cast<int>(arg1) : guest::kAtFdCwd,
+                                                path.c_str(), nullptr);
+        const auto mode = static_cast<mode_t>(at ? arg3 : arg2);
+        return chmod(host_path.c_str(), mode) != 0 ? Fail(errno) : 0;
+    }
+
+    case kSysFchmod: {
+        const int host_fd = HostFdFor(static_cast<int>(arg1));
+        if (host_fd < 0) {
+            return FailLinux(9);
+        }
+        return fchmod(host_fd, static_cast<mode_t>(arg2)) != 0 ? Fail(errno) : 0;
+    }
+
+    case kSysUtimensat:
+        // Timestamps are cosmetic here, and a package manager that cannot set them still
+        // installs correctly; failing would stop it dead.
+        return 0;
+
+    case kSysMount:
+    case kSysUmount2:
+        // Nothing here is mountable, and this is not root. EPERM is the truthful answer,
+        // and unlike ENOSYS it is one callers are written to expect.
+        return FailLinux(1);
+
+    case kSysFlock: {
+        const int host_fd = HostFdFor(static_cast<int>(arg1));
+        if (host_fd < 0) {
+            return FailLinux(9);
+        }
+        // LOCK_SH, LOCK_EX, LOCK_NB and LOCK_UN happen to be 1, 2, 4 and 8 on both
+        // systems, so the operation passes through untouched.
+        return flock(host_fd, static_cast<int>(arg2)) < 0 ? Fail(errno) : 0;
+    }
+
     case kSysStatfs:
-    case kSysFstatfs:
+    case kSysFstatfs: {
+        struct statfs host {};
+        if (number == kSysFstatfs) {
+            const int host_fd = HostFdFor(static_cast<int>(arg1));
+            if (host_fd < 0 || fstatfs(host_fd, &host) != 0) {
+                return host_fd < 0 ? FailLinux(9) : Fail(errno);
+            }
+        } else {
+            std::string path;
+            if (!ReadGuestString(arg1, &path)) {
+                return FailLinux(14);
+            }
+            if (statfs(ResolveGuestPath(path).c_str(), &host) != 0) {
+                return Fail(errno);
+            }
+        }
+
+        // Linux's struct statfs is 120 bytes of 64-bit fields in an order all its own,
+        // and nothing about Darwin's matches, so it is written out field by field.
+        auto* out = static_cast<uint8_t*>(GuestPointer(number == kSysFstatfs ? arg2 : arg2, 120, true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        std::memset(out, 0, 120);
+        const auto put = [&](size_t offset, uint64_t value) { std::memcpy(out + offset, &value, 8); };
+        put(0, 0x858458f6);                 // f_type: report RAMFS_MAGIC
+        put(8, host.f_bsize);
+        put(16, host.f_blocks);
+        put(24, host.f_bfree);
+        put(32, host.f_bavail);
+        put(40, host.f_files);
+        put(48, host.f_ffree);
+        put(64, 255);                       // f_namelen
+        put(72, host.f_bsize);              // f_frsize
+        return 0;
+    }
+
+    case kSysSysinfo:
     case kSysEpollCreate1:
     case kSysMemfdCreate:
         return FailLinux(38);

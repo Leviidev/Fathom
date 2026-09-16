@@ -497,7 +497,8 @@ bool BuildInitialStack(GuestAddressSpace& space, const LoadedImage& image,
     arc4random_buf(random_bytes, sizeof(random_bytes));
     const uint64_t random_address = push_bytes(random_bytes, sizeof(random_bytes));
 
-    const uint64_t platform_address = push_string("x86_64");
+    // The guest's own name for the machine it thinks it is on.
+    const uint64_t platform_address = push_string(space.GuestBase() != 0 ? "i686" : "x86_64");
     const uint64_t execfn_address = push_string(exec_path);
 
     std::vector<uint64_t> env_addresses;
@@ -540,12 +541,19 @@ bool BuildInitialStack(GuestAddressSpace& space, const LoadedImage& image,
         {kAtNull, 0},
     };
 
+    // A 32-bit process's stack is built out of 4-byte words, not 8. Everything about the
+    // layout is otherwise the same -- argc, then argv, then envp, then the auxiliary
+    // vector -- but writing 64-bit words into it puts every entry at twice its offset and
+    // the guest reads its own arguments as garbage.
+    const bool narrow = space.GuestBase() != 0;
+    const size_t word_size = narrow ? 4 : 8;
+
     const size_t word_count = 1                        // argc
                               + arg_addresses.size() + 1 // argv + NULL
                               + env_addresses.size() + 1 // envp + NULL
                               + auxv.size() * 2;
 
-    uint64_t rsp = cursor - word_count * sizeof(uint64_t);
+    uint64_t rsp = cursor - word_count * word_size;
     // The ABI is specific here: at the process entry point RSP is 16-byte aligned and
     // argc sits at [RSP]. That is different from the alignment rule at a *function* entry
     // (where RSP+8 is aligned because a return address was pushed), and conflating the two
@@ -556,24 +564,40 @@ bool BuildInitialStack(GuestAddressSpace& space, const LoadedImage& image,
         return false;
     }
 
-    auto* word = reinterpret_cast<uint64_t*>(rsp);
-    *word++ = arg_addresses.size();
+    // Every pointer stored here is one the guest will dereference, so it is written in
+    // the guest's numbering rather than the host's.
+    uint8_t* word = reinterpret_cast<uint8_t*>(rsp);
+    const auto put = [&word, word_size](uint64_t value) {
+        if (word_size == 4) {
+            const auto narrowed = static_cast<uint32_t>(value);
+            std::memcpy(word, &narrowed, 4);
+        } else {
+            std::memcpy(word, &value, 8);
+        }
+        word += word_size;
+    };
+
+    put(arg_addresses.size());
     for (const auto address : arg_addresses) {
-        *word++ = address;
+        put(space.ToGuest(address));
     }
-    *word++ = 0;
+    put(0);
     for (const auto address : env_addresses) {
-        *word++ = address;
+        put(space.ToGuest(address));
     }
-    *word++ = 0;
+    put(0);
     for (const auto& [key, value] : auxv) {
-        *word++ = key;
-        *word++ = value;
+        put(key);
+        // Only the three that point at something built on this stack need converting.
+        // AT_PHDR, AT_BASE and AT_ENTRY came from the loaded image and are already in the
+        // guest's numbering; converting them twice would subtract the base twice.
+        const bool from_this_stack = key == kAtRandom || key == kAtPlatform || key == kAtExecfn;
+        put(from_this_stack && value != 0 ? space.ToGuest(value) : value);
     }
 
     out_stack->stack_base = base;
     out_stack->stack_size = stack_size;
-    out_stack->rsp = rsp;
+    out_stack->rsp = space.ToGuest(rsp);
     FATHOM_INFO("guest stack: %#llx..%#llx, rsp=%#llx, %zu argv, %zu envp",
                 static_cast<unsigned long long>(base), static_cast<unsigned long long>(top),
                 static_cast<unsigned long long>(rsp), argv.size(), envp.size());

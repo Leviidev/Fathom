@@ -30,6 +30,28 @@
 namespace {
 
 constexpr uint64_t kDefaultAddressSpace = 2ULL * 1024 * 1024 * 1024; // 2 GB
+
+/// A 32-bit guest can address exactly 4GB and no more, so its arena is capped there --
+/// and the whole of it is reserved, not committed, so it costs address space and nothing
+/// else until the guest actually writes.
+constexpr uint64_t k32BitAddressSpace = 4ULL * 1024 * 1024 * 1024;
+
+/// Converts an image's outward-facing addresses -- the ones that end up in registers and
+/// in the auxiliary vector -- from the host's numbering to the guest's. Identity for a
+/// 64-bit guest, where the two are the same.
+void ToGuestAddresses(const fathom::GuestAddressSpace& space, fathom::LoadedImage* image) {
+    if (space.GuestBase() == 0) {
+        return;
+    }
+    const uint64_t host_begin = image->image_begin;
+    image->entry = space.ToGuest(image->entry);
+    image->phdr_address = image->phdr_address != 0 ? space.ToGuest(image->phdr_address) : 0;
+    image->image_begin = space.ToGuest(image->image_begin);
+    image->image_end = space.ToGuest(image->image_end);
+    // load_base is an addend applied to p_vaddr, not an address, so it shifts by however
+    // much the image's start moved.
+    image->load_base -= (host_begin - image->image_begin);
+}
 constexpr uint64_t kDefaultStack = 8ULL * 1024 * 1024;               // 8 MB
 // Per process, and the arena is shared by all of them, so this is a budget rather than a
 // gift: 512MB each meant four processes exhausted a 2GB arena. Busybox and its applets
@@ -128,6 +150,7 @@ bool LoadProgram(fathom::GuestAddressSpace& space, const std::string& guest_root
     if (!fathom::LoadElf(host_path, space, 0, &out->image, error)) {
         return false;
     }
+    ToGuestAddresses(space, &out->image);
 
     // A dynamically linked program does not begin at its own entry point. The kernel maps
     // its interpreter -- ld.so -- alongside it and enters *that*; ld.so then loads the
@@ -145,10 +168,11 @@ bool LoadProgram(fathom::GuestAddressSpace& space, const std::string& guest_root
                     ", which the guest root filesystem does not provide.";
             return false;
         }
-        if (!fathom::LoadElf(loader, space, out->image.image_end, &out->interpreter, error)) {
+        if (!fathom::LoadElf(loader, space, space.ToHost(out->image.image_end), &out->interpreter, error)) {
             error = "could not load the dynamic loader " + inspection.interpreter + ": " + error;
             return false;
         }
+        ToGuestAddresses(space, &out->interpreter);
         out->dynamic = true;
     }
 
@@ -162,12 +186,13 @@ bool LoadProgram(fathom::GuestAddressSpace& space, const std::string& guest_root
     // the layout it expects. Reserved, not touched: nothing is paged in until the guest
     // actually writes to it.
     const uint64_t images_end = std::max(out->image.image_end, out->interpreter.image_end);
-    out->heap = space.Allocate(kHeapReservation, images_end,
-                               fathom::kGuestProtRead | fathom::kGuestProtWrite);
-    if (out->heap == 0) {
+    const uint64_t heap_host = space.Allocate(kHeapReservation, space.ToHost(images_end),
+                                              fathom::kGuestProtRead | fathom::kGuestProtWrite);
+    if (heap_host == 0) {
         error = "could not reserve the guest heap";
         return false;
     }
+    out->heap = space.ToGuest(heap_host);
 
     out->entry = out->dynamic ? out->interpreter.entry : out->image.entry;
     return true;
@@ -751,11 +776,25 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     session->state.store(FATHOM_STATE_LOADING);
 
     std::string reason;
+    // Read before anything is reserved: an i386 guest needs a differently sized and
+    // differently placed arena, and that decision cannot be made after the fact.
+    const auto first_look = fathom::InspectElf(session->program_path);
+    if (!first_look.ok) {
+        return fail(first_look.error);
+    }
+    const bool guest_is_32bit = first_look.is_32bit;
     const uint64_t arena_size =
-        config->address_space_size != 0 ? config->address_space_size : kDefaultAddressSpace;
+        guest_is_32bit ? k32BitAddressSpace
+                       : (config->address_space_size != 0 ? config->address_space_size : kDefaultAddressSpace);
     session->space.reset(fathom::GuestAddressSpace::Reserve(arena_size, reason));
     if (session->space == nullptr) {
         return fail(reason);
+    }
+    if (guest_is_32bit) {
+        // The guest sees its address space starting at zero; it really starts here.
+        session->space->SetGuestBase(session->space->Base());
+        FATHOM_INFO("i386 guest: 4GB arena at %#llx, which the guest sees as 0",
+                    static_cast<unsigned long long>(session->space->Base()));
     }
 
     session->guest_root = config->guest_root == nullptr ? "" : config->guest_root;
@@ -814,6 +853,8 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     options.reduced_precision_x87 = config->reduced_precision_x87;
     options.disassemble = false;
     options.disable_avx = config->disable_avx;
+    options.guest_is_32bit = guest_is_32bit;
+    options.guest_memory_base = session->space->GuestBase();
 
     session->engine = fathom::FexEngine::Create(*session->space, options, reason);
     if (session->engine == nullptr) {

@@ -327,6 +327,11 @@ struct fathom_session final : fathom::ProcessHost {
     }
 
     fathom::RunResult RunProcess(GuestProcess* process);
+    /// Asks every guest thread to stop at its next syscall and waits for all of them.
+    void StopAndJoinThreads();
+    /// The same for one process's threads, which has to happen before that process can be
+    /// destroyed -- its threads hold references to everything it owns.
+    void StopAndJoinThreadsOf(GuestProcess* process);
     void JoinFinishedChildren();
     void ReleaseParent(GuestProcess* process);
 
@@ -411,6 +416,47 @@ fathom::RunResult fathom_session::RunProcess(GuestProcess* process) {
         }
     }
     return result;
+}
+
+void fathom_session::StopAndJoinThreadsOf(GuestProcess* process) {
+    if (process->threads.empty()) {
+        return;
+    }
+    process->syscalls->RequestProcessStop();
+    process_changed.notify_all();
+    for (auto& thread : process->threads) {
+        if (thread->started) {
+            pthread_join(thread->host_thread, nullptr);
+            thread->started = false;
+        }
+    }
+    process->threads.clear();
+}
+
+void fathom_session::StopAndJoinThreads() {
+    console.RequestStop();
+
+    std::vector<pthread_t> waiting;
+    {
+        std::scoped_lock lock {process_mutex};
+        for (auto& [pid, process] : processes) {
+            for (auto& thread : process->threads) {
+                if (thread->started) {
+                    waiting.push_back(thread->host_thread);
+                    thread->started = false;
+                }
+            }
+            if (process->thread_started && !process->finished) {
+                waiting.push_back(process->host_thread);
+                process->thread_started = false;
+            }
+        }
+    }
+    process_changed.notify_all();
+
+    for (pthread_t thread : waiting) {
+        pthread_join(thread, nullptr);
+    }
 }
 
 void fathom_session::JoinFinishedChildren() {
@@ -826,6 +872,11 @@ void* RunChildThread(void* raw) {
     FATHOM_INFO("pid %d: running", process->pid);
     const auto result = session->RunProcess(process);
 
+    // Its own threads first: they are still running inside the JIT, and everything they
+    // are holding -- this process's syscall state, its descriptor table, its stop flag --
+    // belongs to the process that is about to be reaped.
+    session->StopAndJoinThreadsOf(process);
+
     // Before anything else: a process that has stopped running must not still be holding
     // file descriptors. Its copy of a pipe's write end would keep that pipe open, and the
     // parent reading the other end would wait for an end-of-file that can never come.
@@ -1141,6 +1192,13 @@ int fathom_session_run(fathom_session* session) {
     session->SetMessage("running");
 
     const auto result = session->RunProcess(init);
+
+    // The first thread returning means the guest is finished, but its other threads are
+    // still inside the JIT -- parked in a futex, or polling -- holding references to state
+    // this session is about to destroy. Asking them to stop and waiting for them is the
+    // difference between a clean exit and a segfault in a thread that outlived everything
+    // it was using.
+    session->StopAndJoinThreads();
 
     switch (result.outcome) {
     case fathom::RunOutcome::Exited:

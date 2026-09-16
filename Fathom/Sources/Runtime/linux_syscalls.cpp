@@ -290,6 +290,7 @@ enum : uint64_t {
     kSysGetRobustList = 274,
     kSysPrctl = 157,
     kSysSemget = 64,
+    kSysWaitid = 247,
     kSysSchedSetaffinity = 203,
     kSysRecvmmsg = 299,
     kSysSendmmsg = 307,
@@ -655,6 +656,7 @@ const char* SyscallName(uint64_t number) {
     case kSysPipe2: return "pipe2";
     case kSysPrctl: return "prctl";
     case kSysSemget: return "semget";
+    case kSysWaitid: return "waitid";
     case kSysSchedSetaffinity: return "sched_setaffinity";
     case kSysRecvmmsg: return "recvmmsg";
     case kSysSendmmsg: return "sendmmsg";
@@ -761,7 +763,8 @@ LinuxSyscalls::LinuxSyscalls(GuestAddressSpace& space, GuestThreadControl& contr
     , control_ {control}
     , console_ {console}
     , config_ {std::move(config)}
-    , shared_ {std::make_shared<ProcessFiles>()} {
+    , shared_ {std::make_shared<ProcessFiles>()}
+    , process_stopping_ {std::make_shared<std::atomic<bool>>(false)} {
     if (!config_.work_dir.empty()) {
         shared_->cwd = NormaliseGuestPath(config_.work_dir);
     }
@@ -846,6 +849,7 @@ uint64_t LinuxSyscalls::HeapBreak() const {
 
 void LinuxSyscalls::ShareInto(LinuxSyscalls& thread) const {
     thread.shared_ = shared_;
+    thread.process_stopping_ = process_stopping_;
     thread.config_.work_dir = config_.work_dir;
     thread.command_line_ = command_line_;
     thread.thread_name_ = thread_name_;
@@ -1267,7 +1271,7 @@ uint64_t LinuxSyscalls::DoSelect(int count, uint64_t read_address, uint64_t writ
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeout_us < 0 ? 0 : timeout_us);
 
     for (;;) {
-        if (console_.StopRequested()) {
+        if (ShouldStop()) {
             exit_status_ = -1;
             control_.ExitGuest(-1);
         }
@@ -1360,7 +1364,7 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
     std::vector<LinuxPollfd*> host_owners;
 
     for (;;) {
-        if (console_.StopRequested()) {
+        if (ShouldStop()) {
             exit_status_ = -1;
             control_.ExitGuest(-1);
         }
@@ -1910,13 +1914,31 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         // a reader and only wrong for a writer.
         const uint64_t host_page = space_.HostPageSize();
         if ((flags & guest::kMapShared) != 0 && (static_cast<uint64_t>(offset) % host_page) == 0) {
-            const uint64_t rounded = (length + host_page - 1) & ~(host_page - 1);
+            uint64_t rounded = (length + host_page - 1) & ~(host_page - 1);
+
+            // Never past the end of the file. The host's pages are four times the guest's,
+            // so rounding a small mapping up can reach well beyond what the file actually
+            // has -- and a page of a file-backed mapping with no file behind it does not
+            // read as zero, it raises SIGBUS. The remainder stays as the arena's own
+            // anonymous memory, which reads as zero the way Linux's partial last page does.
+            struct stat info {};
+            if (fstat(file->host_fd, &info) == 0) {
+                const uint64_t size_on_disk = static_cast<uint64_t>(info.st_size);
+                const uint64_t after_offset = size_on_disk > static_cast<uint64_t>(offset)
+                                                  ? size_on_disk - static_cast<uint64_t>(offset)
+                                                  : 0;
+                rounded = std::min(rounded, (after_offset + host_page - 1) & ~(host_page - 1));
+            }
+
             int host_protection = PROT_READ;
             if ((protection & guest::kProtWrite) != 0) {
                 host_protection |= PROT_WRITE;
             }
-            void* mapped = mmap(reinterpret_cast<void*>(placed), rounded, host_protection,
-                                MAP_FIXED | MAP_SHARED, file->host_fd, static_cast<off_t>(offset));
+            void* mapped = rounded == 0
+                               ? MAP_FAILED
+                               : mmap(reinterpret_cast<void*>(placed), rounded, host_protection,
+                                      MAP_FIXED | MAP_SHARED, file->host_fd,
+                                      static_cast<off_t>(offset));
             if (mapped != MAP_FAILED) {
                 // The table's lock is already held by the block this sits in.
                 shared_->mappings.emplace_back(placed, length);
@@ -2479,7 +2501,7 @@ uint64_t LinuxSyscalls::DoEpollWait(int epoll_fd, uint64_t events_address, int m
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
     for (;;) {
-        if (console_.StopRequested()) {
+        if (ShouldStop()) {
             exit_status_ = -1;
             control_.ExitGuest(-1);
         }
@@ -2963,7 +2985,7 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
 
     console_.NoteSyscall();
 
-    if (console_.StopRequested()) {
+    if (ShouldStop()) {
         // Every syscall is a safe point to unwind from, which is what makes "stop" feel
         // immediate for anything that talks to the outside world at all.
         exit_status_ = -1;
@@ -3689,6 +3711,52 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return 0;
     }
 
+    case kSysWaitid: {
+        // waitid says the same thing as wait4 and reports it differently: the result comes
+        // back in a siginfo rather than in a status word and a return value.
+        constexpr uint64_t kPAll = 0;
+        constexpr uint64_t kPPid = 1;
+        constexpr int kWNoHang = 1;
+        if (host_ == nullptr) {
+            return FailLinux(38);
+        }
+        if (arg1 != kPAll && arg1 != kPPid) {
+            return FailLinux(22); // Process groups are not a thing here.
+        }
+
+        int status = 0;
+        const int wanted = arg1 == kPAll ? -1 : static_cast<int>(arg2);
+        const int options = (static_cast<int>(arg4) & kWNoHang) != 0 ? kWNoHang : 0;
+        const int64_t reaped = host_->WaitForChild(pid_, wanted, &status, options);
+        if (reaped < 0) {
+            return static_cast<uint64_t>(reaped);
+        }
+
+        if (arg3 != 0) {
+            // siginfo_t is 128 bytes on both architectures, but the fields after si_code
+            // sit at different offsets: an i386 guest has no padding before them.
+            auto* out = static_cast<unsigned char*>(GuestPointer(arg3, 128, true));
+            if (out == nullptr) {
+                return FailLinux(14);
+            }
+            std::memset(out, 0, 128);
+            const size_t fields = config_.guest_is_32bit ? 12 : 16;
+            const auto put = [&](size_t offset, int32_t value) {
+                std::memcpy(out + offset, &value, 4);
+            };
+            constexpr int32_t kSigchld = 17;
+            constexpr int32_t kCldExited = 1;
+            put(0, kSigchld);              // si_signo
+            put(8, kCldExited);            // si_code
+            put(fields, static_cast<int32_t>(reaped));       // si_pid
+            put(fields + 4, 1000);                           // si_uid
+            put(fields + 8, (status >> 8) & 0xFF);           // si_status: the exit code
+        }
+        // WNOWAIT would mean "leave the child reapable"; nothing here asks for it, and
+        // the child has already been reaped by the call above.
+        return 0;
+    }
+
     case kSysSchedSetaffinity:
         // Accepted and ignored: guest threads are host threads, and which core they run
         // on is the host scheduler's business. Refusing it is not a neutral answer -- a
@@ -3777,7 +3845,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             }
             const uint64_t seen = FutexQueue().generation;
             for (;;) {
-                if (console_.StopRequested()) {
+                if (ShouldStop()) {
                     lock.unlock();
                     exit_status_ = -1;
                     control_.ExitGuest(-1);

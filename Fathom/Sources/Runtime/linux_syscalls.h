@@ -165,6 +165,18 @@ public:
     void RequestStop() { console_.RequestStop(); }
     bool StopRequested() const { return console_.StopRequested(); }
 
+    /// Asks the threads of *this* process to stop, without touching any other process.
+    /// A process whose first thread has returned has to bring its others back before it
+    /// can be destroyed: they are still inside the JIT holding references to state that
+    /// goes away with it.
+    void RequestProcessStop() { process_stopping_->store(true, std::memory_order_release); }
+
+    /// What every blocking loop here waits on: either the session stopping or this
+    /// process stopping.
+    bool ShouldStop() const {
+        return console_.StopRequested() || process_stopping_->load(std::memory_order_acquire);
+    }
+
     uint64_t SyscallCount() const { return console_.SyscallCount(); }
     int ExitStatus() const { return exit_status_; }
 
@@ -352,6 +364,9 @@ private:
     ProcessHost* host_ {};
 
     std::shared_ptr<ProcessFiles> shared_;
+
+    /// Shared by the threads of one process, and by nothing else: a fork gets its own.
+    std::shared_ptr<std::atomic<bool>> process_stopping_;
 
     /// Per-process: what this process passed to exit, and where set_tid_address pointed.
     int exit_status_ {};

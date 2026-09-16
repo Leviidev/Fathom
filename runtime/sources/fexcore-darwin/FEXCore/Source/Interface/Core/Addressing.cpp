@@ -48,6 +48,21 @@ Ref LoadEffectiveAddress(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPR
     Tmp = Tmp ? IREmit->Add(GPRSize, Tmp, A.Segment) : A.Segment;
   }
 
+  // A relocated 32-bit guest. Everything above computed an address in the guest's own
+  // 32-bit world; this turns it into the host address that actually holds those bytes.
+  //
+  // The zero-extend is not optional. With a 32-bit GPR size the value in Tmp is only
+  // defined in its low 32 bits -- FEX deliberately allows garbage above them -- so adding
+  // a 64-bit base to it without clearing the top half lands somewhere arbitrary.
+  //
+  // This is the single place it has to happen: for a 32-bit guest every path through
+  // SelectAddressMode takes its base from here, the one that does not being guarded by
+  // !Is32Bit.
+  if (IREmit->GuestMemoryBase != 0 && GPRSize == OpSize::i32Bit) {
+    Ref GuestAddress = Tmp ? IREmit->_Bfe(OpSize::i64Bit, 32, 0, Tmp) : IREmit->Constant(0);
+    return IREmit->Add(OpSize::i64Bit, GuestAddress, IREmit->Constant(IREmit->GuestMemoryBase));
+  }
+
   return Tmp ?: IREmit->Constant(0);
 }
 

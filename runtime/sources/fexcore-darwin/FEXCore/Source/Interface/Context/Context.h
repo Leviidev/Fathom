@@ -391,6 +391,16 @@ public:
 public:
   struct {
     uint64_t VirtualMemSize {1ULL << 36};
+
+    // Where a 32-bit guest's address space actually lives in the host's.
+    //
+    // A 32-bit guest's pointers are 32 bits, so with a 1:1 mapping its memory has to sit
+    // below 4GB. On Darwin nothing can: the kernel demands a full 4GB __PAGEZERO and
+    // kills any process that asks for less. Placing the guest higher and adding this base
+    // to every guest address is what makes 32-bit possible there at all.
+    //
+    // Zero means 1:1, which is what every 64-bit guest uses and what this was before.
+    uint64_t GuestMemoryBase {0};
     uint64_t TSCScale = 0;
 
     // Used if the JIT needs to have its interrupt fault code emitted.

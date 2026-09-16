@@ -19,6 +19,10 @@ namespace FEXCore::IR {
 
 class IREmitter {
 public:
+  /// Mirrors Context::Config::GuestMemoryBase so address generation can reach it without
+  /// every helper having to be handed the context. Zero for a 1:1 guest.
+  uint64_t GuestMemoryBase {0};
+
   IREmitter(FEXCore::Utils::IntrusivePooledAllocator& ThreadAllocator, bool SupportsTSOImm9)
     : DualListData {ThreadAllocator, 8 * 1024 * 1024}
     , SupportsTSOImm9(SupportsTSOImm9) {}

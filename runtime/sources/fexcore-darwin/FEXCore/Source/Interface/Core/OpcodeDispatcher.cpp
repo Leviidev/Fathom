@@ -3995,6 +3995,8 @@ void OpDispatchBuilder::BeginFunction(uint64_t RIP, const fextl::vector<FEXCore:
                                       uint32_t NumInstructions, bool _Is64BitMode, bool MonoBackpatcherBlock) {
   Entry = RIP;
   Is64BitMode = _Is64BitMode;
+  // Picked up here rather than passed around: every address this builder emits needs it.
+  GuestMemoryBase = CTX->Config.GuestMemoryBase;
   LOGMAN_THROW_A_FMT(Is64BitMode == CTX->Config.Is64BitMode, "Expected operating mode to not change at runtime!");
   IsMonoBackpatcherBlock = MonoBackpatcherBlock;
   auto IRHeader = _IRHeader(InvalidNode, RIP, 0, NumInstructions, 0, 0);

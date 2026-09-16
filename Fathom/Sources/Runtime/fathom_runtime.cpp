@@ -369,6 +369,8 @@ struct fathom_session final : fathom::ProcessHost {
     /// The same for one process's threads, which has to happen before that process can be
     /// destroyed -- its threads hold references to everything it owns.
     void StopAndJoinThreadsOf(GuestProcess* process);
+    /// The same, but leaving the thread that asked -- which is what execve needs.
+    void StopAndJoinOtherThreadsOf(GuestProcess* process);
     void JoinFinishedChildren();
     void ReleaseParent(GuestProcess* process);
 
@@ -475,6 +477,30 @@ fathom::RunResult fathom_session::RunProcess(GuestProcess* process) {
         }
     }
     return result;
+}
+
+void fathom_session::StopAndJoinOtherThreadsOf(GuestProcess* process) {
+    if (process->threads.empty()) {
+        return;
+    }
+    // execve on Linux ends every other thread in the thread group before the new image is
+    // loaded, and that is not a detail: the old image's stack and heap are released here,
+    // and a thread still running on them reads whatever the arena hands out next. It
+    // surfaces as a thread whose stack pointer has walked off the bottom of the address
+    // space, a long way from the exec that caused it.
+    const pthread_t self = pthread_self();
+    process->syscalls->RequestProcessStop();
+    process_changed.notify_all();
+    for (auto& thread : process->threads) {
+        if (thread->started && !pthread_equal(thread->host_thread, self)) {
+            pthread_join(thread->host_thread, nullptr);
+            thread->started = false;
+        }
+    }
+    // The flag is shared with the thread that is doing the exec, which is still inside a
+    // syscall and has not looked at it yet. Cleared before it does.
+    process->syscalls->ClearProcessStop();
+    process->threads.clear();
 }
 
 void fathom_session::StopAndJoinThreadsOf(GuestProcess* process) {
@@ -977,6 +1003,9 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& path,
             }
         }
     }
+
+    // Before anything is loaded or released: the threads of the image being replaced.
+    StopAndJoinOtherThreadsOf(process);
 
     // exec is where a process's word size is decided, and it need not match the one that
     // called it: Steam's client is i386 and the process that draws its interface is

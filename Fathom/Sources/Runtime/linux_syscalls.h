@@ -184,6 +184,7 @@ public:
     /// can be destroyed: they are still inside the JIT holding references to state that
     /// goes away with it.
     void RequestProcessStop() { process_stopping_->store(true, std::memory_order_release); }
+    void ClearProcessStop() { process_stopping_->store(false, std::memory_order_release); }
 
     /// What every blocking loop here waits on: either the session stopping or this
     /// process stopping.

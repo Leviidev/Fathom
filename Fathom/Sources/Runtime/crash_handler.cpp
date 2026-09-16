@@ -34,6 +34,9 @@ std::atomic<uint64_t> g_last_syscall {UINT64_MAX};
 // Per host thread, so that the handler -- which runs on the thread that faulted -- can
 // say who it was. A plain char buffer rather than a std::string: this is read from a
 // signal handler, where allocating is not allowed.
+thread_local uint64_t t_last_syscall = UINT64_MAX;
+thread_local uint64_t t_last_syscall_arg = 0;
+thread_local uint64_t t_last_rip = 0;
 thread_local int t_pid = 0;
 thread_local int t_tid = 0;
 thread_local bool t_is_32bit = false;
@@ -157,20 +160,27 @@ void Handle(int number, siginfo_t* info, void* context) {
     WriteText("\nguest syscalls so far: ");
     WriteDecimal(g_syscall_count.load(std::memory_order_relaxed));
 
+    // This thread's own history first. The global figures below are every thread's put
+    // together, which is the wrong question to answer about a crash.
+    if (t_last_syscall != UINT64_MAX) {
+        WriteText("\nlast syscall on this thread: ");
+        WriteDecimal(t_last_syscall);
+        WriteText(" arg0=");
+        WriteHex(t_last_syscall_arg);
+    } else {
+        WriteText("\nlast syscall on this thread: none");
+    }
+    if (t_last_rip != 0) {
+        WriteText("\nlast guest RIP on this thread: ");
+        WriteHex(t_last_rip);
+    }
+
     const uint64_t last = g_last_syscall.load(std::memory_order_relaxed);
     if (last != UINT64_MAX) {
-        WriteText("\nlast guest syscall: ");
+        WriteText("\nlast guest syscall anywhere: ");
         WriteDecimal(last);
         WriteText(" arg0=");
         WriteHex(g_last_syscall_arg.load(std::memory_order_relaxed));
-    } else {
-        WriteText("\nlast guest syscall: none (died before the guest made one)");
-    }
-
-    const uint64_t rip = g_last_guest_rip.load(std::memory_order_relaxed);
-    if (rip != 0) {
-        WriteText("\nlast known guest RIP: ");
-        WriteHex(rip);
     }
     WriteText("\n=== END ===\n");
 
@@ -241,12 +251,15 @@ void SetGuestStateDescriber(GuestStateDescriber describer) {
 }
 
 void NoteSyscall(uint64_t number, uint64_t first_argument, uint64_t count) {
+    t_last_syscall = number;
+    t_last_syscall_arg = first_argument;
     g_last_syscall.store(number, std::memory_order_relaxed);
     g_last_syscall_arg.store(first_argument, std::memory_order_relaxed);
     g_syscall_count.store(count, std::memory_order_relaxed);
 }
 
 void NoteGuestRip(uint64_t rip) {
+    t_last_rip = rip;
     g_last_guest_rip.store(rip, std::memory_order_relaxed);
 }
 

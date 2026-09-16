@@ -842,6 +842,9 @@ void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
         inherited.is_framebuffer = file.is_framebuffer;
         inherited.event = file.event;
         inherited.epoll = file.epoll;
+        inherited.is_timer = file.is_timer;
+        inherited.timer_interval_ns = file.timer_interval_ns;
+        inherited.timer_value_ns = file.timer_value_ns;
 
         if (file.host_fd >= 0) {
             inherited.host_fd = dup(file.host_fd);
@@ -2479,8 +2482,9 @@ bool LinuxSyscalls::IsProcSelfExe(const std::string& path) const {
 
 uint64_t LinuxSyscalls::DoSetThreadArea(uint64_t descriptor_address) {
     // struct user_desc: entry_number, base_addr, limit, then a word of bit fields
-    // describing the segment. Only the first three matter here -- Fathom always installs
-    // a 32-bit read/write data segment, which is the only kind glibc asks for.
+    // describing the segment. Fathom always installs a 32-bit read/write data segment,
+    // which is the only kind glibc asks for; of the bit fields only limit_in_pages
+    // changes what the limit means.
     auto* descriptor = static_cast<uint32_t*>(GuestPointer(descriptor_address, 16, true));
     if (descriptor == nullptr) {
         return FailLinux(14);
@@ -2499,7 +2503,13 @@ uint64_t LinuxSyscalls::DoSetThreadArea(uint64_t descriptor_address) {
         return FailLinux(22);
     }
 
-    control_.SetTlsDescriptor(static_cast<int>(entry), descriptor[1], descriptor[2] >> 12);
+    // The limit is in bytes unless the limit_in_pages bit says it is already in pages,
+    // and glibc sets that bit with a limit of 0xfffff -- the whole address space. Shifting
+    // it down regardless turned that into 0xff, a segment of one megabyte.
+    constexpr uint32_t kLimitInPages = 1u << 4;
+    const uint32_t limit = (descriptor[3] & kLimitInPages) != 0 ? descriptor[2]
+                                                                : descriptor[2] >> 12;
+    control_.SetTlsDescriptor(static_cast<int>(entry), descriptor[1], limit);
     return 0;
 }
 

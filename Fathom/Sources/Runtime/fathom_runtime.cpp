@@ -604,8 +604,9 @@ void* RunGuestThread(void* raw) {
     // with and wake whoever is waiting on it, which is how pthread_join returns.
     start->record->syscalls->ReleaseThreadId();
     start->record->finished.store(true, std::memory_order_release);
-    FATHOM_INFO("tid %d: finished (%s, status %d)", start->record->tid, result.message.c_str(),
-                result.status);
+    FATHOM_INFO("tid %d: finished (%s, status %d, rip=%#llx)", start->record->tid,
+                result.message.c_str(), result.status,
+                static_cast<unsigned long long>(result.rip));
     return nullptr;
 }
 
@@ -704,8 +705,11 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
                 auto* descriptor = reinterpret_cast<uint32_t*>(tls + process->guest_base);
                 if (space->Validate(tls + process->guest_base, 16, fathom::kGuestProtRead)) {
                     const uint32_t entry = descriptor[0] == 0xFFFF'FFFFU ? 12 : descriptor[0];
-                    record->control->SetTlsDescriptor(static_cast<int>(entry), descriptor[1],
-                                                      descriptor[2] >> 12);
+                    constexpr uint32_t kLimitInPages = 1u << 4;
+                    const uint32_t limit = (descriptor[3] & kLimitInPages) != 0
+                                               ? descriptor[2]
+                                               : descriptor[2] >> 12;
+                    record->control->SetTlsDescriptor(static_cast<int>(entry), descriptor[1], limit);
                 }
             } else {
                 record->control->SetFsBase(tls);
@@ -1192,7 +1196,14 @@ void fathom_session_config_defaults(fathom_session_config* config) {
     config->stack_size = kDefaultStack;
     config->max_inst_per_block = 0; // Keep FEXCore's own default.
     config->multiblock = true;
-    config->tso_enabled = true;
+    // Off, as the app has always had it. Emulating x86's memory ordering means every
+    // ordinary guest load and store becomes an acquire or release, and those require
+    // natural alignment on ARM64 while x86 does not -- so every unaligned guest access
+    // raises SIGBUS and has to be emulated by hand. Steam's client spends more than nine
+    // tenths of its time in that handler with this on. What it buys is stricter ordering
+    // for a guest whose threads race on shared memory, which is a real thing to lose, but
+    // not at this price.
+    config->tso_enabled = false;
     config->reduced_precision_x87 = false;
     config->trace_syscalls = false;
 }

@@ -77,7 +77,7 @@ void Usage() {
                  "  --cwd DIR      guest-absolute starting directory (default \"/\")\n"
                  "  --env K=V      add an environment variable (repeatable)\n"
                  "  --trace        log every guest syscall\n"
-                 "  --no-tso       disable x86 memory-ordering emulation (for debugging)\n"
+                 "  --tso          emulate x86 memory ordering (every unaligned access then faults)\n"
                  "  --arena MB     guest address space reservation\n"
                  "\n"
                  "The program path is guest-absolute when --root is given, so\n"
@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
     std::string cwd = "/";
     std::vector<std::string> env;
     bool trace = false;
-    bool tso = true;
+    bool tso = false;
     bool multiblock = true;
     bool avx = true;
     uint64_t arena_mb = 0;
@@ -114,12 +114,14 @@ int main(int argc, char** argv) {
             multiblock = false;
         } else if (option == "--no-avx") {
             avx = false;
-        } else if (option == "--no-tso") {
-            // Emulating x86's memory ordering makes FEX emit store-release everywhere,
-            // and every unaligned one is a recoverable fault. Harmless in normal running,
-            // but a debugger stops on each of them, which buries any real crash. Turning
-            // it off is how you get a clean run under lldb.
-            tso = false;
+        } else if (option == "--tso") {
+            // Emulating x86's memory ordering makes FEX emit acquire and release for
+            // every guest load and store, and those require natural alignment on ARM64
+            // while x86 permits none. Every unaligned guest access then raises SIGBUS and
+            // is emulated by hand -- Steam's client spends over ninety per cent of its
+            // time in that handler. Off by default for that reason, and on here only when
+            // a guest's threads are racing in a way that needs the stricter ordering.
+            tso = true;
         } else if (option == "--arena" && index + 1 < argc) {
             arena_mb = std::strtoull(argv[++index], nullptr, 10);
         } else if (option == "--help" || option == "-h") {

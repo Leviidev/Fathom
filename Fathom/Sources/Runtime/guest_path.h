@@ -20,7 +20,13 @@ namespace fathom {
 ///
 /// A path that does not exist is still mapped, so the caller's own open() reports the
 /// error rather than this having to invent one.
-std::string ResolveGuestPathOnHost(const std::string& guest_root, const std::string& guest_path);
+/// `follow_final` false stops at the last component instead of following it, which is
+/// what every operation that acts on a symlink *itself* needs: unlink, lstat, rename,
+/// readlink and creating a link where one already exists. Following it there deletes or
+/// inspects whatever the link points at instead of the link, and a program removing a
+/// directory tree then finds the tree still full of links it thought it had deleted.
+std::string ResolveGuestPathOnHost(const std::string& guest_root, const std::string& guest_path,
+                                   bool follow_final = true);
 
 /// The inverse, for a host path already known to sit inside the guest root: the guest-
 /// absolute path it corresponds to, or an empty string if it is not inside the root.

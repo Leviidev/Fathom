@@ -266,8 +266,9 @@ private:
 
     // Path handling.
     std::string NormaliseGuestPath(const std::string& path) const;
-    std::string ResolveGuestPath(const std::string& path) const;
-    std::string ResolveAt(int dirfd, const char* path, std::string* guest_path_out);
+    std::string ResolveGuestPath(const std::string& path, bool follow_final = true) const;
+    std::string ResolveAt(int dirfd, const char* path, std::string* guest_path_out,
+                          bool follow_final = true);
 
     // Guest memory helpers. Every pointer a guest hands over is checked before use --
     // a wild guest pointer must fail the syscall, not fault the whole app.
@@ -302,6 +303,8 @@ private:
     uint64_t DoUname(uint64_t address);
     uint64_t DoSetThreadArea(uint64_t descriptor_address);
     uint64_t DoSocketcall(uint64_t call, uint64_t arguments_address);
+    uint64_t DoLlseek(int fd, uint32_t offset_high, uint32_t offset_low, uint64_t result_address,
+                      int whence);
     /// Translates a guest socket address, resolving a unix socket's path against the
     /// guest root. Returns 0 and sets errno on failure.
     uint32_t ToHostSocketAddress(const void* guest_address, uint64_t guest_length,

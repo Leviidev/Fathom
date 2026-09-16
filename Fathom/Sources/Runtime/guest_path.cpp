@@ -42,7 +42,8 @@ std::string Join(const std::string& root, const std::vector<std::string>& parts)
 
 } // namespace
 
-std::string ResolveGuestPathOnHost(const std::string& guest_root, const std::string& guest_path) {
+std::string ResolveGuestPathOnHost(const std::string& guest_root, const std::string& guest_path,
+                                   bool follow_final) {
     if (guest_root.empty()) {
         return guest_path;
     }
@@ -67,6 +68,13 @@ std::string ResolveGuestPathOnHost(const std::string& guest_root, const std::str
         }
 
         resolved.push_back(part);
+
+        // The last component, when the caller is operating on the link rather than
+        // through it.
+        if (!follow_final && pending.empty()) {
+            break;
+        }
+
         const std::string host = Join(guest_root, resolved);
 
         struct stat info {};

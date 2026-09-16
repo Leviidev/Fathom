@@ -290,6 +290,7 @@ enum : uint64_t {
     kSysGetRobustList = 274,
     kSysPrctl = 157,
     kSysSemget = 64,
+    kSysSchedSetaffinity = 203,
     kSysRecvmmsg = 299,
     kSysSendmmsg = 307,
     kSysGetitimer = 36,
@@ -654,6 +655,7 @@ const char* SyscallName(uint64_t number) {
     case kSysPipe2: return "pipe2";
     case kSysPrctl: return "prctl";
     case kSysSemget: return "semget";
+    case kSysSchedSetaffinity: return "sched_setaffinity";
     case kSysRecvmmsg: return "recvmmsg";
     case kSysSendmmsg: return "sendmmsg";
     case kSysGetitimer: return "getitimer";
@@ -927,7 +929,7 @@ std::string LinuxSyscalls::NormaliseGuestPath(const std::string& path) const {
     return normalised.empty() ? "/" : normalised;
 }
 
-std::string LinuxSyscalls::ResolveGuestPath(const std::string& path) const {
+std::string LinuxSyscalls::ResolveGuestPath(const std::string& path, bool follow_final) const {
     const std::string guest_path = NormaliseGuestPath(path);
 
     // The character devices every Unix program assumes exist. A minirootfs ships no /dev
@@ -945,10 +947,11 @@ std::string LinuxSyscalls::ResolveGuestPath(const std::string& path) const {
     // Not a plain concatenation: a symlink inside the root may point at an absolute
     // path, which means absolute *in the guest*, and the host would resolve it against
     // its own root and find nothing.
-    return ResolveGuestPathOnHost(config_.guest_root, guest_path);
+    return ResolveGuestPathOnHost(config_.guest_root, guest_path, follow_final);
 }
 
-std::string LinuxSyscalls::ResolveAt(int dirfd, const char* path, std::string* guest_path_out) {
+std::string LinuxSyscalls::ResolveAt(int dirfd, const char* path, std::string* guest_path_out,
+                                     bool follow_final) {
     std::string request = path == nullptr ? std::string {} : std::string {path};
     if (!request.empty() && request.front() != '/' && dirfd != guest::kAtFdCwd) {
         std::scoped_lock lock {shared_->mutex};
@@ -961,7 +964,7 @@ std::string LinuxSyscalls::ResolveAt(int dirfd, const char* path, std::string* g
     if (guest_path_out != nullptr) {
         *guest_path_out = guest_path;
     }
-    return ResolveGuestPath(guest_path);
+    return ResolveGuestPath(guest_path, follow_final);
 }
 
 // ---------------------------------------------------------------------------
@@ -1733,9 +1736,9 @@ uint64_t LinuxSyscalls::DoStatAt(int dirfd, uint64_t path_address, uint64_t stat
             result = fstat(host_fd, &host);
         }
     } else {
-        const std::string host_path = ResolveAt(dirfd, path.c_str(), nullptr);
-        result = (flags & guest::kAtSymlinkNoFollow) != 0 ? lstat(host_path.c_str(), &host)
-                                                          : stat(host_path.c_str(), &host);
+        const bool follow = (flags & guest::kAtSymlinkNoFollow) == 0;
+        const std::string host_path = ResolveAt(dirfd, path.c_str(), nullptr, follow);
+        result = follow ? stat(host_path.c_str(), &host) : lstat(host_path.c_str(), &host);
     }
     if (result != 0) {
         return Fail(errno);
@@ -2098,7 +2101,9 @@ uint64_t LinuxSyscalls::DoReadlinkAt(int dirfd, uint64_t path_address, uint64_t 
     }
 
     std::string guest_path;
-    const std::string host_path = ResolveAt(dirfd, path.c_str(), &guest_path);
+    // The link itself, not what it points at -- otherwise readlink is handed a regular
+    // file and reports EINVAL for every symlink in the tree.
+    const std::string host_path = ResolveAt(dirfd, path.c_str(), &guest_path, false);
 
     // NormaliseGuestPath has already turned /proc/self/exe into the program's own path,
     // so what arrives here is the answer -- the link just has to report it rather than
@@ -2200,6 +2205,32 @@ uint64_t LinuxSyscalls::DoMultiMessage(int fd, uint64_t vector_address, uint64_t
         ++done;
     }
     return done;
+}
+
+uint64_t LinuxSyscalls::DoLlseek(int fd, uint32_t offset_high, uint32_t offset_low,
+                                 uint64_t result_address, int whence) {
+    // i386's answer to a 32-bit off_t: the offset arrives split across two registers and
+    // the result comes back through a pointer rather than in the return value. Handed to
+    // lseek unchanged -- which is what merely renumbering it to lseek does -- the high
+    // half becomes the offset and the low half becomes the whence, and every seek fails
+    // with EINVAL. A program reading an archive then produces nothing and reports no error
+    // of its own, which is exactly what Steam's installer did.
+    const int host_fd = HostFdFor(fd);
+    if (host_fd < 0) {
+        return IsConsole(fd) ? FailLinux(29) : FailLinux(9); // ESPIPE for a terminal.
+    }
+    const int64_t offset =
+        (static_cast<int64_t>(static_cast<int32_t>(offset_high)) << 32) | offset_low;
+    const off_t placed = lseek(host_fd, static_cast<off_t>(offset), whence);
+    if (placed < 0) {
+        return Fail(errno);
+    }
+    auto* out = static_cast<int64_t*>(GuestPointer(result_address, sizeof(int64_t), true));
+    if (out == nullptr) {
+        return FailLinux(14);
+    }
+    *out = placed;
+    return 0;
 }
 
 uint64_t LinuxSyscalls::DoSocketcall(uint64_t call, uint64_t arguments_address) {
@@ -2899,6 +2930,12 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
         if (number == kI386Socketcall) {
             return DoSocketcall(arg1, arg2);
         }
+        if (number == kI386Llseek) {
+            console_.NoteSyscall();
+            NoteSyscall(number, arg1, console_.SyscallCount());
+            return DoLlseek(static_cast<int>(arg1), static_cast<uint32_t>(arg2),
+                            static_cast<uint32_t>(arg3), arg4, static_cast<int>(arg5));
+        }
         if (number == kI386Ipc) {
             return DoIpc(arg1, arg2, arg3, arg4, arg5);
         }
@@ -2955,7 +2992,8 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
         // meant to be absent -- are the only ones worth leaving out.
         const auto failed = static_cast<int64_t>(result);
         if (failed < 0 && failed > -4096 && failed != -11 && failed != -2 && failed != -17) {
-            FATHOM_INFO("[pid %d] %s(%#llx, %#llx, %#llx) failed: errno %lld", pid_,
+            FATHOM_INFO("[pid %d] %llu %s(%#llx, %#llx, %#llx) failed: errno %lld", pid_,
+                        static_cast<unsigned long long>(number),
                         SyscallName(number), static_cast<unsigned long long>(arg1),
                         static_cast<unsigned long long>(arg2),
                         static_cast<unsigned long long>(arg3), static_cast<long long>(-failed));
@@ -3020,7 +3058,13 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (file == nullptr) {
             return FailLinux(9);
         }
-        const off_t position = lseek(file->host_fd, static_cast<off_t>(arg2), static_cast<int>(arg3));
+        // An i386 guest's off_t is 32 bits and arrives in a register whose upper half is
+        // not defined, so it has to be taken as a signed 32-bit value. Read as 64 bits, a
+        // backwards seek becomes an enormous forwards one and the call fails.
+        const off_t offset = config_.guest_is_32bit
+                                 ? static_cast<off_t>(static_cast<int32_t>(arg2))
+                                 : static_cast<off_t>(arg2);
+        const off_t position = lseek(file->host_fd, offset, static_cast<int>(arg3));
         return position < 0 ? Fail(errno) : static_cast<uint64_t>(position);
     }
 
@@ -3297,8 +3341,11 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (!ReadGuestString(is_at ? arg2 : arg1, &path)) {
             return FailLinux(14);
         }
+        // Not followed: unlink removes the link, not what it points at. Resolving through
+        // it deletes the target and leaves the link behind, so a directory being emptied
+        // never empties and its rmdir fails with ENOTEMPTY for ever after.
         const std::string host_path = ResolveAt(is_at ? static_cast<int>(arg1) : guest::kAtFdCwd,
-                                                path.c_str(), nullptr);
+                                                path.c_str(), nullptr, false);
         const bool remove_directory = is_at && (arg3 & 0x200) != 0; // AT_REMOVEDIR
         const int result = remove_directory ? rmdir(host_path.c_str()) : unlink(host_path.c_str());
         return result == 0 ? 0 : Fail(errno);
@@ -3641,6 +3688,13 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         std::memcpy(out + width, &hard, width);
         return 0;
     }
+
+    case kSysSchedSetaffinity:
+        // Accepted and ignored: guest threads are host threads, and which core they run
+        // on is the host scheduler's business. Refusing it is not a neutral answer -- a
+        // worker pool that cannot pin its threads treats that as a setup failure and
+        // stops, which is how Steam's update applier ends without a word.
+        return 0;
 
     case kSysSchedGetaffinity: {
         void* out = GuestPointer(arg3, arg2, true);
@@ -4250,8 +4304,10 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             !ReadGuestString(new_path_address, &new_path)) {
             return FailLinux(14);
         }
-        const std::string from = ResolveAt(old_dirfd, old_path.c_str(), nullptr);
-        const std::string to = ResolveAt(new_dirfd, new_path.c_str(), nullptr);
+        // Neither side is followed: rename moves the link, not what it points at, and
+        // moving a staged file onto an existing symlink has to replace the link.
+        const std::string from = ResolveAt(old_dirfd, old_path.c_str(), nullptr, false);
+        const std::string to = ResolveAt(new_dirfd, new_path.c_str(), nullptr, false);
         if ((flags & kRenameNoreplace) != 0 && access(to.c_str(), F_OK) == 0) {
             return FailLinux(17); // EEXIST
         }
@@ -4270,7 +4326,8 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         }
         // The target is stored exactly as given: it is resolved later, by the guest,
         // against the guest's root.
-        return symlink(target.c_str(), ResolveAt(dirfd, link_path.c_str(), nullptr).c_str()) != 0
+        return symlink(target.c_str(),
+                       ResolveAt(dirfd, link_path.c_str(), nullptr, false).c_str()) != 0
                    ? Fail(errno)
                    : 0;
     }

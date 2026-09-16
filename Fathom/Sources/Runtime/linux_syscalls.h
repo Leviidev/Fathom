@@ -121,6 +121,11 @@ public:
     uint64_t SyscallCount() const { return console_.SyscallCount(); }
     int ExitStatus() const { return exit_status_; }
 
+    /// What this process has mapped, so a fork knows which of the arena's writable
+    /// regions belong to it. The arena is shared by every process, so asking it directly
+    /// would sweep up the memory of unrelated ones.
+    std::vector<std::pair<uint64_t, uint64_t>> Mappings() const;
+
     /// How far brk has grown: the part of the heap a fork actually has to preserve.
     uint64_t HeapBreak() const { return heap_break_; }
 
@@ -193,6 +198,9 @@ private:
     GuestThreadControl& control_;
     GuestConsole& console_;
     SyscallConfig config_;
+
+    /// Address and length of each live mmap this process made.
+    std::vector<std::pair<uint64_t, uint64_t>> mappings_;
 
     int pid_ {1};
     int ppid_ {0};

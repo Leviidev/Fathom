@@ -88,6 +88,12 @@ public:
     /// QueryGuestExecutableRange, which it asks before compiling a block.
     bool RangeFor(uint64_t address, GuestRange* out) const;
 
+    /// Every committed range the guest can write to. A fork uses this to know what it has
+    /// to preserve on the parent's behalf: the image and the stack are only part of it,
+    /// and a libc that allocates through mmap rather than brk keeps its heap somewhere
+    /// this is the only way to find.
+    std::vector<GuestRange> WritableRanges() const;
+
     std::vector<GuestRange> Snapshot() const;
 
     uint64_t CommittedBytes() const;

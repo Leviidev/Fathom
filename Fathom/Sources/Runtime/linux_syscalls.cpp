@@ -773,6 +773,11 @@ LinuxSyscalls::OpenFile* LinuxSyscalls::FindFile(int fd) {
     return entry == files_.end() ? nullptr : &entry->second;
 }
 
+std::vector<std::pair<uint64_t, uint64_t>> LinuxSyscalls::Mappings() const {
+    std::scoped_lock lock {mutex_};
+    return mappings_;
+}
+
 int LinuxSyscalls::AllocateFd() {
     int fd = 0;
     while (files_.count(fd) != 0) {
@@ -1520,6 +1525,10 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
     if ((guest_protection & kGuestProtWrite) == 0) {
         space_.Protect(placed, length, guest_protection);
     }
+    {
+        std::scoped_lock lock {mutex_};
+        mappings_.emplace_back(placed, length);
+    }
     return placed;
 }
 
@@ -1778,8 +1787,15 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return DoMmap(arg1, arg2, static_cast<int>(arg3), static_cast<int>(arg4),
                       static_cast<int>(arg5), static_cast<int64_t>(arg6));
 
-    case kSysMunmap:
+    case kSysMunmap: {
+        {
+            std::scoped_lock lock {mutex_};
+            std::erase_if(mappings_, [&](const auto& entry) {
+                return entry.first >= arg1 && entry.first + entry.second <= arg1 + arg2;
+            });
+        }
         return space_.Release(arg1, arg2) ? 0 : FailLinux(22);
+    }
 
     case kSysMprotect: {
         int guest_protection = 0;

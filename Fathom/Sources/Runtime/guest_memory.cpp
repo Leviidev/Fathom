@@ -297,6 +297,18 @@ bool GuestAddressSpace::Protect(uint64_t address, uint64_t size, int protection)
     return true;
 }
 
+std::vector<GuestRange> GuestAddressSpace::WritableRanges() const {
+    std::scoped_lock lock {mutex_};
+    std::vector<GuestRange> writable;
+    writable.reserve(committed_.size());
+    for (const auto& range : committed_) {
+        if ((range.protection & kGuestProtWrite) != 0) {
+            writable.push_back(range);
+        }
+    }
+    return writable;
+}
+
 bool GuestAddressSpace::Contains(uint64_t address, uint64_t size) const {
     return address >= base_ && size <= size_ && address + size <= base_ + size_;
 }

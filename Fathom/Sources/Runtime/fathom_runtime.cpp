@@ -444,32 +444,61 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
                     static_cast<unsigned long long>(child->thread->Rax()));
 
         // Taken before the child runs a single instruction.
+        //
+        // Everything the parent can write to, not just its image and stack: a libc that
+        // allocates through mmap rather than brk keeps its heap in mappings that belong
+        // to no segment, and a child that allocates before exec quietly corrupts them.
+        // That is what a pipeline does -- the shell forks twice and allocates in each
+        // child -- and it showed up as a malloc assertion inside the parent afterwards.
+        //
+        // Two ranges are clamped because they are reserved far larger than they are used:
+        // the stack is only live above the stack pointer, and the heap only up to brk.
         uint64_t held = 0;
-        const auto hold = [&](uint64_t from, uint64_t to) {
+        const uint64_t stack_low = parent->program.stack.stack_base;
+        const uint64_t stack_top = stack_low + parent->program.stack.stack_size;
+        const uint64_t rsp = parent->thread->Rsp();
+        const uint64_t heap_low = parent->program.heap;
+        const uint64_t heap_used = parent->syscalls->HeapBreak();
+
+        const uint64_t heap_top = heap_low + kHeapReservation;
+        const auto overlaps = [](uint64_t a1, uint64_t a2, uint64_t b1, uint64_t b2) {
+            return a1 < b2 && b1 < a2;
+        };
+
+        // The parent's own regions only. The arena is shared, so asking it for every
+        // writable range sweeps in whatever sibling processes have mapped -- which on a
+        // pipeline's second fork meant copying the first child's entire 128MB heap.
+        std::vector<std::pair<uint64_t, uint64_t>> owned = parent->syscalls->Mappings();
+        owned.emplace_back(parent->program.image.image_begin,
+                           parent->program.image.image_end - parent->program.image.image_begin);
+        if (parent->program.dynamic) {
+            owned.emplace_back(parent->program.interpreter.image_begin,
+                               parent->program.interpreter.image_end - parent->program.interpreter.image_begin);
+        }
+        owned.emplace_back(stack_low, stack_top - stack_low);
+        owned.emplace_back(heap_low, kHeapReservation);
+
+        for (const auto& [owned_begin, owned_size] : owned) {
+            const fathom::GuestRange range {owned_begin, owned_size, 0};
+            uint64_t from = range.begin;
+            uint64_t to = range.end();
+
+            // Clamped to the part of the heap brk has actually handed out.
+            if (heap_low != 0 && overlaps(from, to, heap_low, heap_top)) {
+                from = std::max(from, heap_low);
+                to = std::min(to, std::max(heap_used, heap_low));
+            }
+            // Clamped to the live part of the stack, which grows down from the top.
+            if (overlaps(from, to, stack_low, stack_top)) {
+                from = std::max(from, rsp);
+                to = std::min(to, stack_top);
+            }
             if (to <= from) {
-                return;
+                continue;
             }
             const auto* bytes = reinterpret_cast<const uint8_t*>(from);
             child->borrowed.push_back({from, std::vector<uint8_t>(bytes, bytes + (to - from))});
             held += to - from;
-        };
-
-        // The live stack: everything from the parent's stack pointer up to the top.
-        const uint64_t rsp = parent->thread->Rsp();
-        const uint64_t stack_low = parent->program.stack.stack_base;
-        const uint64_t stack_top = stack_low + parent->program.stack.stack_size;
-        if (rsp >= stack_low && rsp < stack_top) {
-            hold(rsp, stack_top);
-        }
-        // The images, which is where the globals live.
-        hold(parent->program.image.image_begin, parent->program.image.image_end);
-        if (parent->program.dynamic) {
-            hold(parent->program.interpreter.image_begin, parent->program.interpreter.image_end);
-        }
-        // The part of the heap that has actually been handed out.
-        const uint64_t heap_used = parent->syscalls->HeapBreak();
-        if (heap_used > parent->program.heap) {
-            hold(parent->program.heap, heap_used);
         }
 
         FATHOM_INFO("fork: holding %llu KB of pid %d's memory while pid %d borrows it",

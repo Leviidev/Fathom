@@ -272,6 +272,46 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
 #endif
 }
 
+/// The guest thread this host thread is running, for the code that has only a signal
+/// context to go on.
+thread_local GuestThread* g_current_guest_thread = nullptr;
+
+/// Ends the guest process whose code just faulted, instead of the whole session.
+///
+/// A fault in guest code is the guest's own bug, and on Linux it kills that process and
+/// nothing else: the shell prints "Segmentation fault" and carries on, and Steam notices
+/// a helper died and starts another. Here every guest process is a thread of one host
+/// process, so the default action takes the emulator down with it -- one crashing helper
+/// and the whole session is gone.
+///
+/// Unwinding out of a signal handler is only safe because of the check below: the fault
+/// must have happened inside FEXCore's generated code, where the guest holds no lock of
+/// ours and owns nothing that has to be put back. A fault anywhere else is a bug in
+/// Fathom itself and stays fatal, because there the process really is in no state to
+/// continue.
+bool EndFaultedGuestThread(int signal, siginfo_t* info, void* raw_context) {
+#if defined(__aarch64__) && defined(__APPLE__)
+    (void)info;
+    if (raw_context == nullptr || g_current_guest_thread == nullptr) {
+        return false;
+    }
+    if (g_active.context == nullptr || g_active.thread == nullptr) {
+        return false;
+    }
+    auto* context = static_cast<ucontext_t*>(raw_context);
+    const auto pc = static_cast<uintptr_t>(arm_thread_state64_get_pc(context->uc_mcontext->__ss));
+    if (!g_active.context->IsAddressInCodeBuffer(g_active.thread, pc)) {
+        return false;
+    }
+    return g_current_guest_thread->EndOnFault(signal);
+#else
+    (void)signal;
+    (void)info;
+    (void)raw_context;
+    return false;
+#endif
+}
+
 class FathomSignalDelegator final : public FEXCore::SignalDelegator {
 public:
     uintptr_t GetThunkCallbackRET() const override {
@@ -286,7 +326,6 @@ public:
 /// one LinuxSyscalls per process, so the handler has to route to whichever guest thread
 /// is currently executing on this host thread.
 thread_local LinuxSyscalls* g_current_syscalls = nullptr;
-thread_local GuestThread* g_current_guest_thread = nullptr;
 
 /// Writes the executing guest thread's registers out for a crash record. Signal-handler
 /// context: no allocation, no locks, and g_active is thread-local so it describes the
@@ -418,6 +457,8 @@ public:
     FEXCore::Core::InternalThreadState* thread {};
 
     FEXCore::UncheckedLongJump::JumpBuf exit_jump {};
+    /// The signal that killed this guest thread, if one did.
+    int fatal_signal {};
     bool exit_jump_armed {};
     int exit_status {};
     bool exec_requested {};
@@ -463,6 +504,11 @@ RunResult GuestThread::Run() {
             result.outcome = RunOutcome::Execed;
             result.status = 0;
             result.message = "execve";
+        } else if (impl_->fatal_signal != 0) {
+            result.outcome = RunOutcome::Faulted;
+            result.status = 128 + impl_->fatal_signal;
+            result.message = "killed by a fault in guest code";
+            impl_->fatal_signal = 0;
         } else if (impl_->syscalls.StopRequested()) {
             result.outcome = RunOutcome::Stopped;
             result.status = -1;
@@ -481,6 +527,18 @@ RunResult GuestThread::Run() {
     result.rip = state.rip;
     result.rsp = state.gregs[FEXCore::X86State::REG_RSP];
     return result;
+}
+
+bool GuestThread::EndOnFault(int signal) {
+    if (!impl_->exit_jump_armed) {
+        return false;
+    }
+    impl_->fatal_signal = signal;
+    impl_->exit_jump_armed = false;
+    // Never returns. The frames between here and Run() are FEXCore's generated code and
+    // its dispatcher, which is exactly what exit_group already unwinds past.
+    FEXCore::UncheckedLongJump::LongJump(impl_->exit_jump, 1);
+    return true;
 }
 
 void GuestThread::ResetTo(uint64_t rip, uint64_t rsp) {
@@ -628,6 +686,7 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
 
     // From here on, a guest alignment fault is recoverable rather than fatal.
     SetFaultRecovery(RecoverAlignmentFault);
+    SetGuestFaultEnder(EndFaultedGuestThread);
     SetGuestStateDescriber(DescribeGuestState);
 
     FATHOM_INFO("FEXCore context ready (AVX=%d, SVE128=%d, cache line %u)",

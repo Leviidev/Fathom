@@ -25,6 +25,7 @@ namespace {
 int g_crash_fd = -1;
 std::atomic<FaultRecovery> g_recovery {nullptr};
 std::atomic<GuestStateDescriber> g_describer {nullptr};
+std::atomic<GuestFaultEnder> g_fault_ender {nullptr};
 
 // Updated on every guest syscall. Plain atomics, so reading them from a signal handler
 // is safe -- and the last syscall the guest made is usually the single most useful fact
@@ -234,6 +235,16 @@ void Handle(int number, siginfo_t* info, void* context) {
 
     fsync(g_crash_fd);
 
+    // A fault in guest code belongs to the guest process that ran it, not to Fathom. If
+    // that process can be ended on its own -- which needs the fault to have happened
+    // inside the JIT's generated code -- this call unwinds and never comes back, and the
+    // rest of the session carries on the way Linux would have carried on.
+    if (const auto ender = g_fault_ender.load(std::memory_order_acquire)) {
+        if (ender(number, info, context)) {
+            return;
+        }
+    }
+
     // Restore the default action and re-raise, so the process still dies the way it
     // would have and iOS still records its own crash report.
     signal(number, SIG_DFL);
@@ -244,6 +255,10 @@ void Handle(int number, siginfo_t* info, void* context) {
 
 void SetFaultRecovery(FaultRecovery recovery) {
     g_recovery.store(recovery, std::memory_order_release);
+}
+
+void SetGuestFaultEnder(GuestFaultEnder ender) {
+    g_fault_ender.store(ender, std::memory_order_release);
 }
 
 void SetGuestStateDescriber(GuestStateDescriber describer) {

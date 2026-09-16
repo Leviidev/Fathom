@@ -369,6 +369,8 @@ struct fathom_session final : fathom::ProcessHost {
     /// The same for one process's threads, which has to happen before that process can be
     /// destroyed -- its threads hold references to everything it owns.
     void StopAndJoinThreadsOf(GuestProcess* process);
+    void NotifyProcessChanged() { process_changed.notify_all(); }
+
     /// The same, but leaving the thread that asked -- which is what execve needs.
     void StopAndJoinOtherThreadsOf(GuestProcess* process);
     void JoinFinishedChildren();
@@ -604,6 +606,15 @@ void* RunGuestThread(void* raw) {
     // with and wake whoever is waiting on it, which is how pthread_join returns.
     start->record->syscalls->ReleaseThreadId();
     start->record->finished.store(true, std::memory_order_release);
+    // A fault in one thread ends the whole thread group on Linux, and a process left
+    // running with a thread missing is worse than one that stopped: whatever that thread
+    // was holding is never released and the rest deadlock on it.
+    if (result.outcome == fathom::RunOutcome::Faulted) {
+        FATHOM_WARN("tid %d faulted; ending pid %d with it", start->record->tid,
+                    start->process->pid);
+        start->process->syscalls->RequestProcessStop();
+        start->session->NotifyProcessChanged();
+    }
     FATHOM_INFO("tid %d: finished (%s, status %d, rip=%#llx)", start->record->tid,
                 result.message.c_str(), result.status,
                 static_cast<unsigned long long>(result.rip));
@@ -701,7 +712,12 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
         // passes the FS base directly, while an i386 one passes a user_desc of the kind
         // set_thread_area takes, and expects %gs to be loaded from it afterwards.
         if ((flags & kCloneSettls) != 0 && tls != 0) {
-            if (guest_is_32bit) {
+            // Which of the two this is depends on the process, not on the session: a
+            // 64-bit web helper creating threads inside a 32-bit Steam session passes an
+            // FS base, and reading that as a pointer to a user_desc gives every one of its
+            // threads a wrong TCB -- which shows up as a jump through a garbage function
+            // pointer the first time the thread reads anything out of it.
+            if (process->is_32bit) {
                 auto* descriptor = reinterpret_cast<uint32_t*>(tls + process->guest_base);
                 if (space->Validate(tls + process->guest_base, 16, fathom::kGuestProtRead)) {
                     const uint32_t entry = descriptor[0] == 0xFFFF'FFFFU ? 12 : descriptor[0];
@@ -710,6 +726,23 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
                                                ? descriptor[2]
                                                : descriptor[2] >> 12;
                     record->control->SetTlsDescriptor(static_cast<int>(entry), descriptor[1], limit);
+                    // The TCB header's first words are the thread pointer, the stack
+                    // guard and the pointer guard. glibc mangles the stack pointer and
+                    // return address it stores in a jmp_buf against that pointer guard, so
+                    // a thread holding a different one longjmps to a demangled address
+                    // that is simply wrong -- and lands with both its instruction pointer
+                    // and its stack pointer pointing at nothing.
+                    const uint64_t tcb = static_cast<uint64_t>(descriptor[1]) + process->guest_base;
+                    if (space->Validate(tcb, 32, fathom::kGuestProtRead)) {
+                        const auto* header = reinterpret_cast<const uint32_t*>(tcb);
+                        FATHOM_INFO("clone: tid %d tcb=%#x self=%#x stack guard=%#x pointer guard=%#x",
+                                    tid, descriptor[1], header[0], header[5], header[6]);
+                    }
+                } else {
+                    // Not recoverable and not quiet: a thread whose TLS was never
+                    // installed reads its own descriptor out of whatever is at zero.
+                    FATHOM_ERROR("clone: tid %d asked for TLS at %#llx, which is not mapped",
+                                 tid, static_cast<unsigned long long>(tls));
                 }
             } else {
                 record->control->SetFsBase(tls);

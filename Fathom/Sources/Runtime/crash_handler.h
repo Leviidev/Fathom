@@ -14,6 +14,12 @@ using FaultRecovery = bool (*)(int signal, siginfo_t* info, void* context);
 /// are an expected part of running x86 code on ARM64 rather than a crash.
 void SetFaultRecovery(FaultRecovery recovery);
 
+/// Called after a crash has been reported and before the process dies. If it returns --
+/// it usually does not, because it unwinds -- the fault was not one a guest process could
+/// be blamed for, and the process still dies.
+using GuestFaultEnder = bool (*)(int signal, siginfo_t* info, void* context);
+void SetGuestFaultEnder(GuestFaultEnder ender);
+
 /// Writes a description of the currently executing guest thread's registers into `buffer`.
 /// Supplied by the engine, because only it knows FEXCore exists. Returns the length
 /// written. Runs inside a signal handler, so it must not allocate or take locks.

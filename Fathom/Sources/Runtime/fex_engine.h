@@ -89,6 +89,11 @@ public:
     void SetFsBase(uint64_t base) override;
     uint64_t GetFsBase() const override;
     void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit) override;
+
+    /// Unwinds this thread out of the JIT with a fatal signal recorded, so that the guest
+    /// process it belongs to ends rather than the emulator. Returns false, without
+    /// unwinding, if the thread is not currently executing guest code.
+    bool EndOnFault(int signal);
     [[noreturn]] void ExitGuest(int status) override;
 
 private:

@@ -67,7 +67,7 @@ chmod 1777 /tmp/.X11-unix /tmp/.ICE-unix
 
 # -fbdir puts the framebuffer in a file, which is how the host gets the picture: it maps
 # the same file and every pixel X draws is already in its address space.
-Xvfb :0 -ac -screen 0 "${FATHOM_SCREEN:-1280x720x24}" -fbdir /tmp/fb &
+Xvfb :0 -ac +extension RANDR +extension GLX -screen 0 "${FATHOM_SCREEN:-1280x720x24}" -fbdir /tmp/fb &
 
 for _ in $(seq 1 400); do
     [ -e /tmp/.X11-unix/X0 ] && break

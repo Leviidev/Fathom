@@ -93,6 +93,7 @@ public:
     /// See this file's header for why the host side deliberately stays readable/writable.
     bool Protect(uint64_t address, uint64_t size, int protection);
 
+
     bool Contains(uint64_t address, uint64_t size) const;
 
     /// True when every byte of [address, address+size) is committed and satisfies `required`.
@@ -127,6 +128,8 @@ private:
     bool TakeFreeExtent(uint64_t address, uint64_t size);
     void ReturnFreeExtent(uint64_t address, uint64_t size);
     void RecordCommitted(uint64_t address, uint64_t size, int protection);
+
+    bool ProtectLocked(uint64_t address, uint64_t size, int protection);
 
     mutable std::mutex mutex_;
     uint64_t base_ {};

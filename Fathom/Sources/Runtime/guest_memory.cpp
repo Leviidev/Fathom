@@ -188,7 +188,7 @@ bool GuestAddressSpace::CommitFixed(uint64_t address, uint64_t size, int protect
     if (!TakeFreeExtent(begin, end - begin)) {
         // Already committed. Widening the protection is the only sane interpretation --
         // ELF segments routinely share a host page with the segment before them.
-        return Protect(begin, end - begin, protection);
+        return ProtectLocked(begin, end - begin, protection);
     }
     if (mprotect(reinterpret_cast<void*>(begin), end - begin, ToHostProtection(protection)) != 0) {
         FATHOM_ERROR("fixed commit at %#llx (%llu bytes) failed: %s",
@@ -258,6 +258,15 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
 }
 
 bool GuestAddressSpace::Protect(uint64_t address, uint64_t size, int protection) {
+    std::scoped_lock lock {mutex_};
+    return ProtectLocked(address, size, protection);
+}
+
+// Callers already holding the lock use this directly. The list of committed ranges is
+// rebuilt here, so a guest mprotect running while another thread commits or releases
+// memory frees the vector's storage out from under whoever is walking it -- which shows
+// up as a malloc abort a long way from the thread that caused it.
+bool GuestAddressSpace::ProtectLocked(uint64_t address, uint64_t size, int protection) {
     const uint64_t begin = AlignDown(address);
     const uint64_t end = AlignUp(address + size);
 

@@ -259,6 +259,13 @@ private:
         /// Set when this descriptor is an eventfd or an epoll set rather than a file.
         std::shared_ptr<EventCounter> event;
         std::shared_ptr<EpollSet> epoll;
+        /// Set when this descriptor is a timerfd. Darwin has no timerfd, but it has
+        /// kqueue, whose descriptor becomes readable exactly when a timer it carries
+        /// fires -- so poll and epoll see it without knowing it is anything unusual.
+        bool is_timer {};
+        /// What the guest last asked for, because timerfd_gettime has to answer with it.
+        int64_t timer_interval_ns {};
+        int64_t timer_value_ns {};
     };
 
     /// What the threads of one process share, and what a fork duplicates instead.
@@ -349,6 +356,11 @@ private:
     uint64_t DoSemget(int32_t key, int count, int flags);
     uint64_t DoSemop(int id, uint64_t operations_address, uint64_t count);
     uint64_t DoSemctl(int id, int index, int command, uint64_t argument);
+    uint64_t DoTimerfdCreate(int clock_id, int flags);
+    uint64_t DoTimerfdSettime(int fd, int flags, uint64_t new_value, uint64_t old_value);
+    uint64_t DoTimerfdGettime(int fd, uint64_t current_value);
+    uint64_t DoTimerfdRead(OpenFile& file, uint64_t buffer);
+
     uint64_t DoEventfd(uint64_t initial, int flags);
     uint64_t DoEventfdRead(OpenFile& file, uint64_t buffer);
     uint64_t DoEventfdWrite(OpenFile& file, uint64_t buffer);

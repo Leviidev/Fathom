@@ -313,6 +313,10 @@ struct GuestProcess {
         std::unique_ptr<fathom::GuestThread> thread;
         pthread_t host_thread {};
         bool started {};
+        /// Set when the thread's run loop returns. Read without the process lock, which
+        /// is why it is atomic: fork asks whether this process still has other threads
+        /// running, and the answer changes underneath it.
+        std::atomic<bool> finished {false};
     };
     std::vector<std::unique_ptr<GuestThreadRecord>> threads;
 };
@@ -532,6 +536,14 @@ void fathom_session::ReleaseParent(GuestProcess* process) {
     {
         std::scoped_lock lock {process_mutex};
         for (auto& region : process->borrowed) {
+            // The parent may have let this go while the child was running -- a thread of
+            // its own unmapping a region, or the heap shrinking under it. Writing to a
+            // page the arena has since protected away is a fault on the child's thread
+            // with the parent's address in it, which reads as a wild pointer and is not.
+            if (!space->Validate(region.address, region.bytes.size(),
+                                 fathom::kGuestProtWrite)) {
+                continue;
+            }
             // Put the parent's memory back exactly as the fork found it, before anything
             // lets the parent run on it again.
             std::memcpy(reinterpret_cast<void*>(region.address), region.bytes.data(),
@@ -560,6 +572,7 @@ void* RunGuestThread(void* raw) {
     // to happen is the kernel's own parting act: clear the word the thread was created
     // with and wake whoever is waiting on it, which is how pthread_join returns.
     start->record->syscalls->ReleaseThreadId();
+    start->record->finished.store(true, std::memory_order_release);
     FATHOM_INFO("tid %d: finished (%s, status %d)", start->record->tid, result.message.c_str(),
                 result.status);
     return nullptr;
@@ -784,22 +797,48 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
             return a1 < b2 && b1 < a2;
         };
 
+        // Whether anything else in the parent is still running decides how much of it can
+        // be held. Linux only gives the child the thread that called fork, and says the
+        // child may do nothing but exec afterwards -- so a threaded parent's child touches
+        // its stack and essentially nothing else.
+        //
+        // That restriction is not pedantry here, it is the only thing that can be right.
+        // The parent's other threads keep running while the child does, writing to the
+        // same heap and the same globals. Putting a snapshot of those back would throw
+        // away everything they did in the meantime, and Steam -- eighty-odd threads, seven
+        // hundred megabytes of heap, a fork every time it runs a helper -- would be handed
+        // its own memory as it was a second ago, over and over. It also means copying that
+        // seven hundred megabytes twice per fork, which is the difference between a fork
+        // costing a millisecond and costing a second.
+        bool threaded = false;
+        for (const auto& thread : parent->threads) {
+            if (thread->started && !thread->finished.load(std::memory_order_acquire)) {
+                threaded = true;
+                break;
+            }
+        }
+
         // The parent's own regions only. The arena is shared, so asking it for every
         // writable range sweeps in whatever sibling processes have mapped -- which on a
         // pipeline's second fork meant copying the first child's entire 128MB heap.
-        std::vector<std::pair<uint64_t, uint64_t>> owned = parent->syscalls->Mappings();
-        // ToGuestAddresses put an image's bounds into the guest's numbering, because that
-        // is what the guest is told about them. Copying needs the host's.
-        owned.emplace_back(parent->program.image.image_begin + parent->guest_base,
-                           parent->program.image.image_end - parent->program.image.image_begin);
-        if (parent->program.dynamic) {
-            owned.emplace_back(parent->program.interpreter.image_begin + parent->guest_base,
-                               parent->program.interpreter.image_end - parent->program.interpreter.image_begin);
+        std::vector<std::pair<uint64_t, uint64_t>> owned;
+        if (!threaded) {
+            owned = parent->syscalls->Mappings();
+            // ToGuestAddresses put an image's bounds into the guest's numbering, because
+            // that is what the guest is told about them. Copying needs the host's.
+            owned.emplace_back(parent->program.image.image_begin + parent->guest_base,
+                               parent->program.image.image_end - parent->program.image.image_begin);
+            if (parent->program.dynamic) {
+                owned.emplace_back(parent->program.interpreter.image_begin + parent->guest_base,
+                                   parent->program.interpreter.image_end - parent->program.interpreter.image_begin);
+            }
+            if (heap_low != 0) {
+                owned.emplace_back(heap_low, kHeapReservation);
+            }
         }
+        // The stack is held either way: the child returns out of fork through its parent's
+        // frames whatever else is true, and it is a few kilobytes.
         owned.emplace_back(stack_low, stack_top - stack_low);
-        if (heap_low != 0) {
-            owned.emplace_back(heap_low, kHeapReservation);
-        }
 
         for (const auto& [owned_begin, owned_size] : owned) {
             const fathom::GuestRange range {owned_begin, owned_size, 0};
@@ -824,8 +863,9 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
             held += to - from;
         }
 
-        FATHOM_INFO("fork: holding %llu KB of pid %d's memory while pid %d borrows it",
-                    static_cast<unsigned long long>(held / 1024), caller_pid, child_pid);
+        FATHOM_INFO("fork: holding %llu KB of pid %d's %s while pid %d borrows it",
+                    static_cast<unsigned long long>(held / 1024), caller_pid,
+                    threaded ? "stack" : "memory", child_pid);
 
         child_raw = child.get();
         processes[child_pid] = std::move(child);

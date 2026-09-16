@@ -16,6 +16,7 @@
 #include <ctime>
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/event.h>
 #include <sys/file.h>
 #include <arpa/inet.h>
 #include <sys/mman.h>
@@ -314,7 +315,10 @@ enum : uint64_t {
     kSysEpollWait = 232,
     kSysEpollCtl = 233,
     kSysEpollPwait = 281,
+    kSysTimerfdCreate = 283,
     kSysEventfd = 284,
+    kSysTimerfdSettime = 286,
+    kSysTimerfdGettime = 287,
     kSysEventfd2 = 290,
     kSysEpollCreate1 = 291,
     kSysPipe2 = 293,
@@ -683,6 +687,9 @@ const char* SyscallName(uint64_t number) {
     case kSysEpollCtl: return "epoll_ctl";
     case kSysEpollWait: return "epoll_wait";
     case kSysEpollPwait: return "epoll_pwait";
+    case kSysTimerfdCreate: return "timerfd_create";
+    case kSysTimerfdSettime: return "timerfd_settime";
+    case kSysTimerfdGettime: return "timerfd_gettime";
     case kSysEventfd: return "eventfd";
     case kSysEventfd2: return "eventfd2";
     case kSysDup3: return "dup3";
@@ -1212,6 +1219,9 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
         }
         if (file->event != nullptr) {
             return DoEventfdRead(*file, buffer);
+        }
+        if (file->is_timer) {
+            return DoTimerfdRead(*file, buffer);
         }
         from_console = file->console_stream >= 0;
     }
@@ -2521,6 +2531,136 @@ uint64_t LinuxSyscalls::DoEventfd(uint64_t initial, int flags) {
     return static_cast<uint64_t>(fd);
 }
 
+// Darwin has no timerfd, but kqueue's EVFILT_TIMER is the same idea with a different
+// name, and a kqueue descriptor is readable exactly when one of its timers has fired.
+// That is what makes this work at all: the descriptor handed to the guest is a real host
+// descriptor that poll, select and our epoll already know how to wait on, so none of them
+// need to learn what a timer is.
+uint64_t LinuxSyscalls::DoTimerfdCreate(int clock_id, int flags) {
+    (void)clock_id;   // CLOCK_MONOTONIC and CLOCK_REALTIME both become a relative kqueue timer.
+    const int queue = kqueue();
+    if (queue < 0) {
+        return Fail(errno);
+    }
+    constexpr int kTfdCloexec = 0o2000000;
+    constexpr int kTfdNonblock = 0o4000;
+    if ((flags & kTfdNonblock) != 0) {
+        fcntl(queue, F_SETFL, fcntl(queue, F_GETFL, 0) | O_NONBLOCK);
+    }
+    if ((flags & kTfdCloexec) != 0) {
+        fcntl(queue, F_SETFD, FD_CLOEXEC);
+    }
+    std::scoped_lock lock {shared_->mutex};
+    const int fd = RegisterFile(queue, "anon_inode:[timerfd]");
+    shared_->files[fd].is_timer = true;
+    return static_cast<uint64_t>(fd);
+}
+
+uint64_t LinuxSyscalls::DoTimerfdSettime(int fd, int flags, uint64_t new_value,
+                                         uint64_t old_value) {
+    constexpr int kTfdTimerAbstime = 1;
+    const size_t width = config_.guest_is_32bit ? 4 : 8;
+    const auto* raw = static_cast<const unsigned char*>(GuestPointer(new_value, width * 4, false));
+    if (raw == nullptr) {
+        return FailLinux(14);
+    }
+    const auto field = [&](int index) {
+        int64_t value = 0;
+        std::memcpy(&value, raw + static_cast<size_t>(index) * width, width);
+        return value;
+    };
+    // struct itimerspec is it_interval then it_value, each a timespec.
+    const int64_t interval_ns = field(0) * 1000000000LL + field(1);
+    int64_t value_ns = field(2) * 1000000000LL + field(3);
+
+    int host_fd = -1;
+    {
+        std::scoped_lock lock {shared_->mutex};
+        auto* file = FindFile(fd);
+        if (file == nullptr || !file->is_timer) {
+            return FailLinux(9);
+        }
+        if (old_value != 0) {
+            auto* out = static_cast<unsigned char*>(GuestPointer(old_value, width * 4, true));
+            if (out != nullptr) {
+                const int64_t previous[4] = {file->timer_interval_ns / 1000000000LL,
+                                             file->timer_interval_ns % 1000000000LL,
+                                             file->timer_value_ns / 1000000000LL,
+                                             file->timer_value_ns % 1000000000LL};
+                for (int index = 0; index < 4; ++index) {
+                    std::memcpy(out + static_cast<size_t>(index) * width, &previous[index], width);
+                }
+            }
+        }
+        file->timer_interval_ns = interval_ns;
+        file->timer_value_ns = value_ns;
+        host_fd = file->host_fd;
+    }
+
+    struct kevent change {};
+    if (value_ns == 0 && interval_ns == 0) {
+        EV_SET(&change, 1, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
+        kevent(host_fd, &change, 1, nullptr, 0, nullptr);   // Already gone is not an error.
+        return 0;
+    }
+    if ((flags & kTfdTimerAbstime) != 0) {
+        struct timespec now {};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const int64_t elapsed = static_cast<int64_t>(now.tv_sec) * 1000000000LL + now.tv_nsec;
+        value_ns = value_ns > elapsed ? value_ns - elapsed : 0;
+    }
+    // A repeating timer is armed at its period, because that is what kqueue repeats at.
+    // The first expiry of a repeating timer is almost always the period itself, and a
+    // one-shot keeps exactly the delay it asked for.
+    const int64_t delay_ns = interval_ns != 0 ? interval_ns : std::max<int64_t>(value_ns, 1);
+    EV_SET(&change, 1, EVFILT_TIMER, EV_ADD | EV_ENABLE | (interval_ns != 0 ? 0 : EV_ONESHOT),
+           NOTE_NSECONDS, delay_ns, nullptr);
+    if (kevent(host_fd, &change, 1, nullptr, 0, nullptr) < 0) {
+        return Fail(errno);
+    }
+    return 0;
+}
+
+uint64_t LinuxSyscalls::DoTimerfdGettime(int fd, uint64_t current_value) {
+    const size_t width = config_.guest_is_32bit ? 4 : 8;
+    auto* out = static_cast<unsigned char*>(GuestPointer(current_value, width * 4, true));
+    if (out == nullptr) {
+        return FailLinux(14);
+    }
+    std::scoped_lock lock {shared_->mutex};
+    auto* file = FindFile(fd);
+    if (file == nullptr || !file->is_timer) {
+        return FailLinux(9);
+    }
+    const int64_t fields[4] = {file->timer_interval_ns / 1000000000LL,
+                               file->timer_interval_ns % 1000000000LL,
+                               file->timer_value_ns / 1000000000LL,
+                               file->timer_value_ns % 1000000000LL};
+    for (int index = 0; index < 4; ++index) {
+        std::memcpy(out + static_cast<size_t>(index) * width, &fields[index], width);
+    }
+    return 0;
+}
+
+uint64_t LinuxSyscalls::DoTimerfdRead(OpenFile& file, uint64_t buffer) {
+    auto* out = static_cast<uint64_t*>(GuestPointer(buffer, sizeof(uint64_t), true));
+    if (out == nullptr) {
+        return FailLinux(14);
+    }
+    struct kevent event {};
+    const struct timespec immediately {0, 0};
+    const int ready = kevent(file.host_fd, nullptr, 0, &event, 1, &immediately);
+    if (ready < 0) {
+        return Fail(errno);
+    }
+    if (ready == 0) {
+        return FailLinux(11); // EAGAIN: nothing has expired yet.
+    }
+    // How many times it fired since the last read, which is what timerfd reports.
+    *out = event.data > 0 ? static_cast<uint64_t>(event.data) : 1;
+    return sizeof(uint64_t);
+}
+
 uint64_t LinuxSyscalls::DoEventfdRead(OpenFile& file, uint64_t buffer) {
     auto* out = static_cast<uint64_t*>(GuestPointer(buffer, sizeof(uint64_t), true));
     if (out == nullptr) {
@@ -3158,8 +3298,13 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
         // than crashing almost always did so because something answered it with an error,
         // and the ones that are part of normal operation -- a would-block, a file that is
         // meant to be absent -- are the only ones worth leaving out.
+        // EAGAIN, ENOENT, EEXIST, EINTR and ETIMEDOUT are all part of working normally --
+        // a would-block, a file meant to be absent, a wait that ran out. A single Steam
+        // launch times out on futexes tens of thousands of times, and formatting a line
+        // for each of them costs more than the syscalls do.
         const auto failed = static_cast<int64_t>(result);
-        if (failed < 0 && failed > -4096 && failed != -11 && failed != -2 && failed != -17) {
+        if (failed < 0 && failed > -4096 && failed != -11 && failed != -2 && failed != -17 &&
+            failed != -4 && failed != -110) {
             FATHOM_INFO("[pid %d] %llu %s(%#llx, %#llx, %#llx) failed: errno %lld", pid_,
                         static_cast<unsigned long long>(number),
                         SyscallName(number), static_cast<unsigned long long>(arg1),
@@ -4815,6 +4960,15 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return DoMknodAt(guest::kAtFdCwd, arg1, static_cast<uint32_t>(arg2));
     case kSysMknodat:
         return DoMknodAt(static_cast<int>(arg1), arg2, static_cast<uint32_t>(arg3));
+
+    case kSysTimerfdCreate:
+        return DoTimerfdCreate(static_cast<int>(arg1), static_cast<int>(arg2));
+
+    case kSysTimerfdSettime:
+        return DoTimerfdSettime(static_cast<int>(arg1), static_cast<int>(arg2), arg3, arg4);
+
+    case kSysTimerfdGettime:
+        return DoTimerfdGettime(static_cast<int>(arg1), arg2);
 
     case kSysEventfd:
         return DoEventfd(arg1, 0);

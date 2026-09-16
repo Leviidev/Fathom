@@ -579,7 +579,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
   if (!HasCustomIR) {
     const uint8_t* GuestCode {};
-    GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
+    // Where those instruction bytes actually are in this process. For a 1:1 guest that is
+    // the guest RIP itself; for a relocated 32-bit guest the arena sits high in the host's
+    // address space and the guest's own RIP points at nothing.
+    GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP + Config.GuestMemoryBase);
 
     bool HadDispatchError {false};
     bool HadInvalidInst {false};

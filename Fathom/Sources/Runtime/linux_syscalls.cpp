@@ -10,6 +10,7 @@
 #include "fathom_log.h"
 
 #include <algorithm>
+#include <set>
 #include <cerrno>
 #include <cstring>
 #include <chrono>
@@ -3327,6 +3328,22 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
     return result;
 }
 
+namespace {
+
+/// Each futex operation this layer does not implement, named once. Seen repeatedly in a
+/// log it would be noise; seen once it is the first thing to look at when a guest's
+/// locking goes wrong.
+void ReportUnimplementedFutex(int operation) {
+    static std::mutex mutex;
+    static std::set<int> reported;
+    std::scoped_lock lock {mutex};
+    if (reported.insert(operation).second) {
+        FATHOM_WARN("futex operation %d is not implemented", operation);
+    }
+}
+
+} // namespace
+
 uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3,
                                  uint64_t arg4, uint64_t arg5, uint64_t arg6) {
     switch (number) {
@@ -4116,6 +4133,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         constexpr int kFutexWake = 1;
         constexpr int kFutexRequeue = 3;
         constexpr int kFutexCmpRequeue = 4;
+        constexpr int kFutexWakeOp = 5;
         constexpr int kFutexWaitBitset = 9;
         constexpr int kFutexWakeBitset = 10;
         // The PRIVATE and CLOCK_REALTIME bits change nothing here: every guest thread is
@@ -4136,6 +4154,50 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                 WakeFutex(ToHost(arg5));
             }
             return arg3;  // How many were woken; the caller only checks for an error.
+        }
+        case kFutexWakeOp: {
+            // Apply an operation to the second word, wake the first futex, and wake the
+            // second one too if the value that word held satisfies the comparison. glibc
+            // uses this to hand a condition variable's waiters over to its mutex in one
+            // call, and answering "woke nobody, changed nothing" leaves that mutex's
+            // count describing waiters that were never released.
+            auto* second = static_cast<uint32_t*>(GuestPointer(arg5, sizeof(uint32_t), true));
+            if (second == nullptr) {
+                return FailLinux(14);
+            }
+            const uint32_t encoded = static_cast<uint32_t>(arg6);
+            const uint32_t operation_code = (encoded >> 28) & 0xF;
+            const uint32_t comparison = (encoded >> 24) & 0xF;
+            uint32_t operand = (encoded >> 12) & 0xFFF;
+            const uint32_t against = encoded & 0xFFF;
+            constexpr uint32_t kOpargShift = 8;
+            if ((operation_code & kOpargShift) != 0) {
+                operand = 1u << (operand & 31);
+            }
+            const uint32_t previous = *second;
+            switch (operation_code & 7) {
+            case 0: *second = operand; break;              // FUTEX_OP_SET
+            case 1: *second = previous + operand; break;    // FUTEX_OP_ADD
+            case 2: *second = previous | operand; break;    // FUTEX_OP_OR
+            case 3: *second = previous & ~operand; break;   // FUTEX_OP_ANDN
+            case 4: *second = previous ^ operand; break;    // FUTEX_OP_XOR
+            default: break;
+            }
+            WakeFutex(ToHost(arg1));
+            bool matched = false;
+            switch (comparison) {
+            case 0: matched = previous == against; break;
+            case 1: matched = previous != against; break;
+            case 2: matched = previous < against; break;
+            case 3: matched = previous <= against; break;
+            case 4: matched = previous > against; break;
+            case 5: matched = previous >= against; break;
+            default: break;
+            }
+            if (matched) {
+                WakeFutex(ToHost(arg5));
+            }
+            return arg3;
         }
         case kFutexWait:
         case kFutexWaitBitset: {
@@ -4208,7 +4270,12 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             }
         }
         default:
-            return 0;
+            // Priority-inheritance futexes and the rest. Saying "done" to an operation
+            // that was not performed is how a lock ends up believing it is held by a
+            // thread that never took it; ENOSYS at least makes the guest's own fallback
+            // path run, and says in the log which one is missing.
+            ReportUnimplementedFutex(operation);
+            return FailLinux(38); // -ENOSYS
         }
     }
 

@@ -22,10 +22,8 @@ fi
 
 # Steam's own Depends line names these. xz-utils matters most: Debian's tar shells out to
 # an external xz for a .tar.xz, and the Steam bootstrap is exactly that -- without it tar
-# reports "xz: Cannot exec" and the installation stops before it starts. zenity is the
-# other one that is not optional in practice: steam.sh pipes tar into it to show unpack
-# progress, and with nothing on the other end of that pipe the unpack reports failure.
-PACKAGES="${PACKAGES:-xz-utils python3 ca-certificates file zenity}"
+# reports "xz: Cannot exec" and the installation stops before it starts.
+PACKAGES="${PACKAGES:-xz-utils python3 ca-certificates file}"
 
 echo "==> building an image from $IMAGE with: $PACKAGES"
 docker rm -f fathom-debian-build fathom-debian-export >/dev/null 2>&1 || true
@@ -38,6 +36,12 @@ docker rm -f fathom-debian-build fathom-debian-export >/dev/null 2>&1 || true
 # and a session started on a 32-bit binary decodes and numbers syscalls for i386
 # throughout. A 64-bit X server in the same session would be decoded as 32-bit code. So
 # everything that has to run alongside Steam is the 32-bit build of it.
+#
+# zenity is in here rather than with the amd64 packages for the same reason: steam.sh
+# pipes tar into it to show unpack progress, and with nothing on the other end of that
+# pipe the unpack reports failure -- but zenity is a GTK program, and the GTK stack this
+# root already carries for Steam is the i386 one, so the i386 build costs almost nothing
+# while the amd64 build would pull in a second copy of two hundred packages.
 I386_PACKAGES="${I386_PACKAGES:-libc6:i386 libstdc++6:i386 xvfb:i386 x11-utils:i386 \
     libx11-6:i386 libxext6:i386 libxrender1:i386 libxfixes3:i386 libxdamage1:i386 \
     libxi6:i386 libxrandr2:i386 libxcursor1:i386 libxcomposite1:i386 libxinerama1:i386 \
@@ -49,6 +53,7 @@ I386_PACKAGES="${I386_PACKAGES:-libc6:i386 libstdc++6:i386 xvfb:i386 x11-utils:i
     libdbus-glib-1-2:i386 libgbm1:i386 libasound2:i386 libxcb-dri3-0:i386 \
     libxcb-present0:i386 libxcb-sync1:i386 libxshmfence1:i386 libdrm2:i386 \
     libgtk2.0-0:i386 libnss3:i386 libcurl4:i386 libopenal1:i386 libsdl2-2.0-0:i386 \
+    zenity:i386 \
     libusb-1.0-0:i386 libvulkan1:i386 libglx-mesa0:i386 libegl-mesa0:i386}"
 docker run --platform linux/amd64 --name fathom-debian-build "$IMAGE" \
     sh -c "apt-get update -qq && apt-get install -y --no-install-recommends $PACKAGES \

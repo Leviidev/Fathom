@@ -374,6 +374,9 @@ struct fathom_session final : fathom::ProcessHost {
     void StopAndJoinThreadsOf(GuestProcess* process);
     void NotifyProcessChanged() { process_changed.notify_all(); }
 
+    /// Joins this process's threads that have already finished, before another is made.
+    void JoinFinishedThreadsOf(GuestProcess* process);
+
     /// The same, but leaving the thread that asked -- which is what execve needs.
     void StopAndJoinOtherThreadsOf(GuestProcess* process);
     void JoinFinishedChildren();
@@ -549,6 +552,33 @@ void fathom_session::StopAndJoinThreads() {
     }
 }
 
+void fathom_session::JoinFinishedThreadsOf(GuestProcess* process) {
+    // The same hazard as JoinFinishedChildren, for threads. A guest thread whose run loop
+    // has returned is still a host thread winding down inside the FEXCore context, and
+    // creating another guest thread in that context while it does leaves the new one with
+    // a corrupted register file -- classically a stack pointer of zero, and a fault at a
+    // near-null address the moment it pushes anything. Steam's client creates and retires
+    // threads continuously, so this is not a rare window.
+    std::vector<pthread_t> done;
+    for (auto& thread : process->threads) {
+        if (thread->started && thread->finished.load(std::memory_order_acquire)) {
+            done.push_back(thread->host_thread);
+            thread->started = false;
+        }
+    }
+    if (done.empty()) {
+        return;
+    }
+    for (auto handle : done) {
+        pthread_join(handle, nullptr);
+    }
+    // Their records go too: nothing refers to a thread that has been joined, and leaving
+    // them makes every later sweep walk a longer list.
+    std::erase_if(process->threads, [](const auto& thread) {
+        return !thread->started && thread->finished.load(std::memory_order_acquire);
+    });
+}
+
 void fathom_session::JoinFinishedChildren() {
     std::vector<pthread_t> done;
     {
@@ -650,6 +680,8 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
             return -1;
         }
         tid = next_pid++;
+
+        JoinFinishedThreadsOf(process);
 
         auto record = std::make_unique<GuestProcess::GuestThreadRecord>();
         record->tid = tid;

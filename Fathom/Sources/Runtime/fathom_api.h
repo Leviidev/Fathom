@@ -110,6 +110,7 @@ typedef struct {
     bool multiblock;
     bool tso_enabled;              ///< Emulate x86's stronger memory ordering.
     bool reduced_precision_x87;
+    bool disable_avx;               ///< Tell the guest's CPUID there is no AVX.
     bool trace_syscalls;           ///< Log every guest syscall (very loud).
 } fathom_session_config;
 

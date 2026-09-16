@@ -26,6 +26,11 @@ struct EngineOptions {
     bool tso_enabled {true};
     bool reduced_precision_x87 {false};
     bool disassemble {false};
+    /// Reports no AVX through CPUID. glibc picks its string routines by IFUNC from what
+    /// CPUID advertises, so this is the switch that decides whether it runs the AVX2
+    /// strcmp or the SSE2 one -- and therefore whether a JIT bug in the wide paths is
+    /// reachable at all.
+    bool disable_avx {false};
 };
 
 enum class RunOutcome {

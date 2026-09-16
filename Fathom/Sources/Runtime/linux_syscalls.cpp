@@ -43,6 +43,12 @@ constexpr int kOTrunc = 0x200;
 constexpr int kOAppend = 0x400;
 constexpr int kONonBlock = 0x800;
 constexpr int kODirectory = 0x10000;
+/// fstatat with an empty path means "the descriptor itself". Modern glibc implements
+/// plain fstat() this way, so without it every fstat stats the working directory --
+/// which hands back one identical st_dev/st_ino for every open file, and a dynamic
+/// loader uses exactly those two fields to decide whether it has already loaded a
+/// library. Every library then looks like the same library.
+constexpr int kAtEmptyPath = 0x1000;
 constexpr int kOCloExec = 0x80000;
 
 constexpr int kAtFdCwd = -100;
@@ -1316,10 +1322,24 @@ uint64_t LinuxSyscalls::DoStatAt(int dirfd, uint64_t path_address, uint64_t stat
         return FailLinux(14);
     }
 
-    const std::string host_path = ResolveAt(dirfd, path.c_str(), nullptr);
     struct stat host {};
-    const int result = (flags & guest::kAtSymlinkNoFollow) != 0 ? lstat(host_path.c_str(), &host)
-                                                                : stat(host_path.c_str(), &host);
+    int result = 0;
+    if (path.empty() && (flags & guest::kAtEmptyPath) != 0) {
+        if (dirfd == guest::kAtFdCwd) {
+            result = stat(ResolveGuestPath(cwd_).c_str(), &host);
+        } else {
+            const int host_fd = HostFdFor(dirfd);
+            if (host_fd < 0) {
+                // The console, which has no host descriptor behind it.
+                return DoFstat(dirfd, stat_address);
+            }
+            result = fstat(host_fd, &host);
+        }
+    } else {
+        const std::string host_path = ResolveAt(dirfd, path.c_str(), nullptr);
+        result = (flags & guest::kAtSymlinkNoFollow) != 0 ? lstat(host_path.c_str(), &host)
+                                                          : stat(host_path.c_str(), &host);
+    }
     if (result != 0) {
         return Fail(errno);
     }
@@ -1334,7 +1354,7 @@ uint64_t LinuxSyscalls::DoFstat(int fd, uint64_t stat_address) {
     }
 
     struct stat host {};
-    if (fd >= 0 && fd <= 2) {
+    if (IsConsole(fd)) {
         // The guest's stdio is the app's console view, and a character device is the
         // closest honest description of it.
         std::memset(&host, 0, sizeof(host));

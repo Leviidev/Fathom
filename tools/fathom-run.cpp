@@ -94,6 +94,7 @@ int main(int argc, char** argv) {
     bool trace = false;
     bool tso = true;
     bool multiblock = true;
+    bool avx = true;
     uint64_t arena_mb = 0;
 
     int index = 1;
@@ -111,6 +112,8 @@ int main(int argc, char** argv) {
             // Changes how FEX stitches guest basic blocks together. If a fault goes away
             // with this off, the problem is in the JIT rather than in the guest.
             multiblock = false;
+        } else if (option == "--no-avx") {
+            avx = false;
         } else if (option == "--no-tso") {
             // Emulating x86's memory ordering makes FEX emit store-release everywhere,
             // and every unaligned one is a recoverable fault. Harmless in normal running,
@@ -182,6 +185,7 @@ int main(int argc, char** argv) {
     config.trace_syscalls = trace;
     config.tso_enabled = tso;
     config.multiblock = multiblock;
+    config.disable_avx = !avx;
     if (arena_mb != 0) {
         config.address_space_size = arena_mb * 1024 * 1024;
     }

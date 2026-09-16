@@ -546,6 +546,10 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
     // exposes -- those fault on Darwin, which is one of the fixes that made this FEXCore
     // tree work on Apple hardware at all.
     impl->host_features = FEX::FetchHostFeatures();
+    if (options.disable_avx) {
+        impl->host_features.SupportsAVX = false;
+        FATHOM_INFO("AVX disabled: the guest will be told this CPU has none");
+    }
 
     impl->context = FEXCore::Context::Context::CreateNewContext(impl->host_features);
     if (impl->context == nullptr) {

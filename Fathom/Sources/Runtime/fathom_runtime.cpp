@@ -778,6 +778,7 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     options.tso_enabled = config->tso_enabled;
     options.reduced_precision_x87 = config->reduced_precision_x87;
     options.disassemble = false;
+    options.disable_avx = config->disable_avx;
 
     session->engine = fathom::FexEngine::Create(*session->space, options, reason);
     if (session->engine == nullptr) {

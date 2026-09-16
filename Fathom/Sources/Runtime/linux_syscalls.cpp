@@ -839,6 +839,12 @@ void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
     child.shared_->heap_base = shared_->heap_base;
     child.shared_->heap_limit = shared_->heap_limit;
     child.shared_->heap_break = shared_->heap_break;
+    // The child's address space *is* the parent's until it execs, so what the parent
+    // mapped the child has mapped too. Without this the list starts empty, and the first
+    // thing that goes wrong is a fork inside a fork: the grandchild's snapshot covers none
+    // of those regions, so whatever it writes there is never put back and the child it was
+    // forked from carries on with a heap somebody else has been scribbling in.
+    child.shared_->mappings = shared_->mappings;
     child.config_.work_dir = config_.work_dir;
     // A fork is running the same program as its parent until it execs, so it answers
     // /proc/self/exe the same way -- which is how busybox re-runs itself as an applet.

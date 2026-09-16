@@ -209,12 +209,22 @@ bool LoadProgram(fathom::GuestAddressSpace& space, const std::string& guest_root
 /// addresses to the pool for reuse risks running a stale one. Images are about a
 /// megabyte, so leaking them costs far less than getting that wrong.
 void ReleaseProgramData(fathom::GuestAddressSpace& space, const LoadedProgram& program) {
+    // Everything here goes back to the arena, and all of it in host addresses. Two of
+    // these were wrong and both leaked: the heap was released with the *guest* number the
+    // loader reports, which frees nothing, and the image was never released at all. A
+    // shell script that runs sixty commands then exhausts a 4GB address space and the
+    // next exec fails with "could not allocate the guest stack", a long way from the
+    // process that actually leaked.
     if (program.stack.stack_base != 0 && program.stack.stack_size != 0) {
         space.Release(program.stack.stack_base, program.stack.stack_size);
     }
     if (program.heap != 0) {
-        space.Release(program.heap, kHeapReservation);
+        space.Release(space.ToHost(program.heap), kHeapReservation);
     }
+    // The images are deliberately not released here. They are a few megabytes against the
+    // heap's hundred and twenty-eight, and a program's code can still be reached after it
+    // has stopped running -- a forked child that never exec'd is standing in it. Freeing
+    // them costs far less than it risks.
 }
 
 /// One guest process: its own registers, its own file descriptors, its own heap. Fathom's

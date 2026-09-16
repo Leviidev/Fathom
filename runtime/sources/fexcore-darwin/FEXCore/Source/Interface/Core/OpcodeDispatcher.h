@@ -2573,6 +2573,15 @@ private:
   }
 
   Ref Pop(IR::OpSize Size) {
+    // The mirror of Push above, and for the same reason.
+    if (GuestMemoryBase != 0) {
+      Ref OldSP = LoadGPRRegister(X86State::REG_RSP);
+      Ref HostAddress = _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, OldSP), _Constant(GuestMemoryBase));
+      Ref Value = _LoadMem(RegClass::GPR, Size, HostAddress, Invalid(), IR::OpSize::i8Bit, MemOffsetType::SXTX, 1);
+      StoreGPRRegister(X86State::REG_RSP, _Add(GetGPROpSize(), OldSP, _Constant(IR::OpSizeToSize(Size))));
+      return Value;
+    }
+
     Ref SP = _RMWHandle(LoadGPRRegister(X86State::REG_RSP));
     Ref Value = _AllocateGPR(false);
 
@@ -2592,6 +2601,20 @@ private:
 
   void Push(IR::OpSize Size, Ref Value) {
     auto OldSP = LoadGPRRegister(X86State::REG_RSP);
+
+    // A relocated guest cannot use the Push IR op: its JIT handler takes the stack
+    // pointer register to be a host address and stores straight through it, which for a
+    // 32-bit guest living above 4GB faults on the guest's own stack. Lowered by hand
+    // instead -- the stack pointer stays a guest value, and only the store is relocated.
+    if (GuestMemoryBase != 0) {
+      Ref NewSP = _Sub(GetGPROpSize(), OldSP, _Constant(IR::OpSizeToSize(Size)));
+      Ref HostAddress = _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, NewSP), _Constant(GuestMemoryBase));
+      _StoreMem(RegClass::GPR, Size, Value, HostAddress, Invalid(), IR::OpSize::i8Bit, MemOffsetType::SXTX, 1);
+      StoreGPRRegister(X86State::REG_RSP, NewSP);
+      FlushRegisterCache();
+      return;
+    }
+
     auto NewSP = _Push(GetGPROpSize(), Size, Value, OldSP);
     StoreGPRRegister(X86State::REG_RSP, NewSP);
     FlushRegisterCache();

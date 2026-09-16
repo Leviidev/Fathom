@@ -58,7 +58,13 @@ Ref LoadEffectiveAddress(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPR
   // This is the single place it has to happen: for a 32-bit guest every path through
   // SelectAddressMode takes its base from here, the one that does not being guarded by
   // !Is32Bit.
-  if (IREmit->GuestMemoryBase != 0 && GPRSize == OpSize::i32Bit) {
+  //
+  // Only when this address is going to be dereferenced, which is exactly what
+  // AddSegmentBase distinguishes. LEA computes an address and hands it to the guest
+  // without touching memory, so relocating its result would put a host pointer into a
+  // guest register -- and the guest would then use it as a plain number. The symptom is
+  // wonderfully specific: a syscall number arriving as base + 4.
+  if (IREmit->GuestMemoryBase != 0 && GPRSize == OpSize::i32Bit && AddSegmentBase) {
     Ref GuestAddress = Tmp ? IREmit->_Bfe(OpSize::i64Bit, 32, 0, Tmp) : IREmit->Constant(0);
     return IREmit->Add(OpSize::i64Bit, GuestAddress, IREmit->Constant(IREmit->GuestMemoryBase));
   }

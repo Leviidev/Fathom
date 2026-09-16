@@ -150,6 +150,24 @@ void OpDispatchBuilder::NOPOp(OpcodeArgs) {}
 void OpDispatchBuilder::RETOp(OpcodeArgs) {
   const auto GPRSize = GetGPROpSize();
 
+  // A relocated guest takes the long way round: the read-modify-write form of Pop goes
+  // through the Pop IR op, whose JIT handler treats the stack pointer as a host address.
+  if (GuestMemoryBase != 0) {
+    Ref OldSP = LoadGPRRegister(X86State::REG_RSP);
+    Ref HostAddress = _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, OldSP), _Constant(GuestMemoryBase));
+    Ref ReturnAddress = _LoadMem(RegClass::GPR, GPRSize, HostAddress, Invalid(), IR::OpSize::i8Bit, MemOffsetType::SXTX, 1);
+
+    Ref NewSP = _Add(GPRSize, OldSP, _Constant(IR::OpSizeToSize(GPRSize)));
+    if (Op->OP == 0xC2) {
+      NewSP = Add(GPRSize, NewSP, LoadSourceGPR(Op, Op->Src[0], Op->Flags));
+    }
+    StoreGPRRegister(X86State::REG_RSP, NewSP);
+
+    ExitFunction(ReturnAddress, BranchHint::Return);
+    BlockSetRIP = true;
+    return;
+  }
+
   Ref SP = _RMWHandle(LoadGPRRegister(X86State::REG_RSP));
   Ref NewRIP = Pop(GPRSize, SP);
 
@@ -4104,6 +4122,14 @@ Ref OpDispatchBuilder::AppendSegmentOffset(Ref Value, uint32_t Flags, uint32_t D
   auto Segment = GetSegment(Flags, DefaultPrefix, Override);
   if (Segment) {
     Value = Add(std::max(OpSize::i32Bit, std::max(GetOpSize(Value), GetOpSize(Segment))), Value, Segment);
+  }
+
+  // The other door into guest memory. String instructions -- MOVS, CMPS, LODS, STOS,
+  // SCAS -- build their addresses here and hand them straight to a load or store, never
+  // passing through LoadEffectiveAddress, so a relocated guest has to be accounted for in
+  // both places or ESI and EDI are dereferenced as host addresses.
+  if (GuestMemoryBase != 0) {
+    Value = _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, Value), _Constant(GuestMemoryBase));
   }
 
   return Value;

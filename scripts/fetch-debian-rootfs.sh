@@ -84,10 +84,21 @@ docker run --platform linux/amd64 --rm -v "$OUT_DIR:/out" "$IMAGE" sh -c '
     mkdir -p /tmp/debs/partial /tmp/x
     apt-get install -y --no-install-recommends -o Dir::Cache::archives=/tmp/debs \
         --download-only busybox:i386 x11-xkb-utils:i386 >/dev/null
+    # bash is fetched on its own: apt refuses to resolve it as an i386 package while
+    # the amd64 build of the same version is installed, and only the file is wanted.
+    (cd /tmp && apt-get download bash:i386 >/dev/null 2>&1 && dpkg-deb -x /tmp/bash_*_i386.deb /tmp/x)
     for deb in /tmp/debs/*.deb; do dpkg-deb -x "$deb" /tmp/x; done
     find /tmp/x -name busybox -type f -exec cp {} /out/bin/busybox32 \;
     cp /tmp/x/usr/bin/xkbcomp /out/usr/bin/xkbcomp
+    # Steam's launcher is a bash script and uses bash-only syntax; busybox's ash
+    # silently mangles it and the launcher aborts saying it cannot find Steam.
+    cp /tmp/x/bin/bash /out/bin/bash
 ' >/dev/null
+# cp through a bind mount does not carry the execute bit across, and a program that is
+# runnable but not marked executable is worse than one that is missing: exec works, so it
+# looks installed, while every `test -x` and every PATH search skips it.
+chmod +x "$OUT_DIR/bin/busybox32" "$OUT_DIR/bin/bash" "$OUT_DIR/usr/bin/xkbcomp"
+
 ln -sf busybox32 "$OUT_DIR/bin/sh"
 
 # A 32-bit userland in front of the 64-bit one.

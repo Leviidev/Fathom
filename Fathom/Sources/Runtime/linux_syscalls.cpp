@@ -290,6 +290,8 @@ enum : uint64_t {
     kSysGetRobustList = 274,
     kSysPrctl = 157,
     kSysSemget = 64,
+    kSysGetgroups = 115,
+    kSysSetgroups = 116,
     kSysWaitid = 247,
     kSysSchedSetaffinity = 203,
     kSysRecvmmsg = 299,
@@ -656,6 +658,8 @@ const char* SyscallName(uint64_t number) {
     case kSysPipe2: return "pipe2";
     case kSysPrctl: return "prctl";
     case kSysSemget: return "semget";
+    case kSysGetgroups: return "getgroups";
+    case kSysSetgroups: return "setgroups";
     case kSysWaitid: return "waitid";
     case kSysSchedSetaffinity: return "sched_setaffinity";
     case kSysRecvmmsg: return "recvmmsg";
@@ -1992,6 +1996,17 @@ uint64_t LinuxSyscalls::DoBrk(uint64_t requested) {
     if (requested < shared_->heap_base || requested > shared_->heap_limit) {
         // Linux answers an unsatisfiable brk with the current break rather than an error.
         return shared_->heap_break;
+    }
+    if (requested > shared_->heap_break) {
+        // Linux gives zeroed pages when the break grows, and malloc relies on it: the
+        // first thing it does with fresh heap is read a chunk header out of it. This
+        // arena is reserved once and handed round, so the bytes above the break are
+        // whatever the last process to own them left there -- a forked child that
+        // allocated before exec'ing, most often. Left dirty, the parent's next malloc
+        // reads that as a chunk header and glibc aborts with an assertion about the top
+        // chunk, a long way from anything that looks related.
+        std::memset(reinterpret_cast<void*>(space_.ToHost(shared_->heap_break)), 0,
+                    requested - shared_->heap_break);
     }
     shared_->heap_break = requested;
     return shared_->heap_break;
@@ -3756,6 +3771,23 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         // the child has already been reaped by the call above.
         return 0;
     }
+
+    case kSysGetgroups: {
+        // One group, which is the guest's own. A caller asking for the count passes zero.
+        const int capacity = static_cast<int>(arg1);
+        if (capacity == 0) {
+            return 1;
+        }
+        auto* out = static_cast<uint32_t*>(GuestPointer(arg2, sizeof(uint32_t), true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        *out = 1000;
+        return 1;
+    }
+    case kSysSetgroups:
+        // There is one group and the guest is already in it.
+        return 0;
 
     case kSysSchedSetaffinity:
         // Accepted and ignored: guest threads are host threads, and which core they run

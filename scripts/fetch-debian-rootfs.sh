@@ -41,7 +41,11 @@ I386_PACKAGES="${I386_PACKAGES:-libc6:i386 libstdc++6:i386 xvfb:i386 x11-utils:i
     libxi6:i386 libxrandr2:i386 libxcursor1:i386 libxcomposite1:i386 libxinerama1:i386 \
     libxtst6:i386 libxss1:i386 libxkbcommon0:i386 libgl1:i386 libegl1:i386 \
     libgl1-mesa-dri:i386 libnss3:i386 libnspr4:i386 libdbus-1-3:i386 \
-    libudev1:i386 libpulse0:i386 libva2:i386 libvdpau1:i386}"
+    libudev1:i386 libpulse0:i386 libva2:i386 libvdpau1:i386 \
+    libglib2.0-0:i386 libgtk-3-0:i386 libgdk-pixbuf-2.0-0:i386 libpango-1.0-0:i386 \
+    libcairo2:i386 libatk1.0-0:i386 libatk-bridge2.0-0:i386 libcups2:i386 \
+    libdbus-glib-1-2:i386 libgbm1:i386 libasound2:i386 libxcb-dri3-0:i386 \
+    libxcb-present0:i386 libxcb-sync1:i386 libxshmfence1:i386 libdrm2:i386}"
 docker run --platform linux/amd64 --name fathom-debian-build "$IMAGE" \
     sh -c "apt-get update -qq && apt-get install -y --no-install-recommends $PACKAGES \
            && dpkg --add-architecture i386 && apt-get update -qq \

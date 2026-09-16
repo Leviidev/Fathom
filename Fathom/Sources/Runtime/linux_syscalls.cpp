@@ -894,9 +894,13 @@ void LinuxSyscalls::InitialiseHeap(uint64_t base, uint64_t reserved) {
 std::string LinuxSyscalls::NormaliseGuestPath(const std::string& path) const {
     // /proc/self/exe is the program's own binary, and programs do more with it than read
     // the link: Steam's launcher execs it to restart itself. Substituted here so that
-    // open, exec, stat and readlink all agree about what it means.
-    if (!program_path_.empty() &&
-        (path == "/proc/self/exe" || path == "/proc/" + std::to_string(pid_) + "/exe")) {
+    // open, exec and stat all agree about what it means.
+    //
+    // readlink is deliberately not routed through this -- see DoReadlinkAt. Answering it
+    // from here would make the program's own binary look like a symlink pointing at
+    // itself, and a program that verifies its own installation reports the file as
+    // corrupt and reinstalls, for ever.
+    if (!program_path_.empty() && IsProcSelfExe(path)) {
         return program_path_;
     }
 
@@ -2143,19 +2147,19 @@ uint64_t LinuxSyscalls::DoReadlinkAt(int dirfd, uint64_t path_address, uint64_t 
         return FailLinux(14);
     }
 
-    std::string guest_path;
-    // The link itself, not what it points at -- otherwise readlink is handed a regular
-    // file and reports EINVAL for every symlink in the tree.
-    const std::string host_path = ResolveAt(dirfd, path.c_str(), &guest_path, false);
-
-    // NormaliseGuestPath has already turned /proc/self/exe into the program's own path,
-    // so what arrives here is the answer -- the link just has to report it rather than
-    // being followed on the host, where no such file exists.
-    if (!program_path_.empty() && guest_path == program_path_) {
+    // Only the literal /proc/self/exe is a link to the program. Testing the *resolved*
+    // path instead would answer for the binary itself as well, and report it as a symlink
+    // pointing at itself.
+    if (!program_path_.empty() && IsProcSelfExe(path)) {
         const size_t copied = std::min(static_cast<size_t>(size), program_path_.size());
         std::memcpy(out, program_path_.data(), copied);
         return copied;
     }
+
+    std::string guest_path;
+    // The link itself, not what it points at -- otherwise readlink is handed a regular
+    // file and reports EINVAL for every symlink in the tree.
+    const std::string host_path = ResolveAt(dirfd, path.c_str(), &guest_path, false);
 
     const ssize_t length = readlink(host_path.c_str(), out, size);
     return length < 0 ? Fail(errno) : static_cast<uint64_t>(length);
@@ -2331,6 +2335,10 @@ uint64_t LinuxSyscalls::DoSocketcall(uint64_t call, uint64_t arguments_address) 
                     static_cast<long long>(result));
     }
     return result;
+}
+
+bool LinuxSyscalls::IsProcSelfExe(const std::string& path) const {
+    return path == "/proc/self/exe" || path == "/proc/" + std::to_string(pid_) + "/exe";
 }
 
 uint64_t LinuxSyscalls::DoSetThreadArea(uint64_t descriptor_address) {
@@ -3391,7 +3399,19 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                                                 path.c_str(), nullptr, false);
         const bool remove_directory = is_at && (arg3 & 0x200) != 0; // AT_REMOVEDIR
         const int result = remove_directory ? rmdir(host_path.c_str()) : unlink(host_path.c_str());
-        return result == 0 ? 0 : Fail(errno);
+        if (result == 0) {
+            return 0;
+        }
+        // Darwin refuses to unlink a directory with EPERM; Linux says EISDIR, and a caller
+        // walking a tree branches on exactly that to decide whether to recurse. Told
+        // EPERM it concludes it is not allowed to delete anything and gives up.
+        if (!remove_directory && errno == EPERM) {
+            struct stat info {};
+            if (lstat(host_path.c_str(), &info) == 0 && S_ISDIR(info.st_mode)) {
+                return FailLinux(21); // EISDIR
+            }
+        }
+        return Fail(errno);
     }
 
     case kSysRmdir: {

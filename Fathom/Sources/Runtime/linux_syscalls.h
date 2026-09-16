@@ -313,6 +313,9 @@ private:
     uint64_t DoMmap(uint64_t address, uint64_t length, int protection, int flags, int fd, int64_t offset);
     uint64_t DoBrk(uint64_t requested);
     uint64_t DoUname(uint64_t address);
+    /// True only for the literal /proc/self/exe, never for a path that merely resolves to
+    /// the same file.
+    bool IsProcSelfExe(const std::string& path) const;
     uint64_t DoSetThreadArea(uint64_t descriptor_address);
     uint64_t DoSocketcall(uint64_t call, uint64_t arguments_address);
     uint64_t DoLlseek(int fd, uint32_t offset_high, uint32_t offset_low, uint64_t result_address,

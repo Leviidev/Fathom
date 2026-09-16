@@ -123,6 +123,11 @@ public:
   FEX_DEFAULT_VISIBILITY virtual FEXCore::Core::InternalThreadState*
   CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXCore::Core::CPUState* NewThreadState = nullptr) = 0;
 
+  /// Places a 32-bit guest's address space at  in the host's, rather than mapping
+  /// it 1:1. Required on Darwin, where the low 4GB cannot be mapped at all. Must be set
+  /// before any code is compiled; zero (the default) keeps the 1:1 behaviour.
+  FEX_DEFAULT_VISIBILITY virtual void SetGuestMemoryBase(uint64_t Base) = 0;
+
   FEX_DEFAULT_VISIBILITY virtual void DestroyThread(FEXCore::Core::InternalThreadState* Thread) = 0;
 #ifndef _WIN32
   FEX_DEFAULT_VISIBILITY virtual void LockBeforeFork(FEXCore::Core::InternalThreadState* Thread) {}

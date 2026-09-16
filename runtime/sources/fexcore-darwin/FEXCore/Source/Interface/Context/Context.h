@@ -188,6 +188,9 @@ public:
    *
    * @param Thread The internal FEX thread state object
    */
+  void SetGuestMemoryBase(uint64_t Base) override {
+    Config.GuestMemoryBase = Base;
+  }
   void DestroyThread(FEXCore::Core::InternalThreadState* Thread) override;
 
 #ifndef _WIN32

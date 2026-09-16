@@ -512,8 +512,17 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
             record->syscalls->SetClearChildTid(child_tid_address);
         }
 
+        // The thread that actually made the clone call, which is not necessarily the
+        // process's first one: a program whose threads create further threads would
+        // otherwise copy the main thread's registers into the new one, and the new thread
+        // would resume at whatever the main thread happened to be doing.
+        auto* caller = fathom::FexEngine::Current();
+        if (caller == nullptr) {
+            caller = process->thread.get();
+        }
+
         std::string reason;
-        record->thread = engine->ForkThread(*process->thread, *record->syscalls, reason, stack);
+        record->thread = engine->ForkThread(*caller, *record->syscalls, reason, stack);
         if (record->thread == nullptr) {
             FATHOM_ERROR("could not create a guest thread: %s", reason.c_str());
             return -11; // -EAGAIN
@@ -570,8 +579,9 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
         return -11;
     }
     record_raw->started = true;
-    FATHOM_INFO("clone: pid %d created tid %d on stack %#llx", caller_pid, tid,
-                static_cast<unsigned long long>(stack));
+    FATHOM_INFO("clone: pid %d created tid %d on stack %#llx, resuming at %#llx", caller_pid, tid,
+                static_cast<unsigned long long>(stack),
+                static_cast<unsigned long long>(record_raw->thread->Rip()));
     return tid;
 }
 
@@ -616,8 +626,15 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         parent->syscalls->CloneInto(*child->syscalls);
         child->syscalls->SetProcess(child_pid, caller_pid, this);
 
+        // As in CreateThread: the registers a fork copies are the calling thread's, and a
+        // process with more than one thread can fork from any of them.
+        auto* caller = fathom::FexEngine::Current();
+        if (caller == nullptr) {
+            caller = parent->thread.get();
+        }
+
         std::string reason;
-        child->thread = engine->ForkThread(*parent->thread, *child->syscalls, reason);
+        child->thread = engine->ForkThread(*caller, *child->syscalls, reason);
         if (child->thread == nullptr) {
             FATHOM_ERROR("fork failed: %s", reason.c_str());
             return -11; // -EAGAIN

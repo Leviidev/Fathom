@@ -20,6 +20,7 @@
 #include <arpa/inet.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
+#include <thread>
 #include <sys/ioctl.h>
 #include <sys/ipc.h>
 #include <sys/sem.h>
@@ -2581,6 +2582,100 @@ uint64_t LinuxSyscalls::DoPrctl(uint64_t option, uint64_t arg2) {
 }
 
 bool LinuxSyscalls::ProcFileContents(const std::string& guest_path, std::string* out) const {
+    // The system-wide files first: these describe the machine rather than this process.
+    if (guest_path == "/proc/cpuinfo") {
+        // What the guest is actually running on, described in x86's own terms. The
+        // features listed are the ones FEXCore emulates and reports through CPUID, so a
+        // program that reads this and a program that asks the CPU directly get the same
+        // answer. A program refusing to start because this file is missing is common
+        // enough to be worth answering properly -- Steam is one.
+        const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+        out->clear();
+        for (unsigned index = 0; index < cores; ++index) {
+            char entry[1024];
+            std::snprintf(entry, sizeof(entry),
+                          "processor\t: %u\n"
+                          "vendor_id\t: AuthenticAMD\n"
+                          "cpu family\t: 23\n"
+                          "model\t\t: 1\n"
+                          "model name\t: Fathom x86-64 (FEXCore on ARM64)\n"
+                          "stepping\t: 0\n"
+                          "cpu MHz\t\t: 3200.000\n"
+                          "cache size\t: 1024 KB\n"
+                          "physical id\t: 0\n"
+                          "siblings\t: %u\n"
+                          "core id\t\t: %u\n"
+                          "cpu cores\t: %u\n"
+                          "fpu\t\t: yes\n"
+                          "fpu_exception\t: yes\n"
+                          "cpuid level\t: 13\n"
+                          "wp\t\t: yes\n"
+                          "flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca "
+                          "cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext "
+                          "fxsr_opt rdtscp lm constant_tsc rep_good nopl cpuid extd_apicid "
+                          "pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes "
+                          "xsave avx f16c rdrand lahf_lm abm sse4a misalignsse 3dnowprefetch "
+                          "bmi1 avx2 bmi2 rdseed adx clflushopt\n"
+                          "bugs\t\t:\n"
+                          "bogomips\t: 6400.00\n"
+                          "clflush size\t: 64\n"
+                          "cache_alignment\t: 64\n"
+                          "address sizes\t: 48 bits physical, 48 bits virtual\n"
+                          "power management:\n\n",
+                          index, cores, index, cores);
+            out->append(entry);
+        }
+        return true;
+    }
+    if (guest_path == "/proc/meminfo") {
+        uint64_t total = 0;
+        size_t length = sizeof(total);
+        if (sysctlbyname("hw.memsize", &total, &length, nullptr, 0) != 0) {
+            total = 0;
+        }
+        uint32_t free_pages = 0;
+        length = sizeof(free_pages);
+        if (sysctlbyname("vm.page_free_count", &free_pages, &length, nullptr, 0) != 0) {
+            free_pages = 0;
+        }
+        const uint64_t free_bytes = static_cast<uint64_t>(free_pages) *
+                                    static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+        char buffer[512];
+        std::snprintf(buffer, sizeof(buffer),
+                      "MemTotal:       %llu kB\nMemFree:        %llu kB\n"
+                      "MemAvailable:   %llu kB\nBuffers:               0 kB\n"
+                      "Cached:                0 kB\nSwapTotal:             0 kB\n"
+                      "SwapFree:              0 kB\n",
+                      static_cast<unsigned long long>(total / 1024),
+                      static_cast<unsigned long long>(free_bytes / 1024),
+                      static_cast<unsigned long long>(free_bytes / 1024));
+        *out = buffer;
+        return true;
+    }
+    if (guest_path == "/proc/version") {
+        *out = "Linux version 6.6.0-fathom (fathom@fathom) (gcc version 12.2.0) #1 SMP Fathom\n";
+        return true;
+    }
+    if (guest_path == "/proc/uptime") {
+        struct timespec now {};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        char buffer[128];
+        std::snprintf(buffer, sizeof(buffer), "%lld.%02ld %lld.%02ld\n",
+                      static_cast<long long>(now.tv_sec), now.tv_nsec / 10'000'000,
+                      static_cast<long long>(now.tv_sec), now.tv_nsec / 10'000'000);
+        *out = buffer;
+        return true;
+    }
+    if (guest_path == "/proc/filesystems") {
+        *out = "nodev\tproc\nnodev\tsysfs\nnodev\ttmpfs\n\text4\n";
+        return true;
+    }
+    if (guest_path == "/proc/mounts" || guest_path == "/etc/mtab") {
+        *out = "/dev/root / ext4 rw,relatime 0 0\nproc /proc proc rw,relatime 0 0\n"
+               "tmpfs /tmp tmpfs rw,relatime 0 0\n";
+        return true;
+    }
+
     const std::string self_prefix = "/proc/self/";
     const std::string pid_prefix = "/proc/" + std::to_string(pid_) + "/";
     std::string leaf;

@@ -286,6 +286,7 @@ public:
 /// one LinuxSyscalls per process, so the handler has to route to whichever guest thread
 /// is currently executing on this host thread.
 thread_local LinuxSyscalls* g_current_syscalls = nullptr;
+thread_local GuestThread* g_current_guest_thread = nullptr;
 
 /// Writes the executing guest thread's registers out for a crash record. Signal-handler
 /// context: no allocation, no locks, and g_active is thread-local so it describes the
@@ -437,6 +438,7 @@ RunResult GuestThread::Run() {
     // Bound for the duration of the run: the syscall handler is shared by every thread in
     // the context and finds this thread's syscall state through it.
     g_current_syscalls = &impl_->syscalls;
+    g_current_guest_thread = this;
 
     // The guest leaves the JIT one of two ways. A clean HLT returns from ExecuteThread
     // normally; exit_group happens deep inside a syscall with JIT frames still on the
@@ -473,6 +475,7 @@ RunResult GuestThread::Run() {
     }
 
     g_current_syscalls = nullptr;
+    g_current_guest_thread = nullptr;
 
     const auto& state = impl_->thread->CurrentFrame->State;
     result.rip = state.rip;
@@ -565,6 +568,10 @@ FexEngine::FexEngine(std::unique_ptr<Impl> impl)
     : impl_ {std::move(impl)} {}
 
 FexEngine::~FexEngine() = default;
+
+GuestThread* FexEngine::Current() {
+    return g_current_guest_thread;
+}
 
 const char* FexEngine::FexRevision() {
 #ifdef GIT_DESCRIBE_STRING

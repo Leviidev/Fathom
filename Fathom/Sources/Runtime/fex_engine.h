@@ -118,6 +118,11 @@ public:
     std::unique_ptr<GuestThread> ForkThread(const GuestThread& parent, LinuxSyscalls& syscalls,
                                             std::string& error, uint64_t new_rsp = 0);
 
+    /// The guest thread executing on this host thread, or nullptr. A syscall that has to
+    /// look at the caller's registers -- clone, which copies them into a new thread --
+    /// needs the thread that actually made the call, not the process's first one.
+    static GuestThread* Current();
+
     static const char* FexRevision();
 
 private:

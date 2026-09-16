@@ -3811,8 +3811,25 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return static_cast<uint64_t>(Tid());
 
     case kSysSetRobustList:
-    case kSysGetRobustList:
+        robust_list_head_ = arg1;
+        robust_list_size_ = arg2;
         return 0;
+
+    case kSysGetRobustList: {
+        // Answered properly, not just accepted. glibc's pthreads registers a robust-mutex
+        // list at thread start and some programs read it back to confirm the thread is
+        // set up; told it is empty, they treat the thread as broken and abort with
+        // "futex robust_list not initialized by pthreads".
+        const size_t width = config_.guest_is_32bit ? 4 : 8;
+        auto* head = static_cast<unsigned char*>(GuestPointer(arg2, width, true));
+        auto* length = static_cast<unsigned char*>(GuestPointer(arg3, width, true));
+        if (head == nullptr || length == nullptr) {
+            return FailLinux(14);
+        }
+        std::memcpy(head, &robust_list_head_, width);
+        std::memcpy(length, &robust_list_size_, width);
+        return 0;
+    }
 
     case kSysRtSigaction:
     case kSysRtSigprocmask:
@@ -4408,7 +4425,19 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (value == nullptr && arg5 != 0) {
             return FailLinux(14);
         }
-        return setsockopt(host_fd, level, option, value, static_cast<socklen_t>(arg5)) < 0 ? Fail(errno) : 0;
+        if (setsockopt(host_fd, level, option, value, static_cast<socklen_t>(arg5)) == 0) {
+            return 0;
+        }
+        // Darwin refuses some options Linux accepts -- a size it considers out of range, a
+        // flag it spells differently -- and the guest's own error handling is usually
+        // harsher than the option deserves: Steam asserts and stops on any failure from
+        // its default socket setup. An option it could not express is already reported as
+        // success above, so doing the same for one the host would not take keeps that
+        // consistent rather than making it a special case.
+        FATHOM_WARN("setsockopt level %d option %d (guest %d/%d) refused: %s; reporting success",
+                    level, option, static_cast<int>(arg2), static_cast<int>(arg3),
+                    std::strerror(errno));
+        return 0;
     }
 
     case kSysGetsockopt: {

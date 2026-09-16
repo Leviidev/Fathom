@@ -377,6 +377,10 @@ private:
     /// Guest address passed to set_tid_address, cleared on exit the way Linux does.
     uint64_t clear_child_tid_ {};
 
+    /// What set_robust_list registered, so get_robust_list can report it back.
+    uint64_t robust_list_head_ {};
+    uint64_t robust_list_size_ {};
+
     /// Next free GDT slot for set_thread_area. Linux reserves entries 12 through 14 for
     /// userspace TLS and hands them out in order; glibc asks for one and remembers the
     /// number it was given.

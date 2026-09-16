@@ -24,6 +24,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <pthread.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <vector>
 
@@ -830,6 +831,53 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& path,
 
     LoadedProgram loaded;
     std::string reason;
+    // A script rather than a binary. Linux reads the "#!" line and runs the interpreter
+    // named there with the script's path appended, and a program that launches a shell
+    // script -- Steam launches its web helper through one -- depends on exec doing that
+    // rather than reporting the file as unrunnable.
+    {
+        char first_line[256] = {};
+        const int probe = ::open(host_path.c_str(), O_RDONLY);
+        if (probe >= 0) {
+            const ssize_t read_bytes = ::read(probe, first_line, sizeof(first_line) - 1);
+            ::close(probe);
+            if (read_bytes > 2 && first_line[0] == '#' && first_line[1] == '!') {
+                std::string line {first_line + 2, static_cast<size_t>(read_bytes) - 2};
+                const auto newline = line.find('\n');
+                if (newline != std::string::npos) {
+                    line.resize(newline);
+                }
+                // At most one argument after the interpreter, which is what Linux allows.
+                const auto space = line.find_first_of(" \t");
+                std::string interpreter = line.substr(0, space);
+                std::string argument;
+                if (space != std::string::npos) {
+                    const auto rest = line.find_first_not_of(" \t", space);
+                    if (rest != std::string::npos) {
+                        argument = line.substr(rest);
+                    }
+                }
+                while (!interpreter.empty() && (interpreter.back() == '\r' || interpreter.back() == ' ')) {
+                    interpreter.pop_back();
+                }
+                if (!interpreter.empty()) {
+                    std::vector<std::string> rewritten;
+                    rewritten.push_back(interpreter);
+                    if (!argument.empty()) {
+                        rewritten.push_back(argument);
+                    }
+                    rewritten.push_back(path);
+                    // argv[0] is replaced by the script's path; the rest carries over.
+                    for (size_t index = 1; index < argv.size(); ++index) {
+                        rewritten.push_back(argv[index]);
+                    }
+                    FATHOM_INFO("execve %s: running it through %s", path.c_str(), interpreter.c_str());
+                    return ExecProcess(caller_pid, interpreter, std::move(rewritten), std::move(envp));
+                }
+            }
+        }
+    }
+
     // A session's word size is fixed when it starts: the JIT decodes for one or the other,
     // and the guest's address space is laid out to match. A binary of the other width
     // cannot run here, and letting it try is worse than refusing -- its first instructions

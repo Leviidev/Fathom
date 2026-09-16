@@ -9,7 +9,7 @@ int64_t X86_64SyscallForI386(uint64_t i386_number) {
     // signals, sockets and time. Anything missing returns -1 and is reported as
     // unimplemented by number, which is exactly the signal needed to add it.
     static const std::unordered_map<uint64_t, int64_t> kTable = {
-        {1, 231},    // exit -> exit_group is wrong; exit is 60. Corrected below.
+        {1, 60},     // exit
         {2, 57},     // fork
         {3, 0},      // read
         {4, 1},      // write
@@ -18,6 +18,7 @@ int64_t X86_64SyscallForI386(uint64_t i386_number) {
         {10, 87},    // unlink
         {11, 59},    // execve
         {12, 80},    // chdir
+        {14, 133},   // mknod
         {15, 90},    // chmod
         {19, 8},     // lseek
         {20, 39},    // getpid
@@ -74,6 +75,8 @@ int64_t X86_64SyscallForI386(uint64_t i386_number) {
         {270, 234},  // tgkill
         {295, 257},  // openat
         {296, 258},  // mkdirat
+        {297, 259},  // mknodat
+        {298, 260},  // fchownat
         {300, 262},  // fstatat64 -> newfstatat
         {301, 263},  // unlinkat
         {302, 264},  // renameat
@@ -90,32 +93,137 @@ int64_t X86_64SyscallForI386(uint64_t i386_number) {
         {331, 293},  // pipe2
         {340, 302},  // prlimit64
         {355, 318},  // getrandom
+        {29, 34},    // pause
+        {43, 100},   // times
+        {65, 111},   // getpgrp
+        {66, 112},   // setsid
+        {92, 76},    // truncate
+        {93, 77},    // ftruncate
+        {102, -2},   // socketcall: the old multiplexed socket entry, unpacked at the call site
+        {117, -2},   // ipc: the System V IPC multiplexer, unpacked at the call site
+        {120, 56},   // clone
+        {126, 14},   // sigprocmask -> rt_sigprocmask
+        {132, 121},  // getpgid
+        {147, 124},  // getsid
+        {148, 75},   // fdatasync
+        {150, 149},  // mlock
+        {151, 150},  // munlock
+        {152, 151},  // mlockall
+        {153, 152},  // munlockall
+        {158, 24},   // sched_yield
+        {159, 146},  // sched_get_priority_max
+        {160, 147},  // sched_get_priority_min
+        {163, 25},   // mremap
+        {172, 157},  // prctl
+        {173, 15},   // rt_sigreturn
+        {178, 129},  // rt_sigqueueinfo
+        {179, 130},  // rt_sigsuspend
+        {180, 17},   // pread64
+        {181, 18},   // pwrite64
+        {186, 131},  // sigaltstack
+        {190, 58},   // vfork
+        {191, 97},   // ugetrlimit -> getrlimit
+        {193, 76},   // truncate64
+        {194, 77},   // ftruncate64
+        {198, 94},   // lchown32
+        {203, 113},  // setreuid32
+        {204, 114},  // setregid32
+        {205, 115},  // getgroups32
+        {208, 117},  // setresuid32
+        {209, 118},  // getresuid32
+        {210, 119},  // setresgid32
+        {211, 120},  // getresgid32
+        {212, 92},   // chown32
+        {213, 105},  // setuid32
+        {214, 106},  // setgid32
+        {226, 188},  // setxattr
+        {227, 189},  // lsetxattr
+        {228, 190},  // fsetxattr
+        {229, 191},  // getxattr
+        {230, 192},  // lgetxattr
+        {231, 193},  // fgetxattr
+        {232, 194},  // listxattr
+        {233, 195},  // llistxattr
+        {234, 196},  // flistxattr
+        {235, 197},  // removexattr
+        {236, 198},  // lremovexattr
+        {237, 199},  // fremovexattr
+        {238, 200},  // tkill
+        {239, 40},   // sendfile64 -> sendfile
+        {242, 203},  // sched_setaffinity
+        {250, 221},  // fadvise64
+        {254, 213},  // epoll_create
+        {255, 233},  // epoll_ctl
+        {256, 232},  // epoll_wait
+        {268, 137},  // statfs64 -> statfs
+        {269, 138},  // fstatfs64 -> fstatfs
+        {271, 235},  // utimes
+        {272, 221},  // fadvise64_64
+        {284, 247},  // waitid
+        {291, 253},  // inotify_init
+        {292, 254},  // inotify_add_watch
+        {293, 255},  // inotify_rm_watch
+        {311, 273},  // set_robust_list
+        {312, 274},  // get_robust_list
+        {313, 275},  // splice
+        {315, 277},  // sync_file_range
+        {316, 276},  // tee
+        {317, 278},  // vmsplice
+        {319, 309},  // getcpu
+        {321, 282},  // signalfd
+        {322, 283},  // timerfd_create
+        {323, 284},  // eventfd
+        {324, 285},  // fallocate
+        {325, 286},  // timerfd_settime
+        {326, 287},  // timerfd_gettime
+        {327, 289},  // signalfd4
+        {328, 290},  // eventfd2
+        {332, 294},  // inotify_init1
+        {333, 295},  // preadv
+        {334, 296},  // pwritev
+        {338, 299},  // recvmmsg
+        {344, 306},  // syncfs
+        {345, 307},  // sendmmsg
+        {353, 316},  // renameat2
+        {356, 319},  // memfd_create
+        {358, 322},  // execveat
         {359, 41},   // socket
-        {360, 49},   // bind
-        {361, 42},   // connect
-        {362, 50},   // listen
-        {363, 43},   // accept4 -> accept
-        {364, 51},   // getsockname
-        {365, 52},   // getpeername
-        {366, 53},   // socketpair
-        {367, 44},   // sendto
-        {368, 45},   // recvfrom
-        {369, 48},   // shutdown
-        {370, 54},   // setsockopt
-        {371, 55},   // getsockopt
-        {372, 46},   // sendmsg
-        {373, 47},   // recvmsg
+        {360, 53},   // socketpair
+        {361, 49},   // bind
+        {362, 42},   // connect
+        {363, 50},   // listen
+        {364, 288},  // accept4
+        {365, 55},   // getsockopt
+        {366, 54},   // setsockopt
+        {367, 51},   // getsockname
+        {368, 52},   // getpeername
+        {369, 44},   // sendto
+        {370, 46},   // sendmsg
+        {371, 45},   // recvfrom
+        {372, 47},   // recvmsg
+        {373, 48},   // shutdown
+        {374, 323},  // userfaultfd
+        {375, 324},  // membarrier
+        {376, 325},  // mlock2
+        {377, 326},  // copy_file_range
+        {378, 327},  // preadv2
+        {379, 328},  // pwritev2
         {383, 332},  // statx
         {384, 158},  // arch_prctl
+        {386, 334},  // rseq
         {403, 228},  // clock_gettime64 -> clock_gettime
-        {439, 437},  // openat2
+        {404, 227},  // clock_settime64
+        {406, 229},  // clock_getres_time64
+        {407, 230},  // clock_nanosleep_time64
+        {412, 280},  // utimensat_time64
+        {413, 270},  // pselect6_time64
+        {414, 271},  // ppoll_time64
+        {417, 299},  // recvmmsg_time64
+        {422, 202},  // futex_time64
+        {437, 437},  // openat2
+        {439, 439},  // faccessat2
+        {441, 441},  // epoll_pwait2
     };
-
-    // exit(1) is 60 on x86-64, not exit_group. Corrected here rather than in the table so
-    // the table stays a plain transcription.
-    if (i386_number == 1) {
-        return 60;
-    }
 
     const auto entry = kTable.find(i386_number);
     return entry == kTable.end() ? -1 : entry->second;

@@ -14,8 +14,11 @@
 
 namespace fathom {
 
-/// The x86-64 number for an i386 syscall, or -1 if there is no equivalent.
+/// The x86-64 number for an i386 syscall, -1 if there is no equivalent, or
+/// kI386NeedsUnpacking for one whose arguments do not simply carry across.
 int64_t X86_64SyscallForI386(uint64_t i386_number);
+
+constexpr int64_t kI386NeedsUnpacking = -2;
 
 /// i386 numbers whose arguments or results need reshaping as well as renumbering.
 constexpr uint64_t kI386Mmap = 90;      ///< Takes a pointer to a packed argument struct.
@@ -26,5 +29,7 @@ constexpr uint64_t kI386Fstat64 = 197;
 constexpr uint64_t kI386Fstatat64 = 300;
 constexpr uint64_t kI386SetThreadArea = 243;
 constexpr uint64_t kI386Llseek = 140;
+constexpr uint64_t kI386Socketcall = 102; ///< One entry point for all sixteen socket calls.
+constexpr uint64_t kI386Ipc = 117;        ///< The same idea for System V semaphores and shared memory.
 
 } // namespace fathom

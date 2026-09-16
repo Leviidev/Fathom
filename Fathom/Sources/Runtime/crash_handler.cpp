@@ -124,6 +124,21 @@ void Handle(int number, siginfo_t* info, void* context) {
     }
     WriteText("\n=== END ===\n");
 
+    // The ARM64 instruction that faulted, as a raw word. Decoding it says which kind of
+    // access went wrong -- a plain load, a store-release, a pre-indexed push -- which is
+    // what distinguishes an emulation bug from a guest one.
+    if (context != nullptr) {
+        auto* uc = static_cast<ucontext_t*>(context);
+        const uint64_t pc = uc->uc_mcontext->__ss.__pc;
+        WriteText("\nfaulting host pc: ");
+        WriteHex(pc);
+        uint32_t instruction = 0;
+        std::memcpy(&instruction, reinterpret_cast<const void*>(pc), sizeof(instruction));
+        WriteText("\nfaulting instruction: ");
+        WriteHex(instruction);
+        WriteText("\n");
+    }
+
     // The guest's own registers. A fault at a small address means some pointer was null;
     // this is what says which one, and what the code was doing with it.
     if (auto* describer = g_describer.load(std::memory_order_acquire)) {

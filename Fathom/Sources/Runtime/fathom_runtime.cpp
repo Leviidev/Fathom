@@ -96,6 +96,12 @@ public:
         return target_ != nullptr ? target_->GetFsBase() : pending_fs_base_;
     }
 
+    void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit) override {
+        if (target_ != nullptr) {
+            target_->SetTlsDescriptor(entry, base, limit);
+        }
+    }
+
     [[noreturn]] void ExecGuest() override {
         if (target_ != nullptr) {
             target_->ExecGuest();
@@ -284,6 +290,10 @@ struct fathom_session final : fathom::ProcessHost {
     std::string guest_root;
     uint64_t stack_size {};
     bool trace {};
+    /// Whether this session's guest is an i386 one, which every process it forks needs to
+    /// be told: its syscalls are numbered differently, and a child that is not told
+    /// dispatches its parent's numbers as though they were x86-64's.
+    bool guest_is_32bit {};
 
     // The process table. pid 1 is the program the session was created for; everything
     // else got here through a fork.
@@ -451,6 +461,7 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         // Inherited, or a forked child's syscalls are invisible in the log exactly when
         // the interesting thing is what the child did.
         child_config.trace = trace;
+        child_config.guest_is_32bit = guest_is_32bit;
         child->syscalls = std::make_unique<fathom::LinuxSyscalls>(*space, *child->control, console,
                                                                   child_config);
         parent->syscalls->CloneInto(*child->syscalls);
@@ -478,12 +489,19 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         //
         // Two ranges are clamped because they are reserved far larger than they are used:
         // the stack is only live above the stack pointer, and the heap only up to brk.
+        // Everything below is a host address, because that is what gets dereferenced.
+        // Three of these are kept in guest numbering elsewhere -- the heap because the
+        // loader reports it to the guest, the stack pointer because it comes out of a
+        // guest register -- and for a relocated 32-bit guest the two are nowhere near
+        // each other. Copying from a guest address here reads unmapped memory.
         uint64_t held = 0;
         const uint64_t stack_low = parent->program.stack.stack_base;
         const uint64_t stack_top = stack_low + parent->program.stack.stack_size;
-        const uint64_t rsp = parent->thread->Rsp();
-        const uint64_t heap_low = parent->program.heap;
-        const uint64_t heap_used = parent->syscalls->HeapBreak();
+        const uint64_t rsp = space->ToHost(parent->thread->Rsp());
+        const uint64_t heap_low = parent->program.heap == 0 ? 0 : space->ToHost(parent->program.heap);
+        const uint64_t heap_used = parent->syscalls->HeapBreak() == 0
+                                       ? 0
+                                       : space->ToHost(parent->syscalls->HeapBreak());
 
         const uint64_t heap_top = heap_low + kHeapReservation;
         const auto overlaps = [](uint64_t a1, uint64_t a2, uint64_t b1, uint64_t b2) {
@@ -494,14 +512,18 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         // writable range sweeps in whatever sibling processes have mapped -- which on a
         // pipeline's second fork meant copying the first child's entire 128MB heap.
         std::vector<std::pair<uint64_t, uint64_t>> owned = parent->syscalls->Mappings();
-        owned.emplace_back(parent->program.image.image_begin,
+        // ToGuestAddresses put an image's bounds into the guest's numbering, because that
+        // is what the guest is told about them. Copying needs the host's.
+        owned.emplace_back(space->ToHost(parent->program.image.image_begin),
                            parent->program.image.image_end - parent->program.image.image_begin);
         if (parent->program.dynamic) {
-            owned.emplace_back(parent->program.interpreter.image_begin,
+            owned.emplace_back(space->ToHost(parent->program.interpreter.image_begin),
                                parent->program.interpreter.image_end - parent->program.interpreter.image_begin);
         }
         owned.emplace_back(stack_low, stack_top - stack_low);
-        owned.emplace_back(heap_low, kHeapReservation);
+        if (heap_low != 0) {
+            owned.emplace_back(heap_low, kHeapReservation);
+        }
 
         for (const auto& [owned_begin, owned_size] : owned) {
             const fathom::GuestRange range {owned_begin, owned_size, 0};
@@ -599,6 +621,7 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& path,
     process->exec_entry = loaded.entry;
     process->exec_rsp = loaded.stack.rsp;
     process->syscalls->AdoptImage(loaded.heap, kHeapReservation, path);
+    process->syscalls->SetCommandLine(argv);
 
     FATHOM_INFO("execve: pid %d is now %s (entry %#llx)", caller_pid, path.c_str(),
                 static_cast<unsigned long long>(loaded.entry));
@@ -840,11 +863,13 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     syscall_config.work_dir = config->work_dir == nullptr ? "/" : config->work_dir;
     syscall_config.trace = config->trace_syscalls;
     syscall_config.guest_is_32bit = guest_is_32bit;
+    session->guest_is_32bit = guest_is_32bit;
 
     process->control = std::make_unique<DeferredThreadControl>();
     process->syscalls = std::make_unique<fathom::LinuxSyscalls>(*session->space, *process->control,
                                                                 session->console, syscall_config);
     process->syscalls->InitialiseHeap(process->program.heap, kHeapReservation);
+    process->syscalls->SetCommandLine(argv);
     process->syscalls->SetProcess(1, 0, session.get());
 
     fathom::EngineOptions options;

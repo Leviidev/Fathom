@@ -152,6 +152,10 @@ private:
     int error_ {};
 };
 
+/// How many GDT slots the guest gets. FEXCore indexes this array with a selector's top
+/// 13 bits, and Linux only ever hands userspace entries 12 through 14.
+constexpr int kGdtEntries = 32;
+
 /// The guest's segment descriptors. x86-64 barely uses segmentation, but the JIT still
 /// reads a cached CS base, and leaving it unset produces wrong addresses rather than an
 /// obvious failure.
@@ -175,7 +179,7 @@ public:
     }
 
 private:
-    std::array<FEXCore::Core::CPUState::gdt_segment, 32> gdt_ {};
+    std::array<FEXCore::Core::CPUState::gdt_segment, kGdtEntries> gdt_ {};
 };
 
 /// The FEXCore thread executing on this host thread, if any.
@@ -509,6 +513,28 @@ void GuestThread::SetFsBase(uint64_t base) {
 
 uint64_t GuestThread::GetFsBase() const {
     return impl_->thread == nullptr ? 0 : impl_->thread->CurrentFrame->State.fs_cached;
+}
+
+void GuestThread::SetTlsDescriptor(int entry, uint32_t base, uint32_t limit) {
+    if (impl_->thread == nullptr || entry < 0 || entry >= kGdtEntries) {
+        return;
+    }
+    auto& state = impl_->thread->CurrentFrame->State;
+    auto* descriptor = &state.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT][entry];
+    FEXCore::Core::CPUState::SetGDTBase(descriptor, base);
+    FEXCore::Core::CPUState::SetGDTLimit(descriptor, limit);
+    descriptor->S = 1;      // A code/data descriptor rather than a system one.
+    descriptor->Type = 3;   // Data, read/write, accessed.
+    descriptor->DPL = 3;    // Userspace.
+    descriptor->P = 1;      // Present.
+    descriptor->D = 1;      // 32-bit.
+    descriptor->G = 1;      // Limit counted in pages.
+    // The guest loads %gs from this entry immediately afterwards, and that load recomputes
+    // the cached base itself. Refreshing it here matters only when the entry it is
+    // rewriting is the one %gs already points at, which is what a second thread does.
+    if ((state.gs_idx >> 3) == entry) {
+        state.gs_cached = FEXCore::Core::CPUState::CalculateGDTBase(*descriptor);
+    }
 }
 
 void GuestThread::ExecGuest() {

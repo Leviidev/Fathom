@@ -18,7 +18,10 @@
 #include "guest_console.h"
 #include "guest_memory.h"
 
+#include <sys/stat.h>
+
 #include <atomic>
+#include <memory>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -38,6 +41,12 @@ public:
     /// storage lives. Set through arch_prctl(ARCH_SET_FS) during libc startup.
     virtual void SetFsBase(uint64_t base) = 0;
     virtual uint64_t GetFsBase() const = 0;
+
+    /// Installs a thread-local-storage descriptor in the guest's GDT. This is how a
+    /// 32-bit guest does what a 64-bit one does with arch_prctl: set_thread_area fills in
+    /// a descriptor, and the guest then loads %gs with (entry << 3) | 3 so that every
+    /// %gs-relative access lands on its thread's storage. `base` is a guest address.
+    virtual void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit) = 0;
 
     /// Unwinds out of the JIT and ends the run. Never returns.
     [[noreturn]] virtual void ExitGuest(int status) = 0;
@@ -139,7 +148,37 @@ public:
     /// Where the guest's heap starts; established once the program image is loaded.
     void InitialiseHeap(uint64_t base, uint64_t reserved);
 
+    /// The argument vector this process was started with, which /proc/self/cmdline reports.
+    void SetCommandLine(std::vector<std::string> argv);
+
 private:
+    /// The counter behind an eventfd.
+    ///
+    /// Darwin has no eventfd, so one is built out of a pipe plus this: the pipe exists
+    /// only so that poll and select can see the descriptor become readable, and the
+    /// value the guest reads and writes lives here. Shared through a pointer because a
+    /// fork inherits the same object the way it inherits the same pipe.
+    struct EventCounter {
+        std::mutex mutex;
+        uint64_t value {};
+        bool semaphore {};    ///< EFD_SEMAPHORE: a read takes one, not all of it.
+        int signal_write_fd {-1};
+        bool signalled {};    ///< Whether the pipe currently holds its wake-up byte.
+    };
+
+    /// One descriptor's registration in an epoll set.
+    struct EpollInterest {
+        uint32_t events {};
+        uint64_t data {};
+    };
+
+    /// An epoll set. Level-triggered only, answered by polling the registered
+    /// descriptors -- which is what epoll is, minus the kernel's readiness list.
+    struct EpollSet {
+        std::mutex mutex;
+        std::map<int, EpollInterest> interests;
+    };
+
     struct OpenFile {
         int host_fd {-1};
         std::string guest_path;
@@ -149,6 +188,9 @@ private:
         /// shell redirects by pointing fd 1 somewhere else, so "is this the terminal" has
         /// to be a property of the entry, not of the number.
         int console_stream {-1};
+        /// Set when this descriptor is an eventfd or an epoll set rather than a file.
+        std::shared_ptr<EventCounter> event;
+        std::shared_ptr<EpollSet> epoll;
     };
 
     /// Lowest unused guest descriptor, which is the number open() and pipe() must return:
@@ -184,14 +226,35 @@ private:
     uint64_t DoSelect(int count, uint64_t read_address, uint64_t write_address,
                       uint64_t except_address, int64_t timeout_us);
     uint64_t DoWrite(int fd, uint64_t buffer, uint64_t count);
+    /// Reads a guest iovec array as (base, length) pairs, at the guest's pointer width.
+    bool ReadGuestIovec(uint64_t address, uint64_t count,
+                        std::vector<std::pair<uint64_t, uint64_t>>* out) const;
     uint64_t DoWritev(int fd, uint64_t iov, uint64_t count);
     uint64_t DoReadv(int fd, uint64_t iov, uint64_t count);
+    /// Writes a host stat into guest memory in the layout the guest was built for.
+    uint64_t WriteGuestStat(uint64_t address, const struct stat& host);
     uint64_t DoStatAt(int dirfd, uint64_t path_address, uint64_t stat_address, int flags);
     uint64_t DoFstat(int fd, uint64_t stat_address);
     uint64_t DoGetdents64(int fd, uint64_t buffer, uint64_t size);
     uint64_t DoMmap(uint64_t address, uint64_t length, int protection, int flags, int fd, int64_t offset);
     uint64_t DoBrk(uint64_t requested);
     uint64_t DoUname(uint64_t address);
+    uint64_t DoSetThreadArea(uint64_t descriptor_address);
+    uint64_t DoSocketcall(uint64_t call, uint64_t arguments_address);
+    uint64_t DoIpc(uint64_t call, uint64_t first, uint64_t second, uint64_t third, uint64_t pointer);
+    uint64_t DoSemget(int32_t key, int count, int flags);
+    uint64_t DoSemop(int id, uint64_t operations_address, uint64_t count);
+    uint64_t DoSemctl(int id, int index, int command, uint64_t argument);
+    uint64_t DoEventfd(uint64_t initial, int flags);
+    uint64_t DoEventfdRead(OpenFile& file, uint64_t buffer);
+    uint64_t DoEventfdWrite(OpenFile& file, uint64_t buffer);
+    uint64_t DoEpollCreate(int flags);
+    uint64_t DoEpollCtl(int epoll_fd, int operation, int fd, uint64_t event_address);
+    uint64_t DoEpollWait(int epoll_fd, uint64_t events_address, int max_events, int timeout_ms);
+    uint64_t DoMknodAt(int dirfd, uint64_t path_address, uint32_t mode);
+    uint64_t DoPrctl(uint64_t option, uint64_t arg2);
+    /// Answers a read of a /proc file Fathom synthesises. Returns false for anything else.
+    bool ProcFileContents(const std::string& guest_path, std::string* out) const;
     uint64_t DoFramebufferIoctl(uint64_t request, uint64_t argument);
     bool EnsureFramebuffer();
     uint64_t DoClockGettime(int clock, uint64_t address);
@@ -226,6 +289,17 @@ private:
 
     /// Guest address passed to set_tid_address, cleared on exit the way Linux does.
     uint64_t clear_child_tid_ {};
+
+    /// Next free GDT slot for set_thread_area. Linux reserves entries 12 through 14 for
+    /// userspace TLS and hands them out in order; glibc asks for one and remembers the
+    /// number it was given.
+    uint32_t next_tls_entry_ {12};
+
+    /// What prctl(PR_SET_NAME) was told to call this thread.
+    std::string thread_name_;
+
+    /// argv as the process was started with, so /proc/self/cmdline can answer.
+    std::vector<std::string> command_line_;
 
 };
 

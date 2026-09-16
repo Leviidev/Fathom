@@ -17,6 +17,8 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/ipc.h>
+#include <sys/sem.h>
 #include <sys/param.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -228,6 +230,11 @@ enum : uint64_t {
     kSysUname = 63,
     kSysFcntl = 72,
     kSysFsync = 74,
+    kSysFdatasync = 75,
+    kSysMlock = 149,
+    kSysMunlock = 150,
+    kSysMlockall = 151,
+    kSysMunlockall = 152,
     kSysFtruncate = 77,
     kSysGetdents = 78,
     kSysGetcwd = 79,
@@ -275,6 +282,18 @@ enum : uint64_t {
     kSysReadlinkat = 267,
     kSysSetRobustList = 273,
     kSysGetRobustList = 274,
+    kSysPrctl = 157,
+    kSysSemget = 64,
+    kSysSemop = 65,
+    kSysSemctl = 66,
+    kSysMknod = 133,
+    kSysMknodat = 259,
+    kSysEpollCreate = 213,
+    kSysEpollWait = 232,
+    kSysEpollCtl = 233,
+    kSysEpollPwait = 281,
+    kSysEventfd = 284,
+    kSysEventfd2 = 290,
     kSysEpollCreate1 = 291,
     kSysPipe2 = 293,
     kSysPrlimit64 = 302,
@@ -401,6 +420,57 @@ void TranslateStat(const struct stat& host, LinuxStat* out) {
     out->st_ctime_nsec = static_cast<uint64_t>(host.st_ctimespec.tv_nsec);
 }
 
+// i386's struct stat64. Not a narrowed struct stat: the fields are in a different order,
+// st_ino appears twice (once truncated at the front, once whole at the end), and the
+// whole thing is 96 bytes rather than 144. Writing the x86-64 layout here overruns the
+// guest's buffer by 48 bytes, which a stack-allocated one answers with "stack smashing
+// detected" some functions later.
+#pragma pack(push, 1)
+struct LinuxStat32 {
+    uint64_t st_dev;
+    uint8_t pad0[4];
+    uint32_t broken_st_ino;  ///< Truncated to 32 bits, kept for pre-LFS callers.
+    uint32_t st_mode;
+    uint32_t st_nlink;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint64_t st_rdev;
+    uint8_t pad3[4];
+    int64_t st_size;
+    uint32_t st_blksize;
+    uint64_t st_blocks;
+    uint32_t st_atime_sec;
+    uint32_t st_atime_nsec;
+    uint32_t st_mtime_sec;
+    uint32_t st_mtime_nsec;
+    uint32_t st_ctime_sec;
+    uint32_t st_ctime_nsec;
+    uint64_t st_ino;
+};
+#pragma pack(pop)
+static_assert(sizeof(LinuxStat32) == 96, "i386 Linux struct stat64 is 96 bytes");
+
+void TranslateStat32(const struct stat& host, LinuxStat32* out) {
+    std::memset(out, 0, sizeof(*out));
+    out->st_dev = static_cast<uint64_t>(host.st_dev);
+    out->st_ino = host.st_ino;
+    out->broken_st_ino = static_cast<uint32_t>(host.st_ino);
+    out->st_mode = host.st_mode;
+    out->st_nlink = host.st_nlink;
+    out->st_uid = host.st_uid;
+    out->st_gid = host.st_gid;
+    out->st_rdev = static_cast<uint64_t>(host.st_rdev);
+    out->st_size = host.st_size;
+    out->st_blksize = static_cast<uint32_t>(host.st_blksize);
+    out->st_blocks = static_cast<uint64_t>(host.st_blocks);
+    out->st_atime_sec = static_cast<uint32_t>(host.st_atimespec.tv_sec);
+    out->st_atime_nsec = static_cast<uint32_t>(host.st_atimespec.tv_nsec);
+    out->st_mtime_sec = static_cast<uint32_t>(host.st_mtimespec.tv_sec);
+    out->st_mtime_nsec = static_cast<uint32_t>(host.st_mtimespec.tv_nsec);
+    out->st_ctime_sec = static_cast<uint32_t>(host.st_ctimespec.tv_sec);
+    out->st_ctime_nsec = static_cast<uint32_t>(host.st_ctimespec.tv_nsec);
+}
+
 struct LinuxIovec {
     uint64_t base;
     uint64_t length;
@@ -515,6 +585,19 @@ const char* SyscallName(uint64_t number) {
     case kSysFstatfs: return "fstatfs";
     case kSysPipe: return "pipe";
     case kSysPipe2: return "pipe2";
+    case kSysPrctl: return "prctl";
+    case kSysSemget: return "semget";
+    case kSysSemop: return "semop";
+    case kSysSemctl: return "semctl";
+    case kSysMknod: return "mknod";
+    case kSysMknodat: return "mknodat";
+    case kSysEpollCreate: return "epoll_create";
+    case kSysEpollCreate1: return "epoll_create1";
+    case kSysEpollCtl: return "epoll_ctl";
+    case kSysEpollWait: return "epoll_wait";
+    case kSysEpollPwait: return "epoll_pwait";
+    case kSysEventfd: return "eventfd";
+    case kSysEventfd2: return "eventfd2";
     case kSysDup3: return "dup3";
     case kSysGetpid: return "getpid";
     case kSysClone: return "clone";
@@ -608,6 +691,8 @@ void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
         // a write error instead of doing its job.
         inherited.console_stream = file.console_stream;
         inherited.is_framebuffer = file.is_framebuffer;
+        inherited.event = file.event;
+        inherited.epoll = file.epoll;
 
         if (file.host_fd >= 0) {
             inherited.host_fd = dup(file.host_fd);
@@ -752,17 +837,20 @@ bool LinuxSyscalls::ReadGuestStringArray(uint64_t address, std::vector<std::stri
     if (address == 0) {
         return true;  // A null argv is empty, not an error.
     }
+    const size_t slot_size = config_.guest_is_32bit ? 4 : 8;
     for (size_t index = 0; index < 4096; ++index) {
-        const auto* slot = static_cast<const uint64_t*>(
-            GuestPointer(address + index * sizeof(uint64_t), sizeof(uint64_t), false));
+        const auto* slot = static_cast<const unsigned char*>(
+            GuestPointer(address + index * slot_size, slot_size, false));
         if (slot == nullptr) {
             return false;
         }
-        if (*slot == 0) {
+        uint64_t entry_address = 0;
+        std::memcpy(&entry_address, slot, slot_size);
+        if (entry_address == 0) {
             return true;
         }
         std::string entry;
-        if (!ReadGuestString(*slot, &entry)) {
+        if (!ReadGuestString(entry_address, &entry)) {
             return false;
         }
         out->push_back(std::move(entry));
@@ -777,10 +865,13 @@ bool LinuxSyscalls::ReadGuestString(uint64_t address, std::string* out, size_t l
     // Walked a byte at a time with a validity check per page: a guest string has no
     // length, so the only safe way to find its end is to never read past a page the
     // guest does not own.
+    // Guest numbering, like every other pointer a syscall is handed. GuestPointer does
+    // this for fixed-size buffers; a string has to do it itself because it walks.
+    const uint64_t host_address = space_.ToHost(address);
     std::string value;
     value.reserve(64);
     for (size_t offset = 0; offset < limit; ++offset) {
-        const uint64_t byte_address = address + offset;
+        const uint64_t byte_address = host_address + offset;
         if ((offset == 0) || (byte_address % guest::kPageSize) == 0) {
             if (!space_.Validate(byte_address, 1, kGuestProtRead)) {
                 return false;
@@ -859,6 +950,25 @@ uint64_t LinuxSyscalls::DoOpenAt(int dirfd, uint64_t path_address, int flags, in
         return static_cast<uint64_t>(fd);
     }
 
+    // A few /proc files are answered by this layer rather than by the guest root. They
+    // are backed by a real unlinked temporary file so that the descriptor behaves like
+    // any other -- seekable, statable, readable in whatever sized pieces the caller wants.
+    std::string synthesised;
+    if (ProcFileContents(guest_path, &synthesised)) {
+        char pattern[] = "/tmp/fathom-proc-XXXXXX";
+        const int backing = mkstemp(pattern);
+        if (backing < 0) {
+            return Fail(errno);
+        }
+        unlink(pattern);
+        if (!synthesised.empty()) {
+            (void)!write(backing, synthesised.data(), synthesised.size());
+        }
+        lseek(backing, 0, SEEK_SET);
+        std::scoped_lock lock {mutex_};
+        return static_cast<uint64_t>(RegisterFile(backing, guest_path));
+    }
+
     const int host_fd = open(host_path.c_str(), ToHostOpenFlags(flags), static_cast<mode_t>(mode));
     if (host_fd < 0) {
         if (config_.trace) {
@@ -884,6 +994,9 @@ uint64_t LinuxSyscalls::DoWrite(int fd, uint64_t buffer, uint64_t count) {
         if (file == nullptr) {
             return FailLinux(9); // EBADF
         }
+        if (file->event != nullptr) {
+            return DoEventfdWrite(*file, buffer);
+        }
         if (file->console_stream >= 0) {
             console_.Write(file->console_stream, static_cast<const char*>(data), count);
             return count;
@@ -905,6 +1018,9 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
         auto* file = FindFile(fd);
         if (file == nullptr) {
             return FailLinux(9); // EBADF
+        }
+        if (file->event != nullptr) {
+            return DoEventfdRead(*file, buffer);
         }
         from_console = file->console_stream >= 0;
     }
@@ -941,6 +1057,8 @@ static_assert(sizeof(LinuxPollfd) == 8, "guest pollfd must be 8 bytes");
 
 constexpr int16_t kPollIn = 0x001;
 constexpr int16_t kPollOut = 0x004;
+constexpr int16_t kPollErr = 0x008;
+constexpr int16_t kPollHup = 0x010;
 constexpr int16_t kPollNval = 0x020;
 
 } // namespace
@@ -1305,22 +1423,47 @@ void LinuxSyscalls::CloseFd(int fd) {
     files_.erase(entry);
 }
 
+bool LinuxSyscalls::ReadGuestIovec(uint64_t address, uint64_t count,
+                                   std::vector<std::pair<uint64_t, uint64_t>>* out) const {
+    out->clear();
+    if (count == 0) {
+        return true;
+    }
+    // struct iovec is two pointer-sized words, so an i386 guest's is half the width of
+    // this process's. Reading it as the native struct would take every second field as a
+    // base and fail on the first write to stderr.
+    const size_t width = config_.guest_is_32bit ? 4 : 8;
+    const auto* raw = static_cast<const unsigned char*>(GuestPointer(address, count * width * 2, false));
+    if (raw == nullptr) {
+        return false;
+    }
+    out->reserve(count);
+    for (uint64_t index = 0; index < count; ++index) {
+        uint64_t base = 0;
+        uint64_t length = 0;
+        std::memcpy(&base, raw + index * width * 2, width);
+        std::memcpy(&length, raw + index * width * 2 + width, width);
+        out->emplace_back(base, length);
+    }
+    return true;
+}
+
 uint64_t LinuxSyscalls::DoWritev(int fd, uint64_t iov, uint64_t count) {
-    const auto* vectors = static_cast<const LinuxIovec*>(GuestPointer(iov, count * sizeof(LinuxIovec), false));
-    if (vectors == nullptr) {
+    std::vector<std::pair<uint64_t, uint64_t>> vectors;
+    if (!ReadGuestIovec(iov, count, &vectors)) {
         return count == 0 ? 0 : FailLinux(14);
     }
     uint64_t total = 0;
-    for (uint64_t index = 0; index < count; ++index) {
-        if (vectors[index].length == 0) {
+    for (const auto& [base, length] : vectors) {
+        if (length == 0) {
             continue;
         }
-        const uint64_t written = DoWrite(fd, vectors[index].base, vectors[index].length);
+        const uint64_t written = DoWrite(fd, base, length);
         if (static_cast<int64_t>(written) < 0) {
             return total > 0 ? total : written;
         }
         total += written;
-        if (written < vectors[index].length) {
+        if (written < length) {
             break;
         }
     }
@@ -1328,30 +1471,44 @@ uint64_t LinuxSyscalls::DoWritev(int fd, uint64_t iov, uint64_t count) {
 }
 
 uint64_t LinuxSyscalls::DoReadv(int fd, uint64_t iov, uint64_t count) {
-    const auto* vectors = static_cast<const LinuxIovec*>(GuestPointer(iov, count * sizeof(LinuxIovec), false));
-    if (vectors == nullptr) {
+    std::vector<std::pair<uint64_t, uint64_t>> vectors;
+    if (!ReadGuestIovec(iov, count, &vectors)) {
         return count == 0 ? 0 : FailLinux(14);
     }
     uint64_t total = 0;
-    for (uint64_t index = 0; index < count; ++index) {
-        if (vectors[index].length == 0) {
+    for (const auto& [base, length] : vectors) {
+        if (length == 0) {
             continue;
         }
-        const uint64_t bytes = DoRead(fd, vectors[index].base, vectors[index].length);
+        const uint64_t bytes = DoRead(fd, base, length);
         if (static_cast<int64_t>(bytes) < 0) {
             return total > 0 ? total : bytes;
         }
         total += bytes;
-        if (bytes < vectors[index].length) {
+        if (bytes < length) {
             break;
         }
     }
     return total;
 }
 
-uint64_t LinuxSyscalls::DoStatAt(int dirfd, uint64_t path_address, uint64_t stat_address, int flags) {
-    auto* out = static_cast<LinuxStat*>(GuestPointer(stat_address, sizeof(LinuxStat), true));
+uint64_t LinuxSyscalls::WriteGuestStat(uint64_t address, const struct stat& host) {
+    const uint64_t size = config_.guest_is_32bit ? sizeof(LinuxStat32) : sizeof(LinuxStat);
+    void* out = GuestPointer(address, size, true);
     if (out == nullptr) {
+        return FailLinux(14);
+    }
+    if (config_.guest_is_32bit) {
+        TranslateStat32(host, static_cast<LinuxStat32*>(out));
+    } else {
+        TranslateStat(host, static_cast<LinuxStat*>(out));
+    }
+    return 0;
+}
+
+uint64_t LinuxSyscalls::DoStatAt(int dirfd, uint64_t path_address, uint64_t stat_address, int flags) {
+    const uint64_t stat_size = config_.guest_is_32bit ? sizeof(LinuxStat32) : sizeof(LinuxStat);
+    if (GuestPointer(stat_address, stat_size, true) == nullptr) {
         return FailLinux(14);
     }
     std::string path;
@@ -1380,16 +1537,10 @@ uint64_t LinuxSyscalls::DoStatAt(int dirfd, uint64_t path_address, uint64_t stat
     if (result != 0) {
         return Fail(errno);
     }
-    TranslateStat(host, out);
-    return 0;
+    return WriteGuestStat(stat_address, host);
 }
 
 uint64_t LinuxSyscalls::DoFstat(int fd, uint64_t stat_address) {
-    auto* out = static_cast<LinuxStat*>(GuestPointer(stat_address, sizeof(LinuxStat), true));
-    if (out == nullptr) {
-        return FailLinux(14);
-    }
-
     struct stat host {};
     if (IsConsole(fd)) {
         // The guest's stdio is the app's console view, and a character device is the
@@ -1398,20 +1549,20 @@ uint64_t LinuxSyscalls::DoFstat(int fd, uint64_t stat_address) {
         host.st_mode = S_IFCHR | 0620;
         host.st_nlink = 1;
         host.st_blksize = 1024;
-        TranslateStat(host, out);
-        return 0;
+        return WriteGuestStat(stat_address, host);
     }
 
-    std::scoped_lock lock {mutex_};
-    auto* file = FindFile(fd);
-    if (file == nullptr) {
-        return FailLinux(9);
+    {
+        std::scoped_lock lock {mutex_};
+        auto* file = FindFile(fd);
+        if (file == nullptr) {
+            return FailLinux(9);
+        }
+        if (fstat(file->host_fd, &host) != 0) {
+            return Fail(errno);
+        }
     }
-    if (fstat(file->host_fd, &host) != 0) {
-        return Fail(errno);
-    }
-    TranslateStat(host, out);
-    return 0;
+    return WriteGuestStat(stat_address, host);
 }
 
 uint64_t LinuxSyscalls::DoGetdents64(int fd, uint64_t buffer, uint64_t size) {
@@ -1472,6 +1623,12 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
                                int64_t offset) {
     if (length == 0) {
         return FailLinux(22);
+    }
+    // Everything below -- the arena, mappings_, the framebuffer -- is in host addresses.
+    // The guest's hint comes in guest-numbered and the result goes back out the same way;
+    // for a 1:1 (64-bit) guest both conversions are the identity.
+    if (address != 0) {
+        address = space_.ToHost(address);
     }
 
     int guest_protection = 0;
@@ -1535,7 +1692,7 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
             }
             FATHOM_INFO("guest mapped the display at %#llx",
                         static_cast<unsigned long long>(display.address));
-            return display.address;
+            return space_.ToGuest(display.address);
         }
         // A real mmap shares pages with the page cache; this copies instead. For the one
         // case that matters here -- a dynamic loader mapping a library read-only or
@@ -1561,7 +1718,7 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         std::scoped_lock lock {mutex_};
         mappings_.emplace_back(placed, length);
     }
-    return placed;
+    return space_.ToGuest(placed);
 }
 
 uint64_t LinuxSyscalls::DoBrk(uint64_t requested) {
@@ -1700,6 +1857,569 @@ uint64_t LinuxSyscalls::DoReadlinkAt(int dirfd, uint64_t path_address, uint64_t 
     return length < 0 ? Fail(errno) : static_cast<uint64_t>(length);
 }
 
+uint64_t LinuxSyscalls::DoSocketcall(uint64_t call, uint64_t arguments_address) {
+    // i386 reached every socket operation through this one entry point before it was
+    // given individual numbers: `call` says which, and the arguments are an array of
+    // 32-bit words rather than registers. Modern glibc prefers the direct numbers, so
+    // this is here for the older binaries Steam ships alongside its own libraries.
+    struct Call {
+        uint64_t x86_64_number;
+        int arguments;
+    };
+    static constexpr Call kCalls[] = {
+        {0, 0},      {41, 3},  // socket
+        {49, 3},     {42, 3},  // bind, connect
+        {50, 2},     {43, 3},  // listen, accept
+        {51, 3},     {52, 3},  // getsockname, getpeername
+        {53, 4},     {44, 4},  // socketpair, send
+        {45, 4},     {44, 6},  // recv, sendto
+        {45, 6},     {48, 2},  // recvfrom, shutdown
+        {54, 5},     {55, 5},  // setsockopt, getsockopt
+        {46, 3},     {47, 3},  // sendmsg, recvmsg
+        {288, 4},    {299, 5}, // accept4, recvmmsg
+        {307, 4},              // sendmmsg
+    };
+    if (call == 0 || call >= std::size(kCalls)) {
+        return FailLinux(22);
+    }
+    const Call& selected = kCalls[call];
+
+    const auto* words = static_cast<const uint32_t*>(
+        GuestPointer(arguments_address, static_cast<uint64_t>(selected.arguments) * 4, false));
+    if (words == nullptr && selected.arguments > 0) {
+        return FailLinux(14);
+    }
+    uint64_t unpacked[6] = {};
+    for (int index = 0; index < selected.arguments; ++index) {
+        unpacked[index] = words[index];
+    }
+    // send/recv are sendto/recvfrom with no address, which is how Linux implements them.
+    if (call == 9 || call == 10) {
+        unpacked[4] = 0;
+        unpacked[5] = 0;
+    }
+    return Dispatch(selected.x86_64_number, unpacked[0], unpacked[1], unpacked[2], unpacked[3],
+                    unpacked[4], unpacked[5]);
+}
+
+uint64_t LinuxSyscalls::DoSetThreadArea(uint64_t descriptor_address) {
+    // struct user_desc: entry_number, base_addr, limit, then a word of bit fields
+    // describing the segment. Only the first three matter here -- Fathom always installs
+    // a 32-bit read/write data segment, which is the only kind glibc asks for.
+    auto* descriptor = static_cast<uint32_t*>(GuestPointer(descriptor_address, 16, true));
+    if (descriptor == nullptr) {
+        return FailLinux(14);
+    }
+
+    uint32_t entry = descriptor[0];
+    if (entry == 0xFFFF'FFFFU) {
+        // "Any free one." Linux picks a slot and writes the number back, and glibc reads
+        // it to build the selector it loads into %gs.
+        if (next_tls_entry_ > 14) {
+            return FailLinux(22);
+        }
+        entry = next_tls_entry_++;
+        descriptor[0] = entry;
+    } else if (entry < 12 || entry > 14) {
+        return FailLinux(22);
+    }
+
+    control_.SetTlsDescriptor(static_cast<int>(entry), descriptor[1], descriptor[2] >> 12);
+    return 0;
+}
+
+
+// ---------------------------------------------------------------------------
+// Descriptors Darwin does not have
+// ---------------------------------------------------------------------------
+
+uint64_t LinuxSyscalls::DoEventfd(uint64_t initial, int flags) {
+    constexpr int kEfdSemaphore = 1;
+    constexpr int kEfdNonBlock = 0x800;
+
+    // The pipe is not where the value lives -- it is what makes the descriptor visible to
+    // poll, select and epoll, which is most of what an eventfd is used for.
+    int ends[2] = {-1, -1};
+    if (pipe(ends) != 0) {
+        return Fail(errno);
+    }
+    if ((flags & kEfdNonBlock) != 0) {
+        fcntl(ends[0], F_SETFL, fcntl(ends[0], F_GETFL, 0) | O_NONBLOCK);
+    }
+    fcntl(ends[1], F_SETFL, fcntl(ends[1], F_GETFL, 0) | O_NONBLOCK);
+
+    auto counter = std::make_shared<EventCounter>();
+    counter->value = initial;
+    counter->semaphore = (flags & kEfdSemaphore) != 0;
+    counter->signal_write_fd = ends[1];
+
+    std::scoped_lock lock {mutex_};
+    const int fd = RegisterFile(ends[0], "anon_inode:[eventfd]");
+    files_[fd].event = counter;
+    if (initial != 0) {
+        const char byte = 1;
+        if (write(ends[1], &byte, 1) == 1) {
+            counter->signalled = true;
+        }
+    }
+    return static_cast<uint64_t>(fd);
+}
+
+uint64_t LinuxSyscalls::DoEventfdRead(OpenFile& file, uint64_t buffer) {
+    auto* out = static_cast<uint64_t*>(GuestPointer(buffer, sizeof(uint64_t), true));
+    if (out == nullptr) {
+        return FailLinux(14);
+    }
+    auto counter = file.event;
+    std::scoped_lock lock {counter->mutex};
+    if (counter->value == 0) {
+        return FailLinux(11); // EAGAIN; a blocking read would park here instead.
+    }
+    if (counter->semaphore) {
+        *out = 1;
+        counter->value -= 1;
+    } else {
+        *out = counter->value;
+        counter->value = 0;
+    }
+    if (counter->value == 0 && counter->signalled) {
+        char byte = 0;
+        (void)read(file.host_fd, &byte, 1);
+        counter->signalled = false;
+    }
+    return sizeof(uint64_t);
+}
+
+uint64_t LinuxSyscalls::DoEventfdWrite(OpenFile& file, uint64_t buffer) {
+    const auto* in = static_cast<const uint64_t*>(GuestPointer(buffer, sizeof(uint64_t), false));
+    if (in == nullptr) {
+        return FailLinux(14);
+    }
+    if (*in == ~0ULL) {
+        return FailLinux(22); // The one value the kernel refuses.
+    }
+    auto counter = file.event;
+    std::scoped_lock lock {counter->mutex};
+    counter->value += *in;
+    if (counter->value != 0 && !counter->signalled) {
+        const char byte = 1;
+        if (write(counter->signal_write_fd, &byte, 1) == 1) {
+            counter->signalled = true;
+        }
+    }
+    return sizeof(uint64_t);
+}
+
+uint64_t LinuxSyscalls::DoEpollCreate(int flags) {
+    (void)flags;
+    std::scoped_lock lock {mutex_};
+    const int fd = RegisterFile(-1, "anon_inode:[eventpoll]");
+    files_[fd].epoll = std::make_shared<EpollSet>();
+    return static_cast<uint64_t>(fd);
+}
+
+uint64_t LinuxSyscalls::DoEpollCtl(int epoll_fd, int operation, int fd, uint64_t event_address) {
+    constexpr int kEpollCtlAdd = 1;
+    constexpr int kEpollCtlDel = 2;
+    constexpr int kEpollCtlMod = 3;
+
+    std::shared_ptr<EpollSet> set;
+    {
+        std::scoped_lock lock {mutex_};
+        auto* file = FindFile(epoll_fd);
+        if (file == nullptr || file->epoll == nullptr) {
+            return FailLinux(9); // EBADF
+        }
+        if (FindFile(fd) == nullptr) {
+            return FailLinux(9);
+        }
+        set = file->epoll;
+    }
+
+    if (operation == kEpollCtlDel) {
+        std::scoped_lock lock {set->mutex};
+        return set->interests.erase(fd) == 0 ? FailLinux(2) : 0;
+    }
+
+    // struct epoll_event is packed on x86: a 32-bit event mask followed by an eight-byte
+    // union with no padding between them, on both i386 and x86-64.
+    const auto* raw = static_cast<const unsigned char*>(GuestPointer(event_address, 12, false));
+    if (raw == nullptr) {
+        return FailLinux(14);
+    }
+    EpollInterest interest;
+    std::memcpy(&interest.events, raw, 4);
+    std::memcpy(&interest.data, raw + 4, 8);
+
+    std::scoped_lock lock {set->mutex};
+    if (operation == kEpollCtlAdd) {
+        if (!set->interests.emplace(fd, interest).second) {
+            return FailLinux(17); // EEXIST
+        }
+        return 0;
+    }
+    if (operation == kEpollCtlMod) {
+        auto entry = set->interests.find(fd);
+        if (entry == set->interests.end()) {
+            return FailLinux(2);
+        }
+        entry->second = interest;
+        return 0;
+    }
+    return FailLinux(22);
+}
+
+uint64_t LinuxSyscalls::DoEpollWait(int epoll_fd, uint64_t events_address, int max_events,
+                                    int timeout_ms) {
+    if (max_events <= 0) {
+        return FailLinux(22);
+    }
+    std::shared_ptr<EpollSet> set;
+    {
+        std::scoped_lock lock {mutex_};
+        auto* file = FindFile(epoll_fd);
+        if (file == nullptr || file->epoll == nullptr) {
+            return FailLinux(9);
+        }
+        set = file->epoll;
+    }
+    auto* out = static_cast<unsigned char*>(
+        GuestPointer(events_address, static_cast<uint64_t>(max_events) * 12, true));
+    if (out == nullptr) {
+        return FailLinux(14);
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
+    for (;;) {
+        if (console_.StopRequested()) {
+            exit_status_ = -1;
+            control_.ExitGuest(-1);
+        }
+
+        // A snapshot, so the host poll below runs without either lock held.
+        std::vector<std::pair<int, EpollInterest>> watched;
+        {
+            std::scoped_lock lock {set->mutex};
+            watched.assign(set->interests.begin(), set->interests.end());
+        }
+
+        std::vector<struct pollfd> host_fds;
+        std::vector<const EpollInterest*> owners;
+        host_fds.reserve(watched.size());
+        owners.reserve(watched.size());
+        {
+            std::scoped_lock lock {mutex_};
+            for (const auto& [guest_fd, interest] : watched) {
+                auto* file = FindFile(guest_fd);
+                if (file == nullptr || file->host_fd < 0) {
+                    continue;
+                }
+                struct pollfd entry {};
+                entry.fd = file->host_fd;
+                if ((interest.events & kPollIn) != 0) entry.events |= POLLIN;
+                if ((interest.events & kPollOut) != 0) entry.events |= POLLOUT;
+                host_fds.push_back(entry);
+                owners.push_back(&interest);
+            }
+        }
+
+        int ready = host_fds.empty() ? 0 : poll(host_fds.data(), static_cast<nfds_t>(host_fds.size()), 0);
+        if (ready < 0 && errno != EINTR) {
+            return Fail(errno);
+        }
+        uint64_t reported = 0;
+        for (size_t index = 0; index < host_fds.size() && reported < static_cast<uint64_t>(max_events); ++index) {
+            uint32_t events = 0;
+            if ((host_fds[index].revents & POLLIN) != 0) events |= kPollIn;
+            if ((host_fds[index].revents & POLLOUT) != 0) events |= kPollOut;
+            if ((host_fds[index].revents & POLLERR) != 0) events |= kPollErr;
+            if ((host_fds[index].revents & POLLHUP) != 0) events |= kPollHup;
+            if (events == 0) {
+                continue;
+            }
+            std::memcpy(out + reported * 12, &events, 4);
+            std::memcpy(out + reported * 12 + 4, &owners[index]->data, 8);
+            ++reported;
+        }
+        if (reported > 0) {
+            return reported;
+        }
+        if (timeout_ms == 0 || (timeout_ms > 0 && std::chrono::steady_clock::now() >= deadline)) {
+            return 0;
+        }
+        console_.WaitForInput(10);
+    }
+}
+
+uint64_t LinuxSyscalls::DoMknodAt(int dirfd, uint64_t path_address, uint32_t mode) {
+    std::string path;
+    if (!ReadGuestString(path_address, &path)) {
+        return FailLinux(14);
+    }
+    const std::string host_path = ResolveAt(dirfd, path.c_str(), nullptr);
+    const uint32_t kind = mode & S_IFMT;
+
+    // Only the two kinds an unprivileged process can actually make. Linux answers EPERM
+    // for a device node, which is what a program checks for.
+    if (kind == S_IFIFO) {
+        return mkfifo(host_path.c_str(), mode & 07777) != 0 ? Fail(errno) : 0;
+    }
+    if (kind == 0 || kind == S_IFREG) {
+        const int fd = open(host_path.c_str(), O_CREAT | O_EXCL | O_WRONLY, mode & 07777);
+        if (fd < 0) {
+            return Fail(errno);
+        }
+        close(fd);
+        return 0;
+    }
+    return FailLinux(1); // EPERM
+}
+
+uint64_t LinuxSyscalls::DoPrctl(uint64_t option, uint64_t arg2) {
+    constexpr uint64_t kPrSetPdeathsig = 1;
+    constexpr uint64_t kPrGetDumpable = 3;
+    constexpr uint64_t kPrSetDumpable = 4;
+    constexpr uint64_t kPrSetName = 15;
+    constexpr uint64_t kPrGetName = 16;
+    constexpr uint64_t kPrSetPtracer = 0x59616d61;
+    constexpr uint64_t kPrSetChildSubreaper = 36;
+    constexpr uint64_t kPrSetNoNewPrivs = 38;
+
+    switch (option) {
+    case kPrSetName: {
+        std::string name;
+        if (!ReadGuestString(arg2, &name, 16)) {
+            // The kernel takes 16 bytes with no terminator required, so a name that fills
+            // the buffer exactly is not an error.
+            const auto* raw = static_cast<const char*>(GuestPointer(arg2, 16, false));
+            if (raw == nullptr) {
+                return FailLinux(14);
+            }
+            name.assign(raw, 16);
+        }
+        thread_name_ = std::move(name);
+        return 0;
+    }
+    case kPrGetName: {
+        auto* out = static_cast<char*>(GuestPointer(arg2, 16, true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        std::memset(out, 0, 16);
+        std::memcpy(out, thread_name_.c_str(), std::min<size_t>(thread_name_.size(), 15));
+        return 0;
+    }
+    case kPrGetDumpable:
+        return 1;
+    case kPrSetPdeathsig:
+    case kPrSetDumpable:
+    case kPrSetPtracer:
+    case kPrSetChildSubreaper:
+    case kPrSetNoNewPrivs:
+        // Accepted and ignored: each of these is about how this process relates to a
+        // parent, a debugger or the kernel's dumping machinery, none of which exists here.
+        return 0;
+    default:
+        return FailLinux(22); // EINVAL, which is what an unknown option gets on Linux.
+    }
+}
+
+bool LinuxSyscalls::ProcFileContents(const std::string& guest_path, std::string* out) const {
+    const std::string self_prefix = "/proc/self/";
+    const std::string pid_prefix = "/proc/" + std::to_string(pid_) + "/";
+    std::string leaf;
+    if (guest_path.rfind(self_prefix, 0) == 0) {
+        leaf = guest_path.substr(self_prefix.size());
+    } else if (guest_path.rfind(pid_prefix, 0) == 0) {
+        leaf = guest_path.substr(pid_prefix.size());
+    } else {
+        return false;
+    }
+
+    if (leaf == "cmdline") {
+        // NUL-separated, with a trailing NUL: a program splits on it rather than on spaces.
+        out->clear();
+        for (const auto& argument : command_line_) {
+            out->append(argument);
+            out->push_back('\0');
+        }
+        return true;
+    }
+    if (leaf == "status") {
+        char buffer[512];
+        std::snprintf(buffer, sizeof(buffer),
+                      "Name:\t%s\nState:\tR (running)\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\n"
+                      "TracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\n",
+                      thread_name_.empty() ? "fathom" : thread_name_.c_str(), pid_, pid_, ppid_);
+        *out = buffer;
+        return true;
+    }
+    return false;
+}
+
+void LinuxSyscalls::SetCommandLine(std::vector<std::string> argv) {
+    command_line_ = std::move(argv);
+    if (thread_name_.empty() && !command_line_.empty()) {
+        const auto slash = command_line_.front().rfind('/');
+        thread_name_ = slash == std::string::npos ? command_line_.front()
+                                                  : command_line_.front().substr(slash + 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// System V semaphores
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Linux and Darwin both inherited System V semaphores, but not its command numbering:
+/// GETVAL is 12 on Linux and 5 here, and every other command is shifted too. The flag
+/// bits (IPC_CREAT, IPC_EXCL, the permission bits) did carry across and need no mapping.
+int ToHostSemctlCommand(int guest_command, bool* supported) {
+    *supported = true;
+    switch (guest_command & ~0x100 /* IPC_64, which only selects a struct layout */) {
+    case 0: return IPC_RMID;
+    case 1: return IPC_SET;
+    case 2: return IPC_STAT;
+    case 11: return GETPID;
+    case 12: return GETVAL;
+    case 13: return GETALL;
+    case 14: return GETNCNT;
+    case 15: return GETZCNT;
+    case 16: return SETVAL;
+    case 17: return SETALL;
+    default: *supported = false; return 0;
+    }
+}
+
+} // namespace
+
+uint64_t LinuxSyscalls::DoSemget(int32_t key, int count, int flags) {
+    const int id = semget(static_cast<key_t>(key), count, flags);
+    return id < 0 ? Fail(errno) : static_cast<uint64_t>(id);
+}
+
+uint64_t LinuxSyscalls::DoSemop(int id, uint64_t operations_address, uint64_t count) {
+    // struct sembuf is three 16-bit fields on both systems, so it crosses unchanged.
+    auto* operations = static_cast<struct sembuf*>(
+        GuestPointer(operations_address, count * sizeof(struct sembuf), false));
+    if (operations == nullptr) {
+        return count == 0 ? 0 : FailLinux(14);
+    }
+    return semop(id, operations, static_cast<size_t>(count)) != 0 ? Fail(errno) : 0;
+}
+
+uint64_t LinuxSyscalls::DoSemctl(int id, int index, int command, uint64_t argument) {
+    bool supported = false;
+    const int host_command = ToHostSemctlCommand(command, &supported);
+    if (!supported) {
+        return FailLinux(22); // EINVAL
+    }
+
+    switch (host_command) {
+    case IPC_RMID:
+    case GETPID:
+    case GETVAL:
+    case GETNCNT:
+    case GETZCNT: {
+        const int result = semctl(id, index, host_command);
+        return result < 0 ? Fail(errno) : static_cast<uint64_t>(result);
+    }
+    case SETVAL: {
+        union semun value {};
+        value.val = static_cast<int>(argument);
+        return semctl(id, index, SETVAL, value) < 0 ? Fail(errno) : 0;
+    }
+    case GETALL:
+    case SETALL: {
+        // The guest hands over an array of unsigned shorts, one per semaphore, which is
+        // the same shape here. How many there are is the set's own business, so ask it.
+        struct semid_ds description {};
+        union semun query {};
+        query.buf = &description;
+        if (semctl(id, 0, IPC_STAT, query) < 0) {
+            return Fail(errno);
+        }
+        const uint64_t count = description.sem_nsems;
+        auto* values = static_cast<unsigned short*>(
+            GuestPointer(argument, count * sizeof(unsigned short), host_command == GETALL));
+        if (values == nullptr) {
+            return FailLinux(14);
+        }
+        union semun value {};
+        value.array = values;
+        return semctl(id, 0, host_command, value) < 0 ? Fail(errno) : 0;
+    }
+    case IPC_STAT: {
+        struct semid_ds description {};
+        union semun query {};
+        query.buf = &description;
+        if (semctl(id, 0, IPC_STAT, query) < 0) {
+            return Fail(errno);
+        }
+        // Linux's struct semid64_ds: struct ipc64_perm, then three time_t-sized words and
+        // the semaphore count. Written field by field at 64-bit offsets, the same way
+        // every other structure in this file is.
+        auto* out = static_cast<unsigned char*>(GuestPointer(argument, 104, true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        std::memset(out, 0, 104);
+        const auto put32 = [&](size_t offset, uint32_t value) { std::memcpy(out + offset, &value, 4); };
+        const auto put64 = [&](size_t offset, uint64_t value) { std::memcpy(out + offset, &value, 8); };
+        put32(0, static_cast<uint32_t>(description.sem_perm._key));  // key
+        put32(4, description.sem_perm.uid);
+        put32(8, description.sem_perm.gid);
+        put32(12, description.sem_perm.cuid);
+        put32(16, description.sem_perm.cgid);
+        put32(20, description.sem_perm.mode);
+        put64(64, static_cast<uint64_t>(description.sem_otime));
+        put64(80, static_cast<uint64_t>(description.sem_ctime));
+        put64(96, description.sem_nsems);
+        return 0;
+    }
+    default:
+        return FailLinux(22);
+    }
+}
+
+uint64_t LinuxSyscalls::DoIpc(uint64_t call, uint64_t first, uint64_t second, uint64_t third,
+                             uint64_t pointer) {
+    // i386 reaches all of System V IPC through this one entry point, the way it once
+    // reached all of sockets through socketcall.
+    constexpr uint64_t kSemop = 1;
+    constexpr uint64_t kSemget = 2;
+    constexpr uint64_t kSemctl = 3;
+    constexpr uint64_t kSemtimedop = 4;
+
+    switch (call & 0xFFFF) {
+    case kSemop:
+    case kSemtimedop:
+        // The timeout is ignored: semop blocks until it can proceed, which is the same
+        // thing for every caller that does not actually set one.
+        return DoSemop(static_cast<int>(first), pointer, second);
+    case kSemget:
+        return DoSemget(static_cast<int32_t>(first), static_cast<int>(second),
+                        static_cast<int>(third));
+    case kSemctl: {
+        // The fourth argument arrives indirectly: `pointer` points at the union, it is
+        // not the union. This is a quirk of sys_ipc, not of semctl.
+        if (pointer == 0) {
+            return FailLinux(22);
+        }
+        const auto* slot = static_cast<const uint32_t*>(GuestPointer(pointer, 4, false));
+        if (slot == nullptr) {
+            return FailLinux(14);
+        }
+        return DoSemctl(static_cast<int>(first), static_cast<int>(second),
+                        static_cast<int>(third), *slot);
+    }
+    default:
+        FATHOM_WARN("unimplemented System V IPC call %llu", static_cast<unsigned long long>(call));
+        return FailLinux(38);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -1710,6 +2430,17 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
     // x86-64's 4 is stat -- so the number is translated before anything looks at it, and
     // one implementation of each syscall serves both.
     if (config_.guest_is_32bit) {
+        if (number == kI386SetThreadArea) {
+            // x86-64 has no equivalent: a 64-bit guest sets its TLS pointer with
+            // arch_prctl, so there is no number to translate this into.
+            return DoSetThreadArea(arg1);
+        }
+        if (number == kI386Socketcall) {
+            return DoSocketcall(arg1, arg2);
+        }
+        if (number == kI386Ipc) {
+            return DoIpc(arg1, arg2, arg3, arg4, arg5);
+        }
         if (number == kI386Mmap2) {
             // The only argument difference that matters here: mmap2 counts its offset in
             // 4096-byte pages so that a 32-bit register can address a large file.
@@ -1717,7 +2448,10 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
         }
         const int64_t translated = X86_64SyscallForI386(number);
         if (translated < 0) {
-            FATHOM_WARN("unimplemented i386 syscall %llu", static_cast<unsigned long long>(number));
+            FATHOM_WARN("unimplemented i386 syscall %llu (%#llx, %#llx, %#llx, %#llx, %#llx)",
+                        static_cast<unsigned long long>(number), static_cast<unsigned long long>(arg1),
+                        static_cast<unsigned long long>(arg2), static_cast<unsigned long long>(arg3),
+                        static_cast<unsigned long long>(arg4), static_cast<unsigned long long>(arg5));
             return FailLinux(38);
         }
         number = static_cast<uint64_t>(translated);
@@ -1833,13 +2567,14 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                       static_cast<int>(arg5), static_cast<int64_t>(arg6));
 
     case kSysMunmap: {
+        const uint64_t host_address = space_.ToHost(arg1);
         {
             std::scoped_lock lock {mutex_};
             std::erase_if(mappings_, [&](const auto& entry) {
-                return entry.first >= arg1 && entry.first + entry.second <= arg1 + arg2;
+                return entry.first >= host_address && entry.first + entry.second <= host_address + arg2;
             });
         }
-        return space_.Release(arg1, arg2) ? 0 : FailLinux(22);
+        return space_.Release(host_address, arg2) ? 0 : FailLinux(22);
     }
 
     case kSysMprotect: {
@@ -1847,18 +2582,18 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if ((arg3 & guest::kProtRead) != 0) guest_protection |= kGuestProtRead;
         if ((arg3 & guest::kProtWrite) != 0) guest_protection |= kGuestProtWrite;
         if ((arg3 & guest::kProtExec) != 0) guest_protection |= kGuestProtExec;
-        return space_.Protect(arg1, arg2, guest_protection) ? 0 : FailLinux(22);
+        return space_.Protect(space_.ToHost(arg1), arg2, guest_protection) ? 0 : FailLinux(22);
     }
 
     case kSysMremap: {
         constexpr uint64_t kMremapMayMove = 1;
-        const uint64_t old_address = arg1;
+        const uint64_t old_address = space_.ToHost(arg1);
         const uint64_t old_size = arg2;
         const uint64_t new_size = arg3;
         const uint64_t flags = arg4;
 
         if (new_size <= old_size) {
-            return old_address;
+            return arg1;
         }
         // Without MREMAP_MAYMOVE the caller has said the mapping must not move, and Linux
         // answers ENOMEM rather than relocating it. Moving anyway hands back an address
@@ -1877,7 +2612,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         // reads as zero.
         std::memset(reinterpret_cast<uint8_t*>(placed) + old_size, 0, new_size - old_size);
         space_.Release(old_address, old_size);
-        return placed;
+        return space_.ToGuest(placed);
     }
 
     case kSysBrk:
@@ -1886,6 +2621,12 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysMadvise:
     case kSysMsync:
     case kSysFsync:
+    case kSysFdatasync:
+    // Guest memory is never paged out, so locking it is already true.
+    case kSysMlock:
+    case kSysMunlock:
+    case kSysMlockall:
+    case kSysMunlockall:
         return 0;
 
     case kSysIoctl: {
@@ -2246,23 +2987,31 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (out_address == 0) {
             return 0;
         }
-        auto* out = static_cast<uint64_t*>(GuestPointer(out_address, sizeof(uint64_t) * 2, true));
+        // struct rlimit's two fields are `unsigned long`, so an i386 guest's is eight
+        // bytes and this process's is sixteen. prlimit64 is the exception: it is
+        // explicitly 64-bit on both. Writing sixteen bytes into an eight-byte stack
+        // buffer lands squarely on the canary, and glibc answers with "stack smashing
+        // detected" in whatever function returns next.
+        const bool narrow = config_.guest_is_32bit && number == kSysGetrlimit;
+        const uint64_t width = narrow ? 4 : 8;
+        auto* out = static_cast<unsigned char*>(GuestPointer(out_address, width * 2, true));
         if (out == nullptr) {
             return FailLinux(14);
         }
         const uint64_t resource = number == kSysGetrlimit ? arg1 : arg2;
         constexpr uint64_t kRlimitStack = 3;
         constexpr uint64_t kRlimitNofile = 7;
+        const uint64_t infinity = narrow ? 0xFFFF'FFFFULL : ~0ULL;
+        uint64_t soft = infinity;
+        uint64_t hard = infinity;
         if (resource == kRlimitStack) {
-            out[0] = 8ULL * 1024 * 1024;
-            out[1] = ~0ULL;
+            soft = 8ULL * 1024 * 1024;
         } else if (resource == kRlimitNofile) {
-            out[0] = 1024;
-            out[1] = 4096;
-        } else {
-            out[0] = ~0ULL;
-            out[1] = ~0ULL;
+            soft = 1024;
+            hard = 4096;
         }
+        std::memcpy(out, &soft, width);
+        std::memcpy(out + width, &hard, width);
         return 0;
     }
 
@@ -2882,8 +3631,37 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return 0;
     }
 
-    case kSysSysinfo:
+    case kSysPrctl:
+        return DoPrctl(arg1, arg2);
+
+    case kSysSemget:
+        return DoSemget(static_cast<int32_t>(arg1), static_cast<int>(arg2), static_cast<int>(arg3));
+    case kSysSemop:
+        return DoSemop(static_cast<int>(arg1), arg2, arg3);
+    case kSysSemctl:
+        return DoSemctl(static_cast<int>(arg1), static_cast<int>(arg2), static_cast<int>(arg3), arg4);
+
+    case kSysMknod:
+        return DoMknodAt(guest::kAtFdCwd, arg1, static_cast<uint32_t>(arg2));
+    case kSysMknodat:
+        return DoMknodAt(static_cast<int>(arg1), arg2, static_cast<uint32_t>(arg3));
+
+    case kSysEventfd:
+        return DoEventfd(arg1, 0);
+    case kSysEventfd2:
+        return DoEventfd(arg1, static_cast<int>(arg2));
+
+    case kSysEpollCreate:
     case kSysEpollCreate1:
+        return DoEpollCreate(number == kSysEpollCreate1 ? static_cast<int>(arg1) : 0);
+    case kSysEpollCtl:
+        return DoEpollCtl(static_cast<int>(arg1), static_cast<int>(arg2), static_cast<int>(arg3), arg4);
+    case kSysEpollWait:
+    case kSysEpollPwait:
+        return DoEpollWait(static_cast<int>(arg1), arg2, static_cast<int>(arg3),
+                           static_cast<int>(arg4));
+
+    case kSysSysinfo:
     case kSysMemfdCreate:
         return FailLinux(38);
 

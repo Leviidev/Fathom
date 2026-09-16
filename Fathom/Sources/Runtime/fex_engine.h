@@ -88,6 +88,7 @@ public:
     // GuestThreadControl
     void SetFsBase(uint64_t base) override;
     uint64_t GetFsBase() const override;
+    void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit) override;
     [[noreturn]] void ExitGuest(int status) override;
 
 private:

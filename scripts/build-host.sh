@@ -53,6 +53,11 @@ done
 echo "==> Linking"
 # Repeated in a group: these archives reference each other both ways, and a single pass
 # leaves undefined symbols depending on the order they happen to be listed in.
+# Note for later: non-PIE (ET_EXEC) Linux binaries want a fixed low address, classically
+# 0x400000, which falls inside the default 4GB __PAGEZERO. Shrinking it with
+# -Wl,-pagezero_size looks like the fix and is not: the harness then produces no output at
+# all, because far more than the loader depends on that reservation. Loading ET_EXEC
+# images needs handling in the loader, not in the link line.
 clang++ -target arm64-apple-macos14.4 -o "$OUT" "${objects[@]}" \
     -Wl,-search_paths_first \
     "$LIBS_DIR"/*.a "$LIBS_DIR"/*.a \

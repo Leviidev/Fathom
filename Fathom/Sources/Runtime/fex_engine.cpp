@@ -252,6 +252,10 @@ bool Readable(const void* address, size_t size) {
     return write(fd, address, size) == static_cast<ssize_t>(size);
 }
 
+/// Declared here and defined below: the fault handler wants to name the guest process
+/// it is reporting on, and the definition sits with the rest of the syscall plumbing.
+extern thread_local LinuxSyscalls* g_current_syscalls;
+
 /// How many times this exact instruction has faulted, roughly.
 ///
 /// A few hundred slots, indexed by address, with no locking and no exactness: two sites
@@ -322,8 +326,10 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
         static std::atomic<uint64_t> wild_fixups {0};
         const auto seen = wild_fixups.fetch_add(1, std::memory_order_relaxed) + 1;
         if (seen <= 8 || (seen & 0x3FF) == 0) {
-            FATHOM_WARN("guest read %p, which is not mapped, from an instruction this can "
-                        "step over (%llu so far, guest rip %#llx)",
+            FATHOM_WARN("pid %d tid %d read %p, which is not mapped, from an instruction "
+                        "this can step over (%llu so far, guest rip %#llx)",
+                        g_current_syscalls == nullptr ? -1 : g_current_syscalls->Pid(),
+                        g_current_syscalls == nullptr ? -1 : g_current_syscalls->Tid(),
                         info->si_addr, static_cast<unsigned long long>(seen),
                         static_cast<unsigned long long>(g_active.thread->CurrentFrame->State.rip));
         }

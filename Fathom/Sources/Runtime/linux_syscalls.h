@@ -334,6 +334,12 @@ private:
         /// A directory made up for the guest -- /proc/self/fd is one -- to be removed when
         /// the descriptor onto it is closed.
         std::string scratch_directory;
+        /// Whether an exec closes this descriptor. Ignoring it used to be harmless, but a
+        /// program that hands one end of a socket pair to a child and keeps the other is
+        /// relying on every *other* copy going away: extra copies left open in processes
+        /// that were only ever passing through mean the end-of-file the far side waits
+        /// for never comes.
+        bool close_on_exec {};
         /// What the guest last asked for, because timerfd_gettime has to answer with it.
         int64_t timer_interval_ns {};
         int64_t timer_value_ns {};
@@ -470,7 +476,7 @@ private:
     uint64_t DoReadlinkAt(int dirfd, uint64_t path_address, uint64_t buffer, uint64_t size);
 
     OpenFile* FindFile(int fd);
-    int RegisterFile(int host_fd, std::string guest_path);
+    int RegisterFile(int host_fd, std::string guest_path, bool close_on_exec = false);
     void CloseAll();
 
     GuestAddressSpace& space_;

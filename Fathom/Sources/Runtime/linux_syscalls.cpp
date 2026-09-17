@@ -884,6 +884,7 @@ void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
         inherited.event = file.event;
         inherited.epoll = file.epoll;
         inherited.is_timer = file.is_timer;
+        inherited.close_on_exec = file.close_on_exec;
         inherited.timer_interval_ns = file.timer_interval_ns;
         inherited.timer_value_ns = file.timer_value_ns;
 
@@ -963,6 +964,18 @@ void LinuxSyscalls::AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const
     std::scoped_lock lock {shared_->mutex};
     shared_->mappings.clear();
     shared_->image_data.clear();
+    // The descriptors the old program asked to have closed here. Until now this layer
+    // kept every one, which is not what the guest asked for and is not harmless: the
+    // program on the far side of a pipe waits for every copy of the writing end to go.
+    std::vector<int> closing;
+    for (const auto& [fd, file] : shared_->files) {
+        if (file.close_on_exec) {
+            closing.push_back(fd);
+        }
+    }
+    for (const int fd : closing) {
+        CloseFd(fd);
+    }
 }
 
 void LinuxSyscalls::InitialiseHeap(uint64_t base, uint64_t reserved) {
@@ -1199,7 +1212,7 @@ int LinuxSyscalls::AllocateFd() {
     return fd;
 }
 
-int LinuxSyscalls::RegisterFile(int host_fd, std::string guest_path) {
+int LinuxSyscalls::RegisterFile(int host_fd, std::string guest_path, bool close_on_exec) {
     // Guest descriptors are their own numbering, not the host's. They have to be, because
     // a guest expects the lowest free number back and expects to be able to move one onto
     // fd 1 -- and fd 1 on the host belongs to this app.
@@ -1207,6 +1220,7 @@ int LinuxSyscalls::RegisterFile(int host_fd, std::string guest_path) {
     OpenFile file;
     file.host_fd = host_fd;
     file.guest_path = std::move(guest_path);
+    file.close_on_exec = close_on_exec;
     shared_->files[fd] = std::move(file);
     return fd;
 }
@@ -1256,7 +1270,8 @@ uint64_t LinuxSyscalls::DoOpenAt(int dirfd, uint64_t path_address, int flags, in
         }
         lseek(backing, 0, SEEK_SET);
         std::scoped_lock lock {shared_->mutex};
-        return static_cast<uint64_t>(RegisterFile(backing, guest_path));
+        return static_cast<uint64_t>(
+            RegisterFile(backing, guest_path, (flags & guest::kOCloExec) != 0));
     }
 
     // /proc/self/fd, which Chromium reads to decide which descriptors to keep across an
@@ -1312,7 +1327,8 @@ uint64_t LinuxSyscalls::DoOpenAt(int dirfd, uint64_t path_address, int flags, in
     }
 
     std::scoped_lock lock {shared_->mutex};
-    return static_cast<uint64_t>(RegisterFile(host_fd, guest_path));
+    return static_cast<uint64_t>(
+        RegisterFile(host_fd, guest_path, (flags & guest::kOCloExec) != 0));
 }
 
 uint64_t LinuxSyscalls::DoWrite(int fd, uint64_t buffer, uint64_t count) {
@@ -2754,8 +2770,9 @@ uint64_t LinuxSyscalls::DoEventfd(uint64_t initial, int flags) {
     counter->semaphore = (flags & kEfdSemaphore) != 0;
     counter->signal_write_fd = ends[1];
 
+    constexpr int kEfdCloexec = 0x80000;
     std::scoped_lock lock {shared_->mutex};
-    const int fd = RegisterFile(ends[0], "anon_inode:[eventfd]");
+    const int fd = RegisterFile(ends[0], "anon_inode:[eventfd]", (flags & kEfdCloexec) != 0);
     shared_->files[fd].event = counter;
     if (initial != 0) {
         const char byte = 1;
@@ -2942,9 +2959,9 @@ uint64_t LinuxSyscalls::DoEventfdWrite(OpenFile& file, uint64_t buffer) {
 }
 
 uint64_t LinuxSyscalls::DoEpollCreate(int flags) {
-    (void)flags;
+    constexpr int kEpollCloexec = 0x80000;
     std::scoped_lock lock {shared_->mutex};
-    const int fd = RegisterFile(-1, "anon_inode:[eventpoll]");
+    const int fd = RegisterFile(-1, "anon_inode:[eventpoll]", (flags & kEpollCloexec) != 0);
     shared_->files[fd].epoll = std::make_shared<EpollSet>();
     return static_cast<uint64_t>(fd);
 }
@@ -4276,11 +4293,14 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             }
             return static_cast<uint64_t>(DuplicateTo(*file, AllocateFd()));
         }
-        // Close-on-exec is bookkeeping about a descriptor, not about the file, and
-        // Fathom's exec keeps the table rather than replacing it. Reporting it clear is
-        // the truthful answer for how this runs.
+        // Close-on-exec, kept and answered honestly. What it controls -- which
+        // descriptors survive an exec -- decides whether a program that passes one end of
+        // a socket pair to a child ever sees the other end close.
+        constexpr uint64_t kGuestFdCloexec = 1;
         if (command == kGuestFGetfd) {
-            return 0;
+            std::scoped_lock lock {shared_->mutex};
+            auto* file = FindFile(fd);
+            return file != nullptr && file->close_on_exec ? kGuestFdCloexec : 0;
         }
         if (command == kGuestFSetfd) {
             // Anything this process has open, whether or not it is backed by a host
@@ -4290,7 +4310,9 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             // libevent does, on every one it creates -- believe they were never opened.
             {
                 std::scoped_lock lock {shared_->mutex};
-                if (shared_->files.count(fd) != 0) {
+                auto* file = FindFile(fd);
+                if (file != nullptr) {
+                    file->close_on_exec = (arg3 & kGuestFdCloexec) != 0;
                     return 0;
                 }
             }
@@ -4400,9 +4422,10 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             close(ends[1]);
             return FailLinux(14);
         }
+        const bool cloexec = number == kSysPipe2 && (arg2 & guest::kOCloExec) != 0;
         std::scoped_lock lock {shared_->mutex};
-        out[0] = static_cast<int32_t>(RegisterFile(ends[0], "pipe:[read]"));
-        out[1] = static_cast<int32_t>(RegisterFile(ends[1], "pipe:[write]"));
+        out[0] = static_cast<int32_t>(RegisterFile(ends[0], "pipe:[read]", cloexec));
+        out[1] = static_cast<int32_t>(RegisterFile(ends[1], "pipe:[write]", cloexec));
         return 0;
     }
 
@@ -5177,7 +5200,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         setsockopt(host_fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
 
         std::scoped_lock lock {shared_->mutex};
-        return static_cast<uint64_t>(RegisterFile(host_fd, "socket"));
+        return static_cast<uint64_t>(RegisterFile(host_fd, "socket", cloexec));
     }
 
     case kSysConnect:
@@ -5490,8 +5513,9 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
 
     case kSysSocketpair: {
         bool nonblocking = false;
+        bool cloexec = false;
         const int domain = fathom::net::HostDomain(static_cast<int>(arg1));
-        const int type = fathom::net::HostType(static_cast<int>(arg2), &nonblocking, nullptr);
+        const int type = fathom::net::HostType(static_cast<int>(arg2), &nonblocking, &cloexec);
         if (domain < 0) {
             return FailLinux(97);
         }
@@ -5514,8 +5538,8 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             return FailLinux(14);
         }
         std::scoped_lock lock {shared_->mutex};
-        const int first = RegisterFile(pair[0], "socketpair");
-        const int second = RegisterFile(pair[1], "socketpair");
+        const int first = RegisterFile(pair[0], "socketpair", cloexec);
+        const int second = RegisterFile(pair[1], "socketpair", cloexec);
         // Each end named after the other, so a report about a thread waiting on one says
         // which descriptor is supposed to be writing to it.
         shared_->files[first].guest_path = "socketpair with " + std::to_string(second);

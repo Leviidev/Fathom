@@ -33,7 +33,17 @@ GuestAddressSpace::GuestAddressSpace(uint64_t base, uint64_t size, uint64_t page
     : base_ {base}
     , size_ {size}
     , page_size_ {page_size} {
-    free_.push_back(Extent {base, size});
+    // Everything except the lowest 64KB, which is never handed out. Linux keeps that
+    // region unmappable (mmap_min_addr) for one reason: it is what makes a null pointer
+    // fault. An arena that starts at guest address zero gives the first anonymous
+    // mapping the address zero, and from then on the guest's null dereferences quietly
+    // read and write real memory, its null function pointers execute whatever data is
+    // there, and nothing reports a fault -- which is how a thread ends up running at
+    // guest address 0x35 with a stack pointer of zero and no explanation anywhere.
+    constexpr uint64_t kLowestUsable = 64 * 1024;
+    if (size > kLowestUsable) {
+        free_.push_back(Extent {base + kLowestUsable, size - kLowestUsable});
+    }
 
     // One bit per grain of the arena, sized so the map stays under half a megabyte
     // whatever the arena's size is. 64KB grains for a 4GB arena.

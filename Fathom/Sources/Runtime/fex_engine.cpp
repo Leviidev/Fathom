@@ -255,6 +255,7 @@ bool Readable(const void* address, size_t size) {
 /// Declared here and defined below: the fault handler wants to name the guest process
 /// it is reporting on, and the definition sits with the rest of the syscall plumbing.
 extern thread_local LinuxSyscalls* g_current_syscalls;
+size_t DescribeGuestState(char* buffer, size_t capacity);
 
 /// How many times this exact instruction has faulted, roughly.
 ///
@@ -325,6 +326,11 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
         // twenty-seven million signals in five minutes, which is most of the run.
         static std::atomic<uint64_t> wild_fixups {0};
         const auto seen = wild_fixups.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (seen == 1) {
+            char registers_text[1024] = {};
+            DescribeGuestState(registers_text, sizeof(registers_text));
+            FATHOM_WARN("the guest state at the first of them:\n%s", registers_text);
+        }
         if (seen <= 8 || (seen & 0x3FF) == 0) {
             FATHOM_WARN("pid %d tid %d read %p, which is not mapped, from an instruction "
                         "this can step over (%llu so far, guest rip %#llx)",
@@ -724,9 +730,28 @@ public:
             FATHOM_ERROR("syscall on a host thread with no guest thread bound");
             return static_cast<uint64_t>(-38); // -ENOSYS
         }
-        return syscalls->Handle(args->Argument[0], args->Argument[1], args->Argument[2],
-                                args->Argument[3], args->Argument[4], args->Argument[5],
-                                args->Argument[6]);
+        const uint64_t before_rip = frame == nullptr ? 0 : frame->State.rip;
+        const uint64_t before_rsp =
+            frame == nullptr ? 0 : frame->State.gregs[FEXCore::X86State::REG_RSP];
+        const auto result = syscalls->Handle(args->Argument[0], args->Argument[1], args->Argument[2],
+                                             args->Argument[3], args->Argument[4], args->Argument[5],
+                                             args->Argument[6]);
+        // A syscall must leave the thread exactly where it found it. One that does not is
+        // the moment a thread's state is lost, and without this the loss is only noticed
+        // later, in whatever garbage the thread then runs.
+        if (frame != nullptr) {
+            const uint64_t after_rip = frame->State.rip;
+            const uint64_t after_rsp = frame->State.gregs[FEXCore::X86State::REG_RSP];
+            if (after_rip != before_rip || after_rsp != before_rsp) {
+                FATHOM_WARN("syscall %llu moved the thread: rip %#llx -> %#llx, rsp %#llx -> %#llx",
+                            static_cast<unsigned long long>(args->Argument[0]),
+                            static_cast<unsigned long long>(before_rip),
+                            static_cast<unsigned long long>(after_rip),
+                            static_cast<unsigned long long>(before_rsp),
+                            static_cast<unsigned long long>(after_rsp));
+            }
+        }
+        return result;
     }
 
     FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*,

@@ -887,9 +887,15 @@ bool GuestAddressSpace::RangeFor(uint64_t address, GuestRange* out) const {
     return false;
 }
 
-bool GuestAddressSpace::RangeForNoWait(uint64_t address, GuestRange* out) const {
+bool GuestAddressSpace::RangeForNoWait(uint64_t address, GuestRange* out, bool* known) const {
+    if (known != nullptr) {
+        *known = true;
+    }
     std::shared_lock lock {mutex_, std::try_to_lock};
     if (!lock.owns_lock()) {
+        if (known != nullptr) {
+            *known = false;
+        }
         return false;
     }
     const size_t index = FirstRangeEndingAfter(address);

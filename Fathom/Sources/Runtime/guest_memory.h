@@ -115,7 +115,9 @@ public:
     /// The same, but gives up rather than waiting for the lock. For a signal handler,
     /// which may be running on a thread that is already inside this class and must never
     /// block on a lock its own thread holds.
-    bool RangeForNoWait(uint64_t address, GuestRange* out) const;
+    /// `known` is set to false when the lock was busy and no answer could be given; the
+    /// caller must not read "nothing is mapped there" into that.
+    bool RangeForNoWait(uint64_t address, GuestRange* out, bool* known = nullptr) const;
 
     /// Every committed range the guest can write to. A fork uses this to know what it has
     /// to preserve on the parent's behalf: the image and the stack are only part of it,

@@ -265,7 +265,8 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     const auto faulting = reinterpret_cast<uint64_t>(info->si_addr);
     if (auto* space = g_arena_space.load(std::memory_order_acquire)) {
         fathom::GuestRange range {};
-        if (!space->RangeForNoWait(faulting, &range)) {
+        bool known = false;
+        if (!space->RangeForNoWait(faulting, &range, &known) && known) {
             return false;
         }
     }

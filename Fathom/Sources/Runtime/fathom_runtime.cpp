@@ -28,6 +28,7 @@
 #include <mutex>
 #include <string>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <pthread.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -1735,6 +1736,29 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     // the whole session down with it. Ignored, the write returns EPIPE, which is what the
     // guest's own libc is expecting to see.
     signal(SIGPIPE, SIG_IGN);
+
+    // As many descriptors as this host will give. Every guest process holds its own
+    // duplicate of every file it inherited, so a session running Steam -- a client, a web
+    // helper, a renderer and a shell each with sixty open files -- needs thousands, and
+    // the default here is a few hundred. Past that a forked child silently loses the
+    // descriptor its parent was talking to it on.
+    {
+        struct rlimit limit {};
+        if (getrlimit(RLIMIT_NOFILE, &limit) == 0) {
+            const rlim_t wanted = limit.rlim_max == RLIM_INFINITY
+                                      ? 65536
+                                      : std::min<rlim_t>(limit.rlim_max, 65536);
+            if (limit.rlim_cur < wanted) {
+                limit.rlim_cur = wanted;
+                if (setrlimit(RLIMIT_NOFILE, &limit) != 0) {
+                    FATHOM_WARN("could not raise the descriptor limit: %s", std::strerror(errno));
+                } else {
+                    FATHOM_INFO("descriptor limit raised to %llu",
+                                static_cast<unsigned long long>(wanted));
+                }
+            }
+        }
+    }
 
     auto session = std::make_unique<fathom_session>();
     session->program_path = config->program_path;

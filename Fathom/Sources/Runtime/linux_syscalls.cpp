@@ -871,7 +871,13 @@ void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
         if (file.host_fd >= 0) {
             inherited.host_fd = dup(file.host_fd);
             if (inherited.host_fd < 0) {
-                continue;  // Out of descriptors: the child simply does not inherit it.
+                // Said out loud, because a child quietly missing a descriptor its parent
+                // gave it is invisible until something much later fails: Steam passes the
+                // socket its web helper answers on this way, and a helper that never
+                // answers is a Steam that never draws.
+                FATHOM_WARN("fork: pid %d could not inherit fd %d (%s): %s", child.pid_, fd,
+                            file.guest_path.c_str(), std::strerror(errno));
+                continue;
             }
         }
         child.shared_->files[fd] = std::move(inherited);

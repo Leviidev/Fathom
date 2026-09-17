@@ -50,6 +50,10 @@ public:
     /// %gs-relative access lands on its thread's storage. `base` is a guest address.
     virtual void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit) = 0;
 
+    /// Where the guest is, for a trace line. A syscall's number says what a program
+    /// asked for; the address it asked from says which of its several callers did.
+    virtual uint64_t GuestRip() const = 0;
+
     /// Unwinds out of the JIT and ends the run. Never returns.
     [[noreturn]] virtual void ExitGuest(int status) = 0;
 

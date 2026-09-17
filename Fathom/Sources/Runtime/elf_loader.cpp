@@ -649,6 +649,14 @@ bool BuildInitialStack(GuestAddressSpace& space, uint64_t guest_base, const Load
     out_stack->stack_base = base;
     out_stack->stack_size = stack_size;
     out_stack->rsp = rsp - guest_base;
+    if (getenv("FATHOM_LOG_ARGUMENTS") != nullptr) {
+        for (const auto& argument : argv) {
+            FATHOM_INFO("argv: %s", argument.c_str());
+        }
+        for (const auto& variable : envp) {
+            FATHOM_INFO("envp: %s", variable.c_str());
+        }
+    }
     FATHOM_INFO("auxv: phdr=%#llx phent=%llu phnum=%llu base=%#llx entry=%#llx",
                 static_cast<unsigned long long>(image.phdr_address),
                 static_cast<unsigned long long>(image.phentsize),

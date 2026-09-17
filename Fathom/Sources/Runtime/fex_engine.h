@@ -89,6 +89,7 @@ public:
     void SetFsBase(uint64_t base) override;
     uint64_t GetFsBase() const override;
     void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit) override;
+    uint64_t GuestRip() const override { return Rip(); }
 
     /// Unwinds this thread out of the JIT with a fatal signal recorded, so that the guest
     /// process it belongs to ends rather than the emulator. Returns false, without

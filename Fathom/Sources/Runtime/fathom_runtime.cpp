@@ -102,6 +102,8 @@ public:
         return target_ != nullptr ? target_->GetFsBase() : pending_fs_base_;
     }
 
+    uint64_t GuestRip() const override { return target_ == nullptr ? 0 : target_->GuestRip(); }
+
     void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit) override {
         if (target_ != nullptr) {
             target_->SetTlsDescriptor(entry, base, limit);

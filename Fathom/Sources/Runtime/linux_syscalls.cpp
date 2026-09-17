@@ -892,6 +892,12 @@ void LinuxSyscalls::AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const
     // count across an exec means a process that has exec'd a few times is told there are
     // none left, and its loader gives up with "cannot set up thread-local storage".
     next_tls_entry_ = 12;
+    // Tracing one program rather than all of them. A full trace of a session that runs a
+    // hundred processes is unreadable and slow enough to change what it is measuring; the
+    // interesting one is usually a single program that will not start.
+    if (const char* wanted = getenv("FATHOM_TRACE_PROGRAM")) {
+        config_.trace = path.find(wanted) != std::string::npos;
+    }
     InitialiseHeap(heap_base, heap_reserved);
     config_.work_dir = path;
     program_path_ = path;
@@ -3525,7 +3531,8 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
         // The pid matters more than anything else on this line once there is more than
         // one process: the same syscall from a shell and from its child mean opposite
         // things, and without it a pipeline's trace is unreadable.
-        FATHOM_INFO("[pid %d] syscall %llu %s(%#llx, %#llx, %#llx)", pid_,
+        FATHOM_INFO("[pid %d] %#llx syscall %llu %s(%#llx, %#llx, %#llx)", pid_,
+                    static_cast<unsigned long long>(control_.GuestRip()),
                     static_cast<unsigned long long>(number), SyscallName(number),
                     static_cast<unsigned long long>(arg1),
                     static_cast<unsigned long long>(arg2), static_cast<unsigned long long>(arg3));

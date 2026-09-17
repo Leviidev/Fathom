@@ -846,6 +846,12 @@ void LinuxSyscalls::SetProcess(int pid, int ppid, ProcessHost* host) {
     pid_ = pid;
     ppid_ = ppid;
     host_ = host;
+    // One process, traced. A whole session's trace is unreadable and slow enough to change
+    // what it is measuring; a single process that will not finish starting is usually the
+    // only thing worth watching.
+    if (const char* wanted = getenv("FATHOM_TRACE_PID")) {
+        config_.trace = std::atoi(wanted) == pid;
+    }
 }
 
 void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {

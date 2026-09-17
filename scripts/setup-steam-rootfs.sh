@@ -170,6 +170,11 @@ case "$1" in
         # in one process, and GLib's type system stops working. Chromium draws in
         # software instead, which is what it does on any machine without a GPU.
         extra="--no-zygote --disable-gpu --disable-gpu-compositing --disable-software-rasterizer"
+        # Set FATHOM_WEBHELPER_VERBOSE to have Chromium say what it is doing; its log
+        # goes wherever Steam pointed --log-file, which is the Steam logs directory.
+        if [ -n "${FATHOM_WEBHELPER_VERBOSE:-}" ]; then
+            extra="$extra --enable-logging --v=1"
+        fi
         # --no-zygote: Chromium normally forks a zygote early and forks every renderer
         # from it. A fork here shares its parent's memory rather than copying it, and the
         # zygote is forked out of a browser process that already has a dozen threads, so

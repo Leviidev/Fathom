@@ -1744,14 +1744,24 @@ void fathom_session_config_defaults(fathom_session_config* config) {
     config->stack_size = kDefaultStack;
     config->max_inst_per_block = 0; // Keep FEXCore's own default.
     config->multiblock = true;
-    // Off, as the app has always had it. Emulating x86's memory ordering means every
-    // ordinary guest load and store becomes an acquire or release, and those require
-    // natural alignment on ARM64 while x86 does not -- so every unaligned guest access
-    // raises SIGBUS and has to be emulated by hand. Steam's client spends more than nine
-    // tenths of its time in that handler with this on. What it buys is stricter ordering
-    // for a guest whose threads race on shared memory, which is a real thing to lose, but
-    // not at this price.
-    config->tso_enabled = false;
+    // On. Emulating x86's memory ordering turns every ordinary guest load and store into
+    // an acquire or release, and those require natural alignment on ARM64 while x86 does
+    // not -- so an unaligned guest access raises SIGBUS and is emulated by hand. That used
+    // to cost Steam's client nine tenths of its time, which is why this was off.
+    //
+    // It no longer does: FEXCore patches each faulting instruction the first time it is
+    // seen, and the reason the cost was so high was that compiled code was being thrown
+    // away constantly -- every unmap invalidated everything, so the patches went with it
+    // and the same accesses faulted again and again. With invalidation happening only
+    // where code can actually arrive, the patches stick and a Steam session now emulates
+    // too few unaligned accesses to reach the counter's first report.
+    //
+    // What it buys is what a program with threads racing on shared memory is entitled to
+    // assume. Without it GLib's type system comes up half-built in one thread's view --
+    // "signal id '1' is invalid for instance", "g_param_spec_pool_insert: pool != NULL" --
+    // because the stores that fill an object in can be seen after the store that
+    // publishes it.
+    config->tso_enabled = true;
     config->reduced_precision_x87 = false;
     config->trace_syscalls = false;
 }

@@ -7,17 +7,22 @@ import SwiftUI
 @MainActor
 final class EmulatorSettings: ObservableObject {
     @AppStorage("engine.multiblock") var multiblock = true
-    // Deliberately a new key rather than a changed default: anyone who already ran the
-    // old build has "true" written into UserDefaults, and a changed default would never
-    // reach them. Off, because of what a fault costs here -- see the note below.
+    // Deliberately a new key rather than a changed default: a changed default never
+    // reaches anyone who already ran an older build, because their answer is written into
+    // UserDefaults. On, now that guests here have threads and the cost has gone.
     //
     // TSO emulation turns every guest load and store into an ARM64 acquire/release
-    // instruction, and those fault on an unaligned address where x86 would not care. The
-    // fault is recoverable, but recovering it means a signal -- and while StikDebug is
-    // attached as a debugger, every signal in this process round-trips through it. One
-    // measured fault cost 89 seconds of wall time. Guests are single-threaded here
-    // anyway (clone returns ENOSYS), so TSO emulation currently buys nothing at all.
-    @AppStorage("engine.tso.v2") var tsoEnabled = false
+    // instruction, and those fault on an unaligned address where x86 would not care. That
+    // fault is recoverable, but recovering it means a signal, and a signal while StikDebug
+    // is attached costs a great deal -- which is why this was off. FEXCore patches each
+    // faulting instruction the first time it sees it, so the cost is paid once per
+    // instruction rather than once per execution; what made it feel otherwise was
+    // compiled code being thrown away constantly, taking the patches with it.
+    //
+    // What it buys is what a program whose threads share memory is entitled to assume.
+    // Steam's web helper is Chromium, and without it GLib's type system comes up
+    // half-built in one thread's view.
+    @AppStorage("engine.tso.v3") var tsoEnabled = true
     @AppStorage("engine.x87Reduced") var reducedPrecisionX87 = false
     @AppStorage("engine.maxInst") var maxInstPerBlock = 0
     @AppStorage("engine.addressSpaceMB") var addressSpaceMB = 2048

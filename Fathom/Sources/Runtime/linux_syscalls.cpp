@@ -4219,6 +4219,10 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             nanoseconds = remaining_nanoseconds;
         }
         struct timespec host {static_cast<time_t>(seconds), static_cast<long>(nanoseconds)};
+        // A sleeping thread holds nothing, so it is safe to stop where it stands -- which
+        // matters because a fork cannot take a copy of its parent while any thread of that
+        // parent is still writing, and Steam's client keeps several threads asleep.
+        const auto waiting = EnterBlockingWait();
         nanosleep(&host, nullptr);
         return 0;
     }
@@ -4375,6 +4379,11 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         int status = 0;
         const int wanted = arg1 == kPAll ? -1 : static_cast<int>(arg2);
         const int options = (static_cast<int>(arg4) & kWNoHang) != 0 ? kWNoHang : 0;
+        // Waiting on a child is waiting: the process table's lock is dropped for the
+        // duration, so a fork happening elsewhere may stop this thread where it stands.
+        // It is the fork that holds that lock while it stops anything, which is what makes
+        // this safe -- a thread cannot be caught having just taken it back.
+        const auto waiting = EnterBlockingWait();
         const int64_t reaped = host_->WaitForChild(pid_, wanted, &status, options);
         if (reaped < 0) {
             return static_cast<uint64_t>(reaped);
@@ -4667,6 +4676,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             return FailLinux(38);
         }
         int status = 0;
+        const auto waiting = EnterBlockingWait();
         const int64_t reaped = host_->WaitForChild(pid_, static_cast<int>(static_cast<int32_t>(arg1)),
                                                    &status, static_cast<int>(arg3));
         if (reaped > 0 && arg2 != 0) {

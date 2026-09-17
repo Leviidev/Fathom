@@ -1257,12 +1257,25 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
             [&] { return child_raw->released || console.StopRequested(); });
         if (!released) {
             if (auto* parent = Find(caller_pid)) {
+                FATHOM_WARN("fork: pid %d has held its parent's memory for five seconds "
+                            "(rip %#llx, syscall %llu); letting pid %d's other threads run "
+                            "again and giving up the copy",
+                            child_pid,
+                            static_cast<unsigned long long>(child_raw->control == nullptr
+                                                                ? 0
+                                                                : child_raw->control->GuestRip()),
+                            static_cast<unsigned long long>(child_raw->syscalls == nullptr
+                                                                ? 0
+                                                                : child_raw->syscalls->CurrentSyscall()),
+                            caller_pid);
                 if (!parent->frozen_threads.empty()) {
-                    FATHOM_WARN("fork: pid %d has held its parent's memory for five seconds; "
-                                "letting pid %d's other threads run again",
-                                child_pid, caller_pid);
                     ThawThreads(parent);
                 }
+                // And the copy goes with them. A parent running again is a parent writing
+                // to the memory this copy was taken from, and putting it back later --
+                // whenever the child finally execs -- would throw all of that away.
+                child_raw->borrowed.clear();
+                child_raw->borrowed.shrink_to_fit();
             }
             process_changed.wait(lock, [&] { return child_raw->released || console.StopRequested(); });
         }

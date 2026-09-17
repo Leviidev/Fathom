@@ -112,6 +112,11 @@ public:
     /// QueryGuestExecutableRange, which it asks before compiling a block.
     bool RangeFor(uint64_t address, GuestRange* out) const;
 
+    /// The same, but gives up rather than waiting for the lock. For a signal handler,
+    /// which may be running on a thread that is already inside this class and must never
+    /// block on a lock its own thread holds.
+    bool RangeForNoWait(uint64_t address, GuestRange* out) const;
+
     /// Every committed range the guest can write to. A fork uses this to know what it has
     /// to preserve on the parent's behalf: the image and the stack are only part of it,
     /// and a libc that allocates through mmap rather than brk keeps its heap somewhere

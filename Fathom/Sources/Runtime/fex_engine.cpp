@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -431,7 +432,7 @@ bool EndFaultedGuestThread(int signal, siginfo_t* info, void* raw_context) {
         const auto address = reinterpret_cast<uint64_t>(info->si_addr);
         auto* space = g_arena_space.load(std::memory_order_acquire);
         fathom::GuestRange range {};
-        if (space != nullptr && space->RangeFor(address, &range)) {
+        if (space != nullptr && space->RangeForNoWait(address, &range)) {
             FATHOM_WARN("guest fault at %#llx: mapped %#llx..%#llx, protection %d",
                         static_cast<unsigned long long>(address),
                         static_cast<unsigned long long>(range.begin),
@@ -473,6 +474,26 @@ thread_local LinuxSyscalls* g_current_syscalls = nullptr;
 /// this process's.
 thread_local uint64_t g_current_guest_base = 0;
 
+/// A descriptor onto /dev/null, opened once so a signal handler never has to.
+std::atomic<int> g_probe_fd {-1};
+
+/// Whether `size` bytes at `address` can be read without faulting.
+///
+/// A crash report wants the bytes at the guest's rip and the words under its stack
+/// pointer, and the interesting crashes are exactly the ones where those addresses are
+/// not mapped. Reading them directly faults a second time inside the signal handler,
+/// with the signal already blocked, and the thread stops there for good -- holding
+/// whatever FEXCore lock it was holding when it faulted, which stops the session. The
+/// kernel is asked instead: write() reports EFAULT for a buffer it cannot read rather
+/// than raising anything.
+bool Readable(const void* address, size_t size) {
+    const int fd = g_probe_fd.load(std::memory_order_acquire);
+    if (fd < 0 || address == nullptr) {
+        return false;
+    }
+    return write(fd, address, size) == static_cast<ssize_t>(size);
+}
+
 size_t DescribeGuestState(char* buffer, size_t capacity) {
     if (g_active.thread == nullptr || buffer == nullptr || capacity == 0) {
         return 0;
@@ -498,6 +519,9 @@ size_t DescribeGuestState(char* buffer, size_t capacity) {
     if (written > 0 && static_cast<size_t>(written) + 64 < capacity) {
         const auto* code = reinterpret_cast<const unsigned char*>(
             g_active.context == nullptr ? nullptr : reinterpret_cast<const void*>(host_rip));
+        if (!Readable(code, 16)) {
+            code = nullptr;
+        }
         written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
                                  "  code");
         for (int index = 0; index < 16 && code != nullptr; ++index) {
@@ -511,7 +535,7 @@ size_t DescribeGuestState(char* buffer, size_t capacity) {
     // nothing away in its registers, but the words below its stack pointer are the return
     // addresses of everything that called it -- which is the shape of the path it took.
     const uint64_t stack = state.gregs[FEXCore::X86State::REG_RSP] + g_current_guest_base;
-    if (written > 0 && stack != 0) {
+    if (written > 0 && stack != 0 && Readable(reinterpret_cast<const void*>(stack), 64)) {
         const auto* words = reinterpret_cast<const uint32_t*>(stack);
         for (int row = 0; row < 4 && static_cast<size_t>(written) + 80 < capacity; ++row) {
             written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
@@ -1025,6 +1049,15 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
 
     // From here on, a guest alignment fault is recoverable rather than fatal.
     SetFaultRecovery(RecoverAlignmentFault);
+    if (g_probe_fd.load(std::memory_order_acquire) < 0) {
+        const int fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            int expected = -1;
+            if (!g_probe_fd.compare_exchange_strong(expected, fd)) {
+                close(fd);
+            }
+        }
+    }
     SetGuestFaultEnder(EndFaultedGuestThread);
     SetGuestStateDescriber(DescribeGuestState);
 

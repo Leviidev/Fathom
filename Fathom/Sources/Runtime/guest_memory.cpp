@@ -896,6 +896,21 @@ bool GuestAddressSpace::RangeFor(uint64_t address, GuestRange* out) const {
     return false;
 }
 
+bool GuestAddressSpace::RangeForNoWait(uint64_t address, GuestRange* out) const {
+    std::shared_lock lock {mutex_, std::try_to_lock};
+    if (!lock.owns_lock()) {
+        return false;
+    }
+    const size_t index = FirstRangeEndingAfter(address);
+    if (index >= committed_.size() || committed_[index].begin > address) {
+        return false;
+    }
+    if (out != nullptr) {
+        *out = committed_[index];
+    }
+    return true;
+}
+
 std::vector<GuestRange> GuestAddressSpace::Snapshot() const {
     std::shared_lock lock {mutex_};
     return committed_;

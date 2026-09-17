@@ -2897,6 +2897,7 @@ uint64_t LinuxSyscalls::DoEpollWait(int epoll_fd, uint64_t events_address, int m
         return FailLinux(14);
     }
 
+    constexpr int kSliceMilliseconds = 50;
     const auto waiting = EnterBlockingWait();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
     for (;;) {
@@ -2932,7 +2933,23 @@ uint64_t LinuxSyscalls::DoEpollWait(int epoll_fd, uint64_t events_address, int m
             }
         }
 
-        int ready = host_fds.empty() ? 0 : poll(host_fds.data(), static_cast<nfds_t>(host_fds.size()), 0);
+        // With a real timeout, not zero. Polling every descriptor with a zero timeout and
+        // then sleeping ten milliseconds turns a thread that is waiting quietly for a
+        // socket into a thread that wakes a hundred times a second, rebuilds this list and
+        // allocates twice -- and Chromium has a dozen threads doing it at once, which was
+        // enough to starve the X server in the same session of its own descriptors.
+        int slice = 0;
+        if (timeout_ms != 0) {
+            slice = kSliceMilliseconds;
+            if (timeout_ms > 0) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           deadline - std::chrono::steady_clock::now())
+                                           .count();
+                slice = static_cast<int>(std::clamp<int64_t>(remaining, 0, kSliceMilliseconds));
+            }
+        }
+        int ready = host_fds.empty() ? 0
+                                     : poll(host_fds.data(), static_cast<nfds_t>(host_fds.size()), slice);
         if (ready < 0 && errno != EINTR) {
             return Fail(errno);
         }
@@ -2956,7 +2973,11 @@ uint64_t LinuxSyscalls::DoEpollWait(int epoll_fd, uint64_t events_address, int m
         if (timeout_ms == 0 || (timeout_ms > 0 && std::chrono::steady_clock::now() >= deadline)) {
             return 0;
         }
-        console_.WaitForInput(10);
+        // Only when there was nothing to wait on: the host poll above has already done the
+        // waiting in every other case.
+        if (host_fds.empty()) {
+            console_.WaitForInput(kSliceMilliseconds);
+        }
     }
 }
 

@@ -329,6 +329,7 @@ enum : uint64_t {
     kSysEpollCreate1 = 291,
     kSysPipe2 = 293,
     kSysPrlimit64 = 302,
+    kSysFallocate = 285,
     kSysGetrandom = 318,
     kSysMemfdCreate = 319,
     kSysStatx = 332,
@@ -729,6 +730,9 @@ const char* SyscallName(uint64_t number) {
     case kSysReadlinkat: return "readlinkat";
     case kSysSetRobustList: return "set_robust_list";
     case kSysPrlimit64: return "prlimit64";
+    case kSysFallocate: return "fallocate";
+    case kSysMemfdCreate: return "memfd_create";
+    case kSysPwrite64: return "pwrite64";
     case kSysGetrandom: return "getrandom";
     case kSysStatx: return "statx";
     case kSysRseq: return "rseq";
@@ -3658,6 +3662,65 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return bytes < 0 ? Fail(errno) : static_cast<uint64_t>(bytes);
     }
 
+    case kSysPwrite64: {
+        const void* data = GuestPointer(arg2, arg3, false);
+        if (data == nullptr) {
+            return arg3 == 0 ? 0 : FailLinux(14);
+        }
+        std::scoped_lock lock {shared_->mutex};
+        auto* file = FindFile(static_cast<int>(arg1));
+        if (file == nullptr) {
+            return FailLinux(9);
+        }
+        const ssize_t bytes = pwrite(file->host_fd, data, arg3, static_cast<off_t>(arg4));
+        return bytes < 0 ? Fail(errno) : static_cast<uint64_t>(bytes);
+    }
+
+    // An anonymous file, which is how Chromium -- and so Steam's web helper -- makes the
+    // shared memory it passes between its processes. Darwin has no memfd, so this is a
+    // file in the host's temporary directory that is unlinked the moment it exists: what
+    // is left is a descriptor onto storage with no name, which is what memfd is. Sealing
+    // is not emulated; nothing that uses it here depends on a seal being refused.
+    case kSysMemfdCreate: {
+        const char* wanted = static_cast<const char*>(GuestPointer(arg1, 1, false));
+        std::string name = wanted == nullptr ? "guest" : std::string {wanted};
+        const char* directory = getenv("TMPDIR");
+        std::string pattern = (directory == nullptr ? "/tmp/" : std::string {directory} + "/") +
+                              "fathom-memfd-XXXXXX";
+        std::vector<char> path {pattern.begin(), pattern.end()};
+        path.push_back('\0');
+        const int fd = mkstemp(path.data());
+        if (fd < 0) {
+            return Fail(errno);
+        }
+        unlink(path.data());
+        std::scoped_lock lock {shared_->mutex};
+        return static_cast<uint64_t>(RegisterFile(fd, "memfd:" + name));
+    }
+
+    // Darwin has no fallocate. What callers here want is for the file to be at least
+    // offset+length long -- Chromium sizes its shared memory this way -- and truncating
+    // up does exactly that. FALLOC_FL_KEEP_SIZE asks for space without changing the
+    // length, which on a file that is already long enough is nothing to do.
+    case kSysFallocate: {
+        std::scoped_lock lock {shared_->mutex};
+        auto* file = FindFile(static_cast<int>(arg1));
+        if (file == nullptr) {
+            return FailLinux(9);
+        }
+        const uint64_t wanted_end = arg3 + arg4;
+        struct stat info {};
+        if (fstat(file->host_fd, &info) != 0) {
+            return Fail(errno);
+        }
+        if ((arg2 & 1) == 0 && static_cast<uint64_t>(info.st_size) < wanted_end) {
+            if (ftruncate(file->host_fd, static_cast<off_t>(wanted_end)) != 0) {
+                return Fail(errno);
+            }
+        }
+        return 0;
+    }
+
     case kSysReadv:
         return DoReadv(static_cast<int>(arg1), arg2, arg3);
     case kSysWritev:
@@ -4978,8 +5041,16 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (domain < 0) {
             return FailLinux(97);
         }
+        // Darwin's local sockets have no SOCK_SEQPACKET. Datagrams keep message
+        // boundaries, which is the whole reason anything asks for seqpacket, and a
+        // socketpair's two ends are connected to each other either way -- so Chromium's
+        // IPC, which Steam's web helper is built on, works across it.
+        int host_type = type;
+        if (domain == AF_UNIX && host_type == SOCK_SEQPACKET) {
+            host_type = SOCK_DGRAM;
+        }
         int pair[2] = {-1, -1};
-        if (socketpair(domain, type, static_cast<int>(arg3), pair) < 0) {
+        if (socketpair(domain, host_type, static_cast<int>(arg3), pair) < 0) {
             return Fail(errno);
         }
         auto* out = static_cast<int32_t*>(GuestPointer(arg4, sizeof(int32_t) * 2, true));
@@ -5361,9 +5432,6 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         std::memcpy(out + (narrow ? 52 : 104), &unit, 4);                // mem_unit
         return 0;
     }
-
-    case kSysMemfdCreate:
-        return FailLinux(38);
 
     default:
         FATHOM_WARN("unimplemented syscall %llu (%s)", static_cast<unsigned long long>(number),

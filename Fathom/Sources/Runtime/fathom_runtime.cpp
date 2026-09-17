@@ -1249,7 +1249,7 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
     return child_pid;
 }
 
-int64_t fathom_session::ExecProcess(int caller_pid, const std::string& path,
+int64_t fathom_session::ExecProcess(int caller_pid, const std::string& requested,
                                     std::vector<std::string> argv, std::vector<std::string> envp) {
     GuestProcess* process = nullptr;
     {
@@ -1258,6 +1258,17 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& path,
     }
     if (process == nullptr) {
         return -1; // -EPERM
+    }
+
+    // A program re-running itself. There is no /proc here to hold the link, and the
+    // binary a process is running is something this table already knows -- Steam's
+    // container launcher execs /proc/self/exe to become its own second stage, and reads
+    // "not readable" as a broken installation.
+    std::string path = requested;
+    if (path == "/proc/self/exe" || path == "/proc/" + std::to_string(caller_pid) + "/exe") {
+        path = process->path;
+        FATHOM_INFO("execve: pid %d asked for its own binary, which is %s", caller_pid,
+                    path.c_str());
     }
 
     const std::string host_path = fathom::ResolveGuestPathOnHost(guest_root, path);
@@ -1550,11 +1561,66 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     // A program that lives inside the guest root is reached the way the guest would reach
     // it. /bin/sh is a symlink to "/bin/busybox", and only the guest's root makes that
     // mean anything.
+    std::vector<std::string> script_argv;
     {
         const std::string guest_root = config->guest_root == nullptr ? "" : config->guest_root;
-        const std::string as_guest = fathom::GuestPathForHostPath(guest_root, session->program_path);
+        std::string as_guest = fathom::GuestPathForHostPath(guest_root, session->program_path);
         if (!as_guest.empty()) {
             session->program_path = fathom::ResolveGuestPathOnHost(guest_root, as_guest);
+        }
+
+        // A script rather than a binary. Steam is started through one -- fathom-steam
+        // brings up an X server and then runs the client on it -- and a session that can
+        // only start ELF files answers that with "not an ELF file (bad magic)". What runs
+        // is the interpreter named on the first line with the script as its argument,
+        // which is what an exec of the same file would do.
+        for (int depth = 0; depth < 4 && !as_guest.empty(); ++depth) {
+            char first_line[256] = {};
+            const int probe = ::open(session->program_path.c_str(), O_RDONLY);
+            if (probe < 0) {
+                break;
+            }
+            const ssize_t got = ::read(probe, first_line, sizeof(first_line) - 1);
+            ::close(probe);
+            if (got <= 2 || first_line[0] != '#' || first_line[1] != '!') {
+                break;
+            }
+            std::string line {first_line + 2, static_cast<size_t>(got) - 2};
+            const auto newline = line.find('\n');
+            if (newline != std::string::npos) {
+                line.resize(newline);
+            }
+            const auto space = line.find_first_of(" \t");
+            std::string interpreter = line.substr(0, space);
+            std::string argument;
+            if (space != std::string::npos) {
+                const auto rest = line.find_first_not_of(" \t", space);
+                if (rest != std::string::npos) {
+                    argument = line.substr(rest);
+                }
+            }
+            while (!interpreter.empty() && (interpreter.back() == '\r' || interpreter.back() == ' ')) {
+                interpreter.pop_back();
+            }
+            if (interpreter.empty()) {
+                break;
+            }
+            // Innermost first: the script this one names goes after the interpreter, and
+            // anything already collected -- the script that named *this* one -- after it.
+            std::vector<std::string> rebuilt;
+            rebuilt.push_back(interpreter);
+            if (!argument.empty()) {
+                rebuilt.push_back(argument);
+            }
+            rebuilt.push_back(as_guest);
+            for (size_t index = 1; index < script_argv.size(); ++index) {
+                rebuilt.push_back(script_argv[index]);
+            }
+            script_argv = std::move(rebuilt);
+            as_guest = interpreter;
+            session->program_path = fathom::ResolveGuestPathOnHost(guest_root, interpreter);
+            FATHOM_INFO("%s is a script; running it as %s", script_argv.back().c_str(),
+                        interpreter.c_str());
         }
     }
     session->state.store(FATHOM_STATE_LOADING);
@@ -1594,13 +1660,17 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     session->stack_size = config->stack_size != 0 ? config->stack_size : kDefaultStack;
     session->trace = config->trace_syscalls;
 
-    std::vector<std::string> argv;
+    std::vector<std::string> argv = script_argv;
     if (config->argv != nullptr && config->argc > 0) {
-        argv.reserve(static_cast<size_t>(config->argc));
-        for (int index = 0; index < config->argc; ++index) {
+        argv.reserve(argv.size() + static_cast<size_t>(config->argc));
+        // argv[0] names the program the caller asked for. When that was a script it is
+        // already here, as the interpreter's argument, and adding it again would hand the
+        // interpreter the same script twice.
+        const int first = script_argv.empty() ? 0 : 1;
+        for (int index = first; index < config->argc; ++index) {
             argv.emplace_back(config->argv[index] == nullptr ? "" : config->argv[index]);
         }
-    } else {
+    } else if (argv.empty()) {
         argv.emplace_back(session->program_path);
     }
 

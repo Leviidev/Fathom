@@ -1034,19 +1034,11 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
             return a1 < b2 && b1 < a2;
         };
 
-        // Whether anything else in the parent is still running decides how much of it can
-        // be held. Linux only gives the child the thread that called fork, and says the
-        // child may do nothing but exec afterwards -- so a threaded parent's child touches
-        // its stack and essentially nothing else.
-        //
-        // That restriction is not pedantry here, it is the only thing that can be right.
-        // The parent's other threads keep running while the child does, writing to the
-        // same heap and the same globals. Putting a snapshot of those back would throw
-        // away everything they did in the meantime, and Steam -- eighty-odd threads, seven
-        // hundred megabytes of heap, a fork every time it runs a helper -- would be handed
-        // its own memory as it was a second ago, over and over. It also means copying that
-        // seven hundred megabytes twice per fork, which is the difference between a fork
-        // costing a millisecond and costing a second.
+        // Whether anything else in the parent is running decides whether those threads have
+        // to be stopped first, not how much is held: with them stopped, the copy taken here
+        // is of memory nothing else can change, and putting it back is exact. It was only
+        // when they kept running that holding the heap was worse than not -- a snapshot put
+        // back over their work throws that work away.
         bool threaded = false;
         for (const auto& thread : parent->threads) {
             if (thread->started && !thread->finished.load(std::memory_order_acquire)) {
@@ -1074,6 +1066,11 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
                 owned.emplace_back(parent->program.interpreter.image_begin + parent->guest_base,
                                    parent->program.interpreter.image_end - parent->program.interpreter.image_begin);
             }
+            // Not held for a threaded parent: freezing its own threads makes the copy
+            // exact with respect to *them*, but the session's other processes are still
+            // running in the same arena and can protect a page away between the check
+            // that says it is writable and the write itself. Putting back a hundred and
+            // twenty-eight megabytes widens that window until it is hit.
             if (heap_low != 0) {
                 owned.emplace_back(heap_low, kHeapReservation);
             }
@@ -1084,12 +1081,9 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
         // the child rewrites all of it on its way to exec. Left alone, the parent's next
         // allocation reads a chunk header the child rewrote and glibc aborts with
         // "malloc(): unaligned tcache chunk detected", a long way from the fork.
-        // All of it, not just the C library's own: measured, a threaded parent that keeps
-        // only its C library's data lasts twenty seconds, and one that keeps every
-        // writable image region lasts as long as it is left running. What the difference
-        // is made of is the program's own allocator arenas, which a loader places as
-        // anonymous mappings at fixed addresses and which the child rewrites the same way
-        // it rewrites malloc's.
+        // Every writable image region as well: a library's data and bss, and the program's
+        // own allocator arenas, which a loader places as anonymous mappings at fixed
+        // addresses. The child rewrites all of it on its way to exec.
         for (const auto& region : parent->syscalls->ImageData(false)) {
             owned.push_back(region);
         }

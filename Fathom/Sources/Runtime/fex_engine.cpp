@@ -396,6 +396,24 @@ size_t DescribeGuestState(char* buffer, size_t capacity) {
         }
         written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written), "\n");
     }
+
+    // And what is on the stack. A guest that has jumped somewhere it should not have gives
+    // nothing away in its registers, but the words below its stack pointer are the return
+    // addresses of everything that called it -- which is the shape of the path it took.
+    const uint64_t stack = state.gregs[FEXCore::X86State::REG_RSP] + g_current_guest_base;
+    if (written > 0 && stack != 0) {
+        const auto* words = reinterpret_cast<const uint32_t*>(stack);
+        for (int row = 0; row < 4 && static_cast<size_t>(written) + 80 < capacity; ++row) {
+            written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
+                                     "  stack+%02x", row * 16);
+            for (int column = 0; column < 4; ++column) {
+                written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
+                                         " %08x", words[row * 4 + column]);
+            }
+            written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
+                                     "\n");
+        }
+    }
     return written < 0 ? 0 : static_cast<size_t>(written);
 }
 

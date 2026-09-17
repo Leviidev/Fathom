@@ -174,7 +174,13 @@ case "$1" in
         # against a different glibc from the one the helper is running -- two C libraries
         # in one process, and GLib's type system stops working. Chromium draws in
         # software instead, which is what it does on any machine without a GPU.
+        #
+        # --enable-features=NetworkServiceInProcess: Chromium normally runs its network
+        # service as a separate process, and separate processes here are forks of a
+        # browser that already has a dozen threads. In process, there is nothing to
+        # launch and nothing to wait for.
         extra="--no-zygote --disable-gpu --disable-gpu-compositing --disable-software-rasterizer"
+        extra="$extra --enable-features=NetworkServiceInProcess2,NetworkServiceInProcess"
         # Set FATHOM_WEBHELPER_VERBOSE to have Chromium say what it is doing; its log
         # goes wherever Steam pointed --log-file, which is the Steam logs directory.
         if [ -n "${FATHOM_WEBHELPER_VERBOSE:-}" ]; then

@@ -19,8 +19,10 @@
 //     buffers need that).
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -176,6 +178,20 @@ private:
     std::vector<std::pair<uint64_t, uint64_t>> UncommittedIn(uint64_t begin, uint64_t end) const;
 
     bool ProtectLocked(uint64_t address, uint64_t size, int protection, bool& gained_exec);
+
+    /// Marks [begin, end) as having held guest code, and says whether any part of it
+    /// already had. Throwing compiled code away is the most expensive thing the runtime
+    /// asks FEXCore to do -- it takes a lock that gives writers priority, so one of them
+    /// stops every thread in the session that wants to compile -- and a library mapped
+    /// into arena space nothing has ever executed from has no compiled code to throw
+    /// away. Coarse and one-way on purpose: a bit that is set and should not be costs an
+    /// invalidation that was not needed, which is merely slow, while the reverse runs
+    /// stale code. Lock-free because it sits on the mmap path.
+    bool NoteExecutable(uint64_t begin, uint64_t end);
+
+    std::unique_ptr<std::atomic<uint64_t>[]> code_words_;
+    uint64_t code_grain_ {};
+    uint64_t code_word_count_ {};
 
 
     ReleaseObserver release_observer_ {};

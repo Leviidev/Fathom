@@ -34,6 +34,43 @@ GuestAddressSpace::GuestAddressSpace(uint64_t base, uint64_t size, uint64_t page
     , size_ {size}
     , page_size_ {page_size} {
     free_.push_back(Extent {base, size});
+
+    // One bit per grain of the arena, sized so the map stays under half a megabyte
+    // whatever the arena's size is. 64KB grains for a 4GB arena.
+    code_grain_ = 64 * 1024;
+    while (size / code_grain_ / 64 > 65536) {
+        code_grain_ *= 2;
+    }
+    code_word_count_ = size / code_grain_ / 64 + 1;
+    code_words_ = std::make_unique<std::atomic<uint64_t>[]>(code_word_count_);
+    for (uint64_t i = 0; i < code_word_count_; ++i) {
+        code_words_[i].store(0, std::memory_order_relaxed);
+    }
+}
+
+bool GuestAddressSpace::NoteExecutable(uint64_t begin, uint64_t end) {
+    if (code_words_ == nullptr || end <= begin) {
+        return true;
+    }
+    // Outside the arena there is no map, so answer the safe way.
+    if (begin < base_ || end > base_ + size_) {
+        return true;
+    }
+    bool had = false;
+    const uint64_t first = (begin - base_) / code_grain_;
+    const uint64_t last = (end - 1 - base_) / code_grain_;
+    for (uint64_t grain = first; grain <= last; ++grain) {
+        const uint64_t word = grain / 64;
+        if (word >= code_word_count_) {
+            return true;
+        }
+        const uint64_t bit = 1ull << (grain % 64);
+        const uint64_t before = code_words_[word].fetch_or(bit, std::memory_order_relaxed);
+        if ((before & bit) != 0) {
+            had = true;
+        }
+    }
+    return had;
 }
 
 GuestAddressSpace::~GuestAddressSpace() {
@@ -408,7 +445,7 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
                 return 0;
             }
             RecordCommitted(aligned_hint, length, protection);
-            if (executable) {
+            if (executable && NoteExecutable(aligned_hint, aligned_hint + length)) {
                 fresh_begin = aligned_hint;
                 fresh_end = aligned_hint + length;
             }
@@ -438,7 +475,7 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
             return 0;
         }
         RecordCommitted(address, length, protection);
-        if (executable) {
+        if (executable && NoteExecutable(address, address + length)) {
             fresh_begin = address;
             fresh_end = address + length;
         }
@@ -502,7 +539,8 @@ bool GuestAddressSpace::CommitFixed(uint64_t address, uint64_t size, int protect
     RecordCommitted(begin, end - begin, protection);
     lock.unlock();
     // As in Allocate: only where the guest can execute.
-    if ((protection & kGuestProtExec) != 0 && release_observer_ != nullptr) {
+    if ((protection & kGuestProtExec) != 0 && NoteExecutable(begin, end) &&
+        release_observer_ != nullptr) {
         release_observer_(begin, end);
     }
     return true;
@@ -612,7 +650,9 @@ bool GuestAddressSpace::Protect(uint64_t address, uint64_t size, int protection)
     // Code can arrive at an address by being mapped there and then made executable, and
     // the blocks compiled from whatever used to be there have to go with it. Outside the
     // lock, because the observer goes into FEXCore and FEXCore asks this class questions.
-    if (changed && gained_exec && release_observer_ != nullptr) {
+    if (changed && gained_exec &&
+        NoteExecutable(AlignDown(address), AlignUp(address + size)) &&
+        release_observer_ != nullptr) {
         release_observer_(AlignDown(address), AlignUp(address + size));
     }
     return changed;

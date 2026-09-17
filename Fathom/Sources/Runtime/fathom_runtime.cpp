@@ -523,6 +523,31 @@ void fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::Gue
     // exec. Suspending and looking is the only way to ask without a race -- the answer can
     // change the instant after it is given -- so a thread caught in there is let go and
     // tried again.
+    const auto freeze = [&](pthread_t host_thread, const fathom::LinuxSyscalls* syscalls, int tid) {
+        const auto port = pthread_mach_thread_np(host_thread);
+        if (port == MACH_PORT_NULL) {
+            return;
+        }
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            if (thread_suspend(port) != KERN_SUCCESS) {
+                return;
+            }
+            if (syscalls == nullptr || !syscalls->InRuntime()) {
+                process->frozen_threads.push_back(port);
+                return;
+            }
+            thread_resume(port);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+        FATHOM_WARN("fork: tid %d would not stop; pid %d's child shares its memory with it", tid,
+                    process->pid);
+    };
+
+    // The first thread is not in the list -- it is the process itself -- and a fork made
+    // from one of the others leaves it running unless it is named here.
+    if (process->thread != nullptr && process->thread.get() != caller && process->thread_started) {
+        freeze(process->host_thread, process->syscalls.get(), process->pid);
+    }
     for (auto& thread : process->threads) {
         if (!thread->started || thread->finished.load(std::memory_order_acquire)) {
             continue;
@@ -530,28 +555,7 @@ void fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::Gue
         if (thread->thread.get() == caller) {
             continue;
         }
-        const auto port = pthread_mach_thread_np(thread->host_thread);
-        if (port == MACH_PORT_NULL) {
-            continue;
-        }
-        bool frozen = false;
-        for (int attempt = 0; attempt < 200; ++attempt) {
-            if (thread_suspend(port) != KERN_SUCCESS) {
-                break;
-            }
-            if (!thread->syscalls->InRuntime()) {
-                frozen = true;
-                break;
-            }
-            thread_resume(port);
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
-        }
-        if (frozen) {
-            process->frozen_threads.push_back(port);
-        } else {
-            FATHOM_WARN("fork: tid %d would not stop; pid %d's child shares its memory with it",
-                        thread->tid, process->pid);
-        }
+        freeze(thread->host_thread, thread->syscalls.get(), thread->tid);
     }
 }
 

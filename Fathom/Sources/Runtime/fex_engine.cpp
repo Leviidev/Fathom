@@ -309,9 +309,11 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     // nothing and costing most of the run.
     const auto fixups = g_alignment_fixups.fetch_add(1, std::memory_order_relaxed) + 1;
     if ((fixups & 0xFFFFF) == 0) {
-        FATHOM_INFO("%llu unaligned accesses emulated so far -- an atomic one cannot be\n"
-                    "  patched away, so each execution of it costs a signal",
-                    static_cast<unsigned long long>(fixups));
+        FATHOM_INFO("%llu unaligned accesses emulated so far; the last was guest rip %#llx "
+                    "at address %p",
+                    static_cast<unsigned long long>(fixups),
+                    static_cast<unsigned long long>(g_active.thread->CurrentFrame->State.rip),
+                    info->si_addr);
     }
     return true;
 #else

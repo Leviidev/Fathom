@@ -5855,6 +5855,46 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (buffer == nullptr && arg3 != 0) {
             return FailLinux(14);
         }
+        {
+            // A netlink socket is a pipe here, and recvfrom on a pipe is ENOTSOCK --
+            // which Chromium's address tracker reports and then retries forever.
+            bool netlink = false;
+            bool route = false;
+            {
+                std::scoped_lock lock {shared_->mutex};
+                auto* file = FindFile(static_cast<int>(arg1));
+                if (file != nullptr && file->is_netlink) {
+                    netlink = true;
+                    route = file->netlink_protocol == 0;
+                }
+            }
+            if (netlink) {
+                if (!route) {
+                    return FailLinux(11); // EAGAIN: nothing is ever announced here.
+                }
+                const auto waiting = EnterBlockingWait();
+                const ssize_t bytes = read(host_fd, buffer, arg3);
+                (void)waiting;
+                if (bytes < 0) {
+                    return Fail(errno);
+                }
+                if (arg5 != 0 && arg6 != 0) {
+                    auto* out_length =
+                        static_cast<uint32_t*>(GuestPointer(arg6, sizeof(uint32_t), true));
+                    if (out_length != nullptr && *out_length >= 12) {
+                        auto* out = static_cast<unsigned char*>(GuestPointer(arg5, 12, true));
+                        if (out != nullptr) {
+                            unsigned char sender[12] = {};
+                            const uint16_t family = 16;
+                            std::memcpy(sender, &family, sizeof(family));
+                            std::memcpy(out, sender, sizeof(sender));
+                            *out_length = 12;
+                        }
+                    }
+                }
+                return static_cast<uint64_t>(bytes);
+            }
+        }
         sockaddr_storage from {};
         socklen_t from_length = sizeof(from);
         const ssize_t received = recvfrom(host_fd, buffer, arg3, HostMessageFlags(static_cast<int>(arg4)),

@@ -186,7 +186,10 @@ case "$1" in
         # service as a separate process, and separate processes here are forks of a
         # browser that already has a dozen threads. In process, there is nothing to
         # launch and nothing to wait for.
-        extra="--no-zygote --disable-gpu --disable-gpu-compositing --disable-software-rasterizer"
+        # --no-sandbox goes with --no-zygote and is not optional: Chromium refuses to
+        # start at all when the zygote is disabled and the sandbox is not, and says so
+        # once, on standard error, where Steam's own log never sees it.
+        extra="--no-zygote --no-sandbox --disable-gpu --disable-gpu-compositing --disable-software-rasterizer"
         extra="$extra --enable-features=NetworkServiceInProcess2,NetworkServiceInProcess"
         # --no-proxy-server: the last thing the helper does before it goes quiet is ask
         # D-Bus for the desktop's proxy settings, twice, and there is no D-Bus here. With

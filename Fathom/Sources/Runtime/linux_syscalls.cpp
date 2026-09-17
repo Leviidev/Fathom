@@ -3265,6 +3265,16 @@ bool LinuxSyscalls::ProcFileContents(const std::string& guest_path, std::string*
         *out = buffer;
         return true;
     }
+    // No user namespaces here, and nothing that could make one: there is no kernel to ask.
+    // Saying so matters because it is how a program decides whether it can sandbox itself.
+    // Steam reads these two before starting its web helper and, finding neither, assumes
+    // it can -- and Chromium then refuses to start at all, because a sandbox it cannot
+    // build is a sandbox it will not run without.
+    if (guest_path == "/proc/sys/kernel/unprivileged_userns_clone" ||
+        guest_path == "/proc/sys/user/max_user_namespaces") {
+        *out = "0\n";
+        return true;
+    }
     if (guest_path == "/proc/version") {
         *out = "Linux version 6.6.0-fathom (fathom@fathom) (gcc version 12.2.0) #1 SMP Fathom\n";
         return true;

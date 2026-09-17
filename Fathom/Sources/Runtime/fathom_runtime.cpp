@@ -677,33 +677,43 @@ void fathom_session::JoinFinishedChildren() {
 }
 
 void fathom_session::RestoreBorrowedMemory(GuestProcess* process) {
+    size_t refused = 0;
+    size_t refused_bytes = 0;
+    size_t held = 0;
     {
         std::scoped_lock lock {process_mutex};
+        held = process->borrowed.size();
         for (auto& region : process->borrowed) {
             // The parent may have let this go while the child was running -- a thread of
             // its own unmapping a region, or the heap shrinking under it. Writing to a
             // page the arena has since protected away is a fault on the child's thread
             // with the parent's address in it, which reads as a wild pointer and is not.
-            if (space->EpochAt(region.address) != region.epoch ||
-                !space->Validate(region.address, region.bytes.size(),
-                                 fathom::kGuestProtWrite)) {
-                FATHOM_WARN("fork: not putting back %#llx..%#llx for pid %d -- epoch %llu, "
-                            "now %llu, writable %d",
-                            static_cast<unsigned long long>(region.address),
-                            static_cast<unsigned long long>(region.address + region.bytes.size()),
-                            process->ppid, static_cast<unsigned long long>(region.epoch),
-                            static_cast<unsigned long long>(space->EpochAt(region.address)),
-                            space->Validate(region.address, region.bytes.size(),
-                                            fathom::kGuestProtWrite) ? 1 : 0);
-                continue;
-            }
             // Put the parent's memory back exactly as the fork found it, before anything
-            // lets the parent run on it again.
-            std::memcpy(reinterpret_cast<void*>(region.address), region.bytes.data(),
-                        region.bytes.size());
+            // lets the parent run on it again -- unless it is not the parent's memory any
+            // more, which happens when the parent released it while the child was running
+            // and the arena has since given it to something else.
+            const char* refusal = "";
+            if (!space->RestoreIfUnchanged(region.address, region.bytes.data(),
+                                           region.bytes.size(), region.epoch, &refusal)) {
+                ++refused;
+                refused_bytes += region.bytes.size();
+                // A few, not all of them: a busy parent can have thousands of regions and
+                // a line each buries everything else in the log.
+                if (refused <= 4) {
+                    FATHOM_WARN("fork: not putting back %#llx..%#llx for pid %d -- %s",
+                                static_cast<unsigned long long>(region.address),
+                                static_cast<unsigned long long>(region.address + region.bytes.size()),
+                                process->ppid, refusal);
+                }
+            }
         }
         process->borrowed.clear();
         process->borrowed.shrink_to_fit();
+    }
+    if (refused != 0) {
+        FATHOM_WARN("fork: pid %d kept %zu of %zu regions (%zu KB) that are no longer its "
+                    "parent's to give back",
+                    process->pid, refused, held, refused_bytes / 1024);
     }
 }
 
@@ -1055,25 +1065,23 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
         // The parent's own regions only. The arena is shared, so asking it for every
         // writable range sweeps in whatever sibling processes have mapped -- which on a
         // pipeline's second fork meant copying the first child's entire 128MB heap.
-        std::vector<std::pair<uint64_t, uint64_t>> owned;
-        if (!threaded) {
-            owned = parent->syscalls->Mappings();
-            // ToGuestAddresses put an image's bounds into the guest's numbering, because
-            // that is what the guest is told about them. Copying needs the host's.
-            owned.emplace_back(parent->program.image.image_begin + parent->guest_base,
-                               parent->program.image.image_end - parent->program.image.image_begin);
-            if (parent->program.dynamic) {
-                owned.emplace_back(parent->program.interpreter.image_begin + parent->guest_base,
-                                   parent->program.interpreter.image_end - parent->program.interpreter.image_begin);
-            }
-            // Not held for a threaded parent: freezing its own threads makes the copy
-            // exact with respect to *them*, but the session's other processes are still
-            // running in the same arena and can protect a page away between the check
-            // that says it is writable and the write itself. Putting back a hundred and
-            // twenty-eight megabytes widens that window until it is hit.
-            if (heap_low != 0) {
-                owned.emplace_back(heap_low, kHeapReservation);
-            }
+        std::vector<std::pair<uint64_t, uint64_t>> owned = parent->syscalls->Mappings();
+        // ToGuestAddresses put an image's bounds into the guest's numbering, because that
+        // is what the guest is told about them. Copying needs the host's.
+        owned.emplace_back(parent->program.image.image_begin + parent->guest_base,
+                           parent->program.image.image_end - parent->program.image.image_begin);
+        if (parent->program.dynamic) {
+            owned.emplace_back(parent->program.interpreter.image_begin + parent->guest_base,
+                               parent->program.interpreter.image_end - parent->program.interpreter.image_begin);
+        }
+        // The heap included, whatever else is running. A child mallocs on its way to exec
+        // -- that is what a C library's own fork path does -- and a parent that does not
+        // get its heap back reads a chunk header the child rewrote and gives up with
+        // "corrupted double-linked list". Holding it is only safe because the parent's
+        // threads are stopped for the duration and the copy goes back under the address
+        // space's lock; without either, putting it back is worse than not.
+        if (heap_low != 0) {
+            owned.emplace_back(heap_low, kHeapReservation);
         }
         // Held either way: the writable parts of every image the process has mapped. That
         // is where a C library keeps what belongs to the process rather than to a thread
@@ -1091,10 +1099,14 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
         // frames whatever else is true, and it is a few kilobytes.
         owned.emplace_back(stack_low, stack_top - stack_low);
 
+        // Clamped first, then merged. Those lists overlap heavily -- an image appears in
+        // Mappings(), in the program image, and again in ImageData() -- and a span named
+        // twice is a span copied twice, held twice and put back twice, which on Steam ran
+        // to twenty copies of the same page.
+        std::vector<std::pair<uint64_t, uint64_t>> wanted;
         for (const auto& [owned_begin, owned_size] : owned) {
-            const fathom::GuestRange range {owned_begin, owned_size, 0};
-            uint64_t from = range.begin;
-            uint64_t to = range.end();
+            uint64_t from = owned_begin;
+            uint64_t to = owned_begin + owned_size;
 
             // Clamped to the part of the heap brk has actually handed out.
             if (heap_low != 0 && overlaps(from, to, heap_low, heap_top)) {
@@ -1106,9 +1118,21 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
                 from = std::max(from, rsp);
                 to = std::min(to, stack_top);
             }
-            if (to <= from) {
+            if (to > from) {
+                wanted.emplace_back(from, to);
+            }
+        }
+        std::sort(wanted.begin(), wanted.end());
+        std::vector<std::pair<uint64_t, uint64_t>> merged;
+        for (const auto& [from, to] : wanted) {
+            if (!merged.empty() && from <= merged.back().second) {
+                merged.back().second = std::max(merged.back().second, to);
                 continue;
             }
+            merged.emplace_back(from, to);
+        }
+
+        for (const auto& [from, to] : merged) {
             // Only the writable parts, and each one on its own. A span named here is
             // rarely one mapping: an image is read-only text next to writable data, and a
             // heap that has not been fully handed out has nothing mapped above the break.

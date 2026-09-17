@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fathom {
@@ -139,6 +140,13 @@ public:
     /// merely shredded.
     void FreeSpace(uint64_t* total, uint64_t* largest) const;
 
+    /// Puts a copy of guest memory back, if that memory is still the memory it was taken
+    /// from. The check and the write happen together under this address space's own lock,
+    /// which is the point: checking first and writing afterwards leaves a window in which
+    /// another guest process -- which is not stopped, whatever the parent's own threads
+    /// are doing -- releases the range and the write lands on nothing.
+    bool RestoreIfUnchanged(uint64_t address, const void* bytes, uint64_t size, uint64_t epoch, const char** refusal = nullptr);
+
     /// The allocation epoch of whatever covers `address`, or 0 if nothing does.
     uint64_t EpochAt(uint64_t address) const;
 
@@ -161,6 +169,8 @@ private:
     bool TakeFreeExtent(uint64_t address, uint64_t size);
     void ReturnFreeExtent(uint64_t address, uint64_t size);
     void RecordCommitted(uint64_t address, uint64_t size, int protection);
+    void TakeFreeSpan(uint64_t begin, uint64_t end);
+    std::vector<std::pair<uint64_t, uint64_t>> UncommittedIn(uint64_t begin, uint64_t end) const;
 
     bool ProtectLocked(uint64_t address, uint64_t size, int protection);
 

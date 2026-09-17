@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -198,11 +199,100 @@ void GuestAddressSpace::ReturnFreeExtent(uint64_t address, uint64_t size) {
     }
 }
 
+/// Takes whatever of [begin, end) is still free, without requiring all of it to be.
+///
+/// TakeFreeExtent is all-or-nothing, which is right for an allocation but wrong for a
+/// fixed mapping: a loader reserves a library's whole span and then maps each segment
+/// over the top, so the second mapping lands partly on its own memory and partly on free
+/// space. Left in the free list, that free part is handed out again later -- to another
+/// process -- and two programs end up living at the same address.
+void GuestAddressSpace::TakeFreeSpan(uint64_t begin, uint64_t end) {
+    for (size_t index = 0; index < free_.size();) {
+        auto& extent = free_[index];
+        if (extent.end() <= begin || extent.begin >= end) {
+            ++index;
+            continue;
+        }
+        const uint64_t head = begin > extent.begin ? begin - extent.begin : 0;
+        const uint64_t tail = extent.end() > end ? extent.end() - end : 0;
+        if (head == 0 && tail == 0) {
+            free_.erase(free_.begin() + static_cast<long>(index));
+            continue;
+        }
+        if (head == 0) {
+            extent.begin = end;
+            extent.size = tail;
+            ++index;
+            continue;
+        }
+        if (tail == 0) {
+            extent.size = head;
+            ++index;
+            continue;
+        }
+        const Extent remainder {end, tail};
+        extent.size = head;
+        free_.insert(free_.begin() + static_cast<long>(index) + 1, remainder);
+        index += 2;
+    }
+}
+
+/// The parts of [begin, end) nothing is committed over, host page by host page.
+std::vector<std::pair<uint64_t, uint64_t>> GuestAddressSpace::UncommittedIn(uint64_t begin,
+                                                                           uint64_t end) const {
+    std::vector<std::pair<uint64_t, uint64_t>> gaps;
+    uint64_t cursor = begin;
+    for (const auto& range : committed_) {
+        if (range.end() <= cursor) {
+            continue;
+        }
+        if (range.begin >= end) {
+            break;
+        }
+        if (range.begin > cursor) {
+            gaps.emplace_back(cursor, std::min(range.begin, end));
+        }
+        cursor = std::max(cursor, range.end());
+        if (cursor >= end) {
+            return gaps;
+        }
+    }
+    if (cursor < end) {
+        gaps.emplace_back(cursor, end);
+    }
+    return gaps;
+}
+
+/// Records a committed range, and takes that address away from anything that claimed it
+/// before.
+///
+/// Overlapping entries are not merely untidy. Everything that asks this list a question
+/// about an address -- which mapping is here, is it writable, is it still the one a copy
+/// was taken from -- gets a different answer depending on which entry it happens to reach
+/// first, and a fork's snapshot ends up holding the same page four times over, each with
+/// a different idea of when it was mapped. So the newcomer wins, and whatever was there
+/// is clipped around it.
 void GuestAddressSpace::RecordCommitted(uint64_t address, uint64_t size, int protection) {
-    GuestRange range {address, size, protection, next_epoch_++};
-    auto position = std::lower_bound(committed_.begin(), committed_.end(), range,
-                                     [](const GuestRange& lhs, const GuestRange& rhs) { return lhs.begin < rhs.begin; });
-    committed_.insert(position, range);
+    const uint64_t end = address + size;
+    std::vector<GuestRange> updated;
+    updated.reserve(committed_.size() + 2);
+    for (const auto& range : committed_) {
+        if (range.end() <= address || range.begin >= end) {
+            updated.push_back(range);
+            continue;
+        }
+        if (range.begin < address) {
+            updated.push_back(GuestRange {range.begin, address - range.begin, range.protection,
+                                          range.epoch});
+        }
+        if (range.end() > end) {
+            updated.push_back(GuestRange {end, range.end() - end, range.protection, range.epoch});
+        }
+    }
+    updated.push_back(GuestRange {address, size, protection, next_epoch_++});
+    std::sort(updated.begin(), updated.end(),
+              [](const GuestRange& lhs, const GuestRange& rhs) { return lhs.begin < rhs.begin; });
+    committed_ = std::move(updated);
 }
 
 uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protection) {
@@ -280,8 +370,22 @@ bool GuestAddressSpace::CommitFixed(uint64_t address, uint64_t size, int protect
         return false;
     }
     if (!TakeFreeExtent(begin, end - begin)) {
-        // Already committed. Widening the protection is the only sane interpretation --
-        // ELF segments routinely share a host page with the segment before them.
+        // Partly committed already, which is the ordinary case: a loader reserves a
+        // library's whole span and then maps each of its segments over the top. The parts
+        // that are still free are taken and committed here; the parts that are not keep
+        // what they have, widened -- ELF segments routinely share a host page with the
+        // segment before them, and taking access away from a neighbour that was never
+        // mentioned is how a loader's own data goes read-only underneath it.
+        for (const auto& [gap_begin, gap_end] : UncommittedIn(begin, end)) {
+            TakeFreeSpan(gap_begin, gap_end);
+            if (!CommitRange(gap_begin, gap_end, page_size_, ToHostProtection(protection),
+                             committed_)) {
+                FATHOM_WARN("fixed commit of the free part at %#llx failed: %s",
+                            static_cast<unsigned long long>(gap_begin), std::strerror(errno));
+                continue;
+            }
+            RecordCommitted(gap_begin, gap_end - gap_begin, protection);
+        }
         return ProtectLocked(begin, end - begin, protection);
     }
     if (!CommitRange(begin, end, page_size_, ToHostProtection(protection), committed_)) {
@@ -497,6 +601,60 @@ void GuestAddressSpace::FreeSpace(uint64_t* total, uint64_t* largest) const {
     if (largest != nullptr) {
         *largest = biggest;
     }
+}
+
+bool GuestAddressSpace::RestoreIfUnchanged(uint64_t address, const void* bytes, uint64_t size,
+                                           uint64_t epoch, const char** refusal) {
+    static thread_local char why[192];
+    const auto refuse = [&](const char* what, const GuestRange* range) {
+        if (refusal != nullptr) {
+            if (range != nullptr) {
+                std::snprintf(why, sizeof(why), "%s (wanted epoch %llu, %#llx..%#llx is epoch %llu prot %d)",
+                              what, static_cast<unsigned long long>(epoch),
+                              static_cast<unsigned long long>(range->begin),
+                              static_cast<unsigned long long>(range->end()),
+                              static_cast<unsigned long long>(range->epoch), range->protection);
+            } else {
+                std::snprintf(why, sizeof(why), "%s", what);
+            }
+            *refusal = why;
+        }
+        return false;
+    };
+    std::scoped_lock lock {mutex_};
+    uint64_t cursor = address;
+    const uint64_t end = address + size;
+    for (const auto& range : committed_) {
+        if (range.end() <= cursor) {
+            continue;
+        }
+        if (range.begin > cursor) {
+            return refuse("nothing is mapped there any more", &range);
+        }
+        if (range.epoch != epoch) {
+            return refuse("a different mapping is there now", &range);
+        }
+        if ((range.protection & kGuestProtWrite) == 0) {
+            return refuse("it is no longer writable", &range);
+        }
+        cursor = range.end();
+        if (cursor >= end) {
+            // The arena saying a range is writable is not the host saying so. A guest that
+            // mapped a file here left a mapping whose maximum protection the file decided,
+            // and a guest mprotect that widened it afterwards failed quietly. Writing
+            // anyway is a protection fault inside this memcpy, which kills the session --
+            // so the host is asked first, and told no is a reason to leave the copy alone.
+            const uint64_t page_begin = AlignDown(address);
+            const uint64_t page_end = AlignUp(end);
+            if (mprotect(reinterpret_cast<void*>(page_begin), page_end - page_begin,
+                         PROT_READ | PROT_WRITE) != 0) {
+                return refuse("the host will not allow writing there", nullptr);
+            }
+            std::memcpy(reinterpret_cast<void*>(address), bytes, size);
+            return true;
+        }
+    }
+    return refuse("the mapping ends short of the copy", nullptr);
 }
 
 uint64_t GuestAddressSpace::EpochAt(uint64_t address) const {

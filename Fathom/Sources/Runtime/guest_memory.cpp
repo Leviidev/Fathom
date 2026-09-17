@@ -373,6 +373,13 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
     // outside, it looks like a jump into nonsense. Collected here and done once the lock
     // is dropped, because the observer goes into FEXCore and FEXCore asks this class
     // questions.
+    // Only when the guest can execute there. Throwing compiled code away takes FEXCore's
+    // invalidation lock, which gives writers priority, so one of these stops every thread
+    // in the session that wants to compile -- and with thirty of them compiling, a single
+    // mmap can wait indefinitely. Code only ever becomes runnable at an address by being
+    // mapped executable or protected executable, and both of those invalidate; memory
+    // handed out for data cannot run anything until then.
+    const bool executable = (protection & kGuestProtExec) != 0;
     uint64_t fresh_begin = 0;
     uint64_t fresh_end = 0;
     struct Notify {
@@ -401,8 +408,10 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
                 return 0;
             }
             RecordCommitted(aligned_hint, length, protection);
-            fresh_begin = aligned_hint;
-            fresh_end = aligned_hint + length;
+            if (executable) {
+                fresh_begin = aligned_hint;
+                fresh_end = aligned_hint + length;
+            }
             lock.unlock();
             return aligned_hint;
         }
@@ -429,8 +438,10 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
             return 0;
         }
         RecordCommitted(address, length, protection);
-        fresh_begin = address;
-        fresh_end = address + length;
+        if (executable) {
+            fresh_begin = address;
+            fresh_end = address + length;
+        }
         lock.unlock();
         return address;
     }
@@ -490,7 +501,8 @@ bool GuestAddressSpace::CommitFixed(uint64_t address, uint64_t size, int protect
     }
     RecordCommitted(begin, end - begin, protection);
     lock.unlock();
-    if (release_observer_ != nullptr) {
+    // As in Allocate: only where the guest can execute.
+    if ((protection & kGuestProtExec) != 0 && release_observer_ != nullptr) {
         release_observer_(begin, end);
     }
     return true;

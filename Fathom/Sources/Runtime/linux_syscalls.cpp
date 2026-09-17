@@ -1363,6 +1363,7 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
         return count == 0 ? 0 : FailLinux(14);
     }
     bool from_console = false;
+    int host_fd = -1;
     {
         std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(fd);
@@ -1376,6 +1377,7 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
             return DoTimerfdRead(*file, buffer);
         }
         from_console = file->console_stream >= 0;
+        host_fd = file->host_fd;
     }
     if (from_console) {
         const int64_t read_bytes = console_.ReadInput(static_cast<char*>(data), count);
@@ -1389,12 +1391,15 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
         return static_cast<uint64_t>(read_bytes);
     }
 
-    std::scoped_lock lock {shared_->mutex};
-    auto* file = FindFile(fd);
-    if (file == nullptr) {
-        return FailLinux(9);
-    }
-    const ssize_t bytes = read(file->host_fd, data, count);
+    // The descriptor's number is taken above and the table's lock dropped before the read
+    // itself, which is the whole point: a read blocks, and the table belongs to every
+    // thread of the process. Holding it here stops all of them -- including the one that
+    // was going to write the bytes this read is waiting for, because it needs the table
+    // to find its own end of the pipe. Two threads of a program passing messages to each
+    // other is not an unusual thing to do; Chromium does it during startup, and the whole
+    // process would stop dead the first time it did.
+    const auto waiting = EnterBlockingWait();
+    const ssize_t bytes = read(host_fd, data, count);
     return bytes < 0 ? Fail(errno) : static_cast<uint64_t>(bytes);
 }
 

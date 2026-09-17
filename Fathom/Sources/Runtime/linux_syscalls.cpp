@@ -1259,6 +1259,44 @@ uint64_t LinuxSyscalls::DoOpenAt(int dirfd, uint64_t path_address, int flags, in
         return static_cast<uint64_t>(RegisterFile(backing, guest_path));
     }
 
+    // /proc/self/fd, which Chromium reads to decide which descriptors to keep across an
+    // exec. There is no /proc here to hold it, so one is made: a directory of links named
+    // for this process's open descriptors, which readdir walks like any other. It is
+    // removed when the descriptor onto it is closed.
+    {
+        const std::string self = "/proc/self/fd";
+        const std::string mine = "/proc/" + std::to_string(pid_) + "/fd";
+        if (guest_path == self || guest_path == mine) {
+            const char* temporary = getenv("TMPDIR");
+            std::string pattern = (temporary == nullptr ? "/tmp/" : std::string {temporary} + "/") +
+                                  "fathom-fds-XXXXXX";
+            std::vector<char> directory {pattern.begin(), pattern.end()};
+            directory.push_back('\0');
+            if (mkdtemp(directory.data()) == nullptr) {
+                return Fail(errno);
+            }
+            const std::string made {directory.data()};
+            {
+                std::scoped_lock lock {shared_->mutex};
+                for (const auto& [number, file] : shared_->files) {
+                    const std::string link = made + "/" + std::to_string(number);
+                    const std::string target =
+                        file.guest_path.empty() ? std::string {"/"} : file.guest_path;
+                    (void)symlink(target.c_str(), link.c_str());
+                }
+            }
+            const int directory_fd = open(made.c_str(), O_RDONLY | O_DIRECTORY);
+            if (directory_fd < 0) {
+                rmdir(made.c_str());
+                return Fail(errno);
+            }
+            std::scoped_lock lock {shared_->mutex};
+            const int fd = RegisterFile(directory_fd, guest_path);
+            shared_->files[fd].scratch_directory = made;
+            return static_cast<uint64_t>(fd);
+        }
+    }
+
     // Shared memory, said out loud. There are a handful of these in a session and they are
     // how separate programs find each other's memory -- Steam's client and its web helper
     // share one -- so an open that does not happen is worth seeing.
@@ -1879,6 +1917,23 @@ void LinuxSyscalls::CloseFd(int fd) {
     } else if (entry->second.host_fd >= 0) {
         close(entry->second.host_fd);
     }
+    if (entry->second.netlink_peer >= 0) {
+        close(entry->second.netlink_peer);
+    }
+    if (!entry->second.scratch_directory.empty()) {
+        const std::string directory = entry->second.scratch_directory;
+        DIR* listing = opendir(directory.c_str());
+        if (listing != nullptr) {
+            while (auto* item = readdir(listing)) {
+                if (std::strcmp(item->d_name, ".") == 0 || std::strcmp(item->d_name, "..") == 0) {
+                    continue;
+                }
+                unlink((directory + "/" + item->d_name).c_str());
+            }
+            closedir(listing);
+        }
+        rmdir(directory.c_str());
+    }
     shared_->files.erase(entry);
 }
 
@@ -1990,8 +2045,27 @@ uint64_t LinuxSyscalls::DoStatAt(int dirfd, uint64_t path_address, uint64_t stat
         }
     } else {
         const bool follow = (flags & guest::kAtSymlinkNoFollow) == 0;
-        const std::string host_path = ResolveAt(dirfd, path.c_str(), nullptr, follow);
-        result = follow ? stat(host_path.c_str(), &host) : lstat(host_path.c_str(), &host);
+        std::string guest_path;
+        const std::string host_path = ResolveAt(dirfd, path.c_str(), &guest_path, follow);
+        // The /proc entries this layer makes up have no file behind them, and a program
+        // that stats before it opens -- which is most of them -- is told they are not
+        // there. Answering for them here is what makes them exist.
+        std::string contents;
+        if (guest_path == "/proc/self/fd" || guest_path == "/proc/" + std::to_string(pid_) + "/fd") {
+            host = {};
+            host.st_mode = S_IFDIR | 0500;
+            host.st_nlink = 2;
+            host.st_size = 512;
+            result = 0;
+        } else if (guest_path.rfind("/proc/", 0) == 0 && ProcFileContents(guest_path, &contents)) {
+            host = {};
+            host.st_mode = S_IFREG | 0444;
+            host.st_nlink = 1;
+            host.st_size = static_cast<off_t>(contents.size());
+            result = 0;
+        } else {
+            result = follow ? stat(host_path.c_str(), &host) : lstat(host_path.c_str(), &host);
+        }
     }
     if (result != 0) {
         return Fail(errno);

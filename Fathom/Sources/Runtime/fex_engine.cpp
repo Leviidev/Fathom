@@ -338,6 +338,10 @@ struct LiveThread {
 
 std::mutex g_live_threads_mutex;
 std::vector<LiveThread> g_live_threads;
+/// How many sweeps are using a copy of that list. A thread may not be destroyed while any
+/// of them is, because the sweep reaches into it.
+size_t g_invalidators {0};
+std::condition_variable g_invalidations_done;
 
 /// Unwinding out of a signal handler is only safe because of the check below: the fault
 /// must have happened inside FEXCore's generated code, where the guest holds no lock of
@@ -615,13 +619,25 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
         FATHOM_INFO("%llu code invalidations so far",
                     static_cast<unsigned long long>(count));
     }
-    // Held for the whole sweep, not just long enough to copy the list. A thread that ends
-    // while its entry is being used takes its lookup cache with it, and the invalidation
+    // The list is copied, and a thread is kept from ending while the copy is in use. A
+    // thread that ends mid-sweep takes its lookup cache with it, and the invalidation
     // walks into freed memory -- a null dereference inside FEXCore, reached from an
-    // ordinary guest mmap. Forgetting a thread takes this same lock, so holding it here
-    // means no thread named in this list can go away until the sweep is done.
-    std::scoped_lock lock {g_live_threads_mutex};
-    const auto& live = g_live_threads;
+    // ordinary guest mmap. Holding the lock for the whole sweep would do it too, but the
+    // sweep waits on FEXCore's own lock and that wait can be long, so a counter is used
+    // instead and thread destruction waits on that.
+    std::vector<LiveThread> live;
+    {
+        std::scoped_lock lock {g_live_threads_mutex};
+        live = g_live_threads;
+        ++g_invalidators;
+    }
+    struct Finished {
+        ~Finished() {
+            std::scoped_lock lock {g_live_threads_mutex};
+            --g_invalidators;
+            g_invalidations_done.notify_all();
+        }
+    } finished;
     // Contexts first: a code buffer's lookup table is shared by every thread using it.
     const auto self = pthread_mach_thread_np(pthread_self());
     std::set<FEXCore::Context::Context*> contexts;
@@ -632,31 +648,18 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
         const uint64_t begin = host_begin - entry.guest_base;
         std::unique_lock guard {entry.context->GetCodeInvalidationMutex()};
 
-        // Held exclusively, so nothing is compiling and no lookup cache is being written.
-        // What is left is threads *running* compiled code, and those have to be stopped
-        // too or a block can be unlinked while one of them is standing in it. They are
-        // safe to stop exactly here: nothing they could be holding is needed below.
-        std::vector<uint32_t> stopped;
-        stopped.reserve(live.size());
-        for (const auto& thread : live) {
-            if (thread.context != entry.context || thread.port == 0 || thread.port == self) {
-                continue;
-            }
-            if (thread_suspend(thread.port) == KERN_SUCCESS) {
-                stopped.push_back(thread.port);
-            }
-        }
-
+        // Deliberately not stopping the threads that might be *running* a block being
+        // thrown away, tempting as it is: a thread looking a block up holds its own lookup
+        // cache's read lock while it does, and the invalidation below takes that same
+        // cache's write lock -- so a thread stopped at the wrong instant is a lock nothing
+        // can take, and every mmap in the process waits on it forever. Unlinking a block
+        // under a thread standing in it is a much rarer accident than that.
         entry.context->InvalidateCodeBuffersCodeRange(begin, host_end - host_begin);
         for (const auto& thread : live) {
             if (thread.context == entry.context) {
                 entry.context->InvalidateThreadCachedCodeRange(thread.thread, begin,
                                                                host_end - host_begin);
             }
-        }
-
-        for (const auto port : stopped) {
-            thread_resume(port);
         }
     }
 }
@@ -675,6 +678,11 @@ public:
     ~Impl() {
         if (context != nullptr && thread != nullptr) {
             ForgetLiveThread(thread);
+            {
+                // Nothing may be halfway through a sweep that names this thread.
+                std::unique_lock wait {g_live_threads_mutex};
+                g_invalidations_done.wait(wait, [] { return g_invalidators == 0; });
+            }
             std::scoped_lock guard {g_thread_lifecycle};
             context->DestroyThread(thread);
             thread = nullptr;

@@ -1607,6 +1607,15 @@ int HostMessageFlags(int guest_flags) {
 /// cast across. struct iovec happens to match on both, so the guest's array is handed
 /// over as-is once its buffers have been checked.
 uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bool sending) {
+    {
+        // A netlink socket here is a pipe with nothing on the other end. recvmsg on a pipe
+        // is an error the guest has no reason to see; "nothing yet" is the truth.
+        std::scoped_lock lock {shared_->mutex};
+        auto* file = FindFile(fd);
+        if (file != nullptr && file->is_netlink) {
+            return sending ? FailLinux(11) : FailLinux(11); // EAGAIN either way.
+        }
+    }
     const int host_fd = HostFdFor(fd);
     if (host_fd < 0) {
         return FailLinux(9);
@@ -5016,6 +5025,34 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysSocket: {
         bool nonblocking = false;
         bool cloexec = false;
+        constexpr int kGuestAfNetlink = 16;
+        constexpr int kNetlinkKobjectUevent = 15;
+        // udev watches for devices arriving over a netlink socket. There is no netlink
+        // here and no devices to announce, but refusing the socket is not the same as
+        // there being nothing on it: SDL takes the refusal as a failure, reloads libudev
+        // and tries again, several times a second, for as long as Steam is running.
+        // A pipe nothing writes to says the truthful thing instead -- no events, ever.
+        if (static_cast<int>(arg1) == kGuestAfNetlink) {
+            if (static_cast<int>(arg3) != kNetlinkKobjectUevent) {
+                // Route and the rest expect answers to the requests sent on them, and a
+                // socket that never answers is worse than one that was never made.
+                return FailLinux(93); // EPROTONOSUPPORT
+            }
+            fathom::net::HostType(static_cast<int>(arg2), &nonblocking, &cloexec);
+            int pair[2] = {-1, -1};
+            if (pipe(pair) != 0) {
+                return Fail(errno);
+            }
+            if (nonblocking) {
+                fcntl(pair[0], F_SETFL, fcntl(pair[0], F_GETFL, 0) | O_NONBLOCK);
+            }
+            std::scoped_lock lock {shared_->mutex};
+            const int fd = RegisterFile(pair[0], "netlink");
+            auto& file = shared_->files[fd];
+            file.is_netlink = true;
+            file.netlink_peer = pair[1];
+            return static_cast<uint64_t>(fd);
+        }
         const int domain = fathom::net::HostDomain(static_cast<int>(arg1));
         const int type = fathom::net::HostType(static_cast<int>(arg2), &nonblocking, &cloexec);
         if (domain < 0) {
@@ -5044,6 +5081,13 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
 
     case kSysConnect:
     case kSysBind: {
+        {
+            std::scoped_lock lock {shared_->mutex};
+            auto* file = FindFile(static_cast<int>(arg1));
+            if (file != nullptr && file->is_netlink) {
+                return 0; // Bound, to the one address a netlink socket can have.
+            }
+        }
         const int host_fd = HostFdFor(static_cast<int>(arg1));
         if (host_fd < 0) {
             return FailLinux(9);
@@ -5201,6 +5245,33 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
 
     case kSysGetsockname:
     case kSysGetpeername: {
+        {
+            std::scoped_lock lock {shared_->mutex};
+            auto* file = FindFile(static_cast<int>(arg1));
+            if (file != nullptr && file->is_netlink) {
+                // struct sockaddr_nl: family, a pad, the port id, the group mask. udev
+                // reads the port id back to know which address the kernel gave it.
+                auto* size = static_cast<uint32_t*>(GuestPointer(arg3, sizeof(uint32_t), true));
+                if (size == nullptr) {
+                    return FailLinux(14);
+                }
+                const uint32_t wanted = std::min<uint32_t>(*size, 12);
+                auto* out = static_cast<unsigned char*>(GuestPointer(arg2, wanted, true));
+                if (out == nullptr && wanted != 0) {
+                    return FailLinux(14);
+                }
+                unsigned char address[12] = {};
+                const uint16_t family = 16;
+                const uint32_t port = static_cast<uint32_t>(pid_);
+                std::memcpy(address, &family, sizeof(family));
+                std::memcpy(address + 4, &port, sizeof(port));
+                if (wanted != 0) {
+                    std::memcpy(out, address, wanted);
+                }
+                *size = 12;
+                return 0;
+            }
+        }
         const int host_fd = HostFdFor(static_cast<int>(arg1));
         if (host_fd < 0) {
             return FailLinux(9);
@@ -5226,6 +5297,13 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     }
 
     case kSysSetsockopt: {
+        {
+            std::scoped_lock lock {shared_->mutex};
+            auto* file = FindFile(static_cast<int>(arg1));
+            if (file != nullptr && file->is_netlink) {
+                return 0; // A buffer size or a credential hint, on a socket with no traffic.
+            }
+        }
         const int host_fd = HostFdFor(static_cast<int>(arg1));
         if (host_fd < 0) {
             return FailLinux(9);

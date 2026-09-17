@@ -323,6 +323,14 @@ private:
         /// kqueue, whose descriptor becomes readable exactly when a timer it carries
         /// fires -- so poll and epoll see it without knowing it is anything unusual.
         bool is_timer {};
+        /// A netlink socket, which this host has no such thing as. The guest gets one end
+        /// of a pipe that nothing ever writes to, which is exactly what a machine with no
+        /// devices arriving or leaving looks like -- and the calls a netlink socket
+        /// expects to succeed (bind, setsockopt, getsockname) are answered here rather
+        /// than passed to a host that would refuse them.
+        bool is_netlink {};
+        /// The other end, kept open so reads block rather than see end-of-file.
+        int netlink_peer {-1};
         /// What the guest last asked for, because timerfd_gettime has to answer with it.
         int64_t timer_interval_ns {};
         int64_t timer_value_ns {};

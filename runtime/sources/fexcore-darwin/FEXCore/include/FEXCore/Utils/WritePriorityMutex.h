@@ -268,6 +268,12 @@ public:
   void StealAndDropActiveLocks() {
     Futex = 0;
   }
+
+  // The raw state word, for a caller that has been waiting long enough to want to say why.
+  // Reader count in the low bits, writer-waiter count above it, write-owned in the top bit.
+  uint32_t State() {
+    return std::atomic_ref<uint32_t>(Futex).load(std::memory_order_relaxed);
+  }
 #endif
 
 private:

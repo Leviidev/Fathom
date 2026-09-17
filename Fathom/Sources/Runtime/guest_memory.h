@@ -175,7 +175,7 @@ private:
     void Coalesce();
     std::vector<std::pair<uint64_t, uint64_t>> UncommittedIn(uint64_t begin, uint64_t end) const;
 
-    bool ProtectLocked(uint64_t address, uint64_t size, int protection);
+    bool ProtectLocked(uint64_t address, uint64_t size, int protection, bool& gained_exec);
 
 
     ReleaseObserver release_observer_ {};

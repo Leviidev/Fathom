@@ -453,7 +453,8 @@ bool GuestAddressSpace::CommitFixed(uint64_t address, uint64_t size, int protect
             }
             RecordCommitted(gap_begin, gap_end - gap_begin, protection);
         }
-        return ProtectLocked(begin, end - begin, protection);
+        bool gained_exec = false;
+        return ProtectLocked(begin, end - begin, protection, gained_exec);
     }
     if (!CommitRange(begin, end, page_size_, ToHostProtection(protection), committed_)) {
         FATHOM_ERROR("fixed commit at %#llx (%llu bytes) failed: %s",
@@ -554,15 +555,27 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
 }
 
 bool GuestAddressSpace::Protect(uint64_t address, uint64_t size, int protection) {
-    std::unique_lock lock {mutex_};
-    return ProtectLocked(address, size, protection);
+    bool gained_exec = false;
+    bool changed = false;
+    {
+        std::unique_lock lock {mutex_};
+        changed = ProtectLocked(address, size, protection, gained_exec);
+    }
+    // Code can arrive at an address by being mapped there and then made executable, and
+    // the blocks compiled from whatever used to be there have to go with it. Outside the
+    // lock, because the observer goes into FEXCore and FEXCore asks this class questions.
+    if (changed && gained_exec && release_observer_ != nullptr) {
+        release_observer_(AlignDown(address), AlignUp(address + size));
+    }
+    return changed;
 }
 
 // Callers already holding the lock use this directly. The list of committed ranges is
 // rebuilt here, so a guest mprotect running while another thread commits or releases
 // memory frees the vector's storage out from under whoever is walking it -- which shows
 // up as a malloc abort a long way from the thread that caused it.
-bool GuestAddressSpace::ProtectLocked(uint64_t address, uint64_t size, int protection) {
+bool GuestAddressSpace::ProtectLocked(uint64_t address, uint64_t size, int protection,
+                                     bool& gained_exec) {
     const uint64_t begin = AlignDown(address);
     const uint64_t end = AlignUp(address + size);
 
@@ -618,6 +631,7 @@ bool GuestAddressSpace::ProtectLocked(uint64_t address, uint64_t size, int prote
     if ((protection & kGuestProtWrite) != 0) {
         mprotect(reinterpret_cast<void*>(begin), end - begin, PROT_READ | PROT_WRITE);
     }
+    gained_exec = (protection & kGuestProtExec) != 0;
     return true;
 }
 

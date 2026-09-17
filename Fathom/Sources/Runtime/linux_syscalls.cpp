@@ -2068,7 +2068,17 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         // range was never released -- a loader maps a library's whole span and then maps
         // each of its segments over the top. Any code compiled from the old bytes has to
         // go, or the new library runs as the old one.
-        space_.NotifyContentsReplaced(placed, placed + length);
+        //
+        // Only for a mapping the guest can execute, though. Throwing compiled code away
+        // stops every thread in the process: FEXCore's invalidation lock gives writers
+        // priority, so one of these blocks every thread that is running compiled code
+        // until it is done. A loader places a library's data and bss this way too, and
+        // Chromium's allocator places a hundred megabytes of heap this way -- none of
+        // which any block was ever compiled from. Code arriving at an address always
+        // arrives executable, either here or through an mprotect, and both invalidate.
+        if ((guest_protection & kGuestProtExec) != 0) {
+            space_.NotifyContentsReplaced(placed, placed + length);
+        }
     } else {
         // Writable regardless of what the guest asked for: file-backed contents have to
         // be written in below, and the real protection is applied afterwards.

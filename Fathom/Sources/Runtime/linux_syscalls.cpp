@@ -164,6 +164,7 @@ enum : uint64_t {
     kSysFstat = 5,
     kSysLstat = 6,
     kSysPoll = 7,
+    kSysPpoll = 271,
     kSysLseek = 8,
     kSysMmap = 9,
     kSysMprotect = 10,
@@ -608,6 +609,7 @@ clockid_t ToHostClock(int guest_clock, bool* supported) {
 const char* SyscallName(uint64_t number) {
     switch (number) {
     case kSysPoll: return "poll";
+    case kSysPpoll: return "ppoll";
     case kSysRead: return "read";
     case kSysWrite: return "write";
     case kSysOpen: return "open";
@@ -5367,6 +5369,32 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
 
     case kSysPoll:
         return DoPoll(arg1, arg2, static_cast<int>(arg3));
+
+    case kSysPpoll: {
+        // poll with a timespec and a signal mask. The mask is ignored: nothing here
+        // delivers signals to a guest thread while it waits, so there is no window for
+        // one to be blocked in. Chromium's message loop is built on this call and makes
+        // it thousands of times a minute -- answering ENOSYS leaves its event loops
+        // spinning on nothing, which is a web helper that starts and then never replies.
+        int timeout_ms = -1;
+        if (arg3 != 0) {
+            struct GuestTimespec {
+                int64_t seconds;
+                int64_t nanoseconds;
+            } wanted {};
+            const void* raw = GuestPointer(arg3, sizeof(wanted), false);
+            if (raw == nullptr) {
+                return FailLinux(14);
+            }
+            std::memcpy(&wanted, raw, sizeof(wanted));
+            const int64_t milliseconds = wanted.seconds * 1000 + wanted.nanoseconds / 1000000;
+            timeout_ms = milliseconds > INT32_MAX ? INT32_MAX : static_cast<int>(milliseconds);
+            if (timeout_ms < 0) {
+                timeout_ms = 0;
+            }
+        }
+        return DoPoll(arg1, arg2, timeout_ms);
+    }
 
     case kSysSocket: {
         bool nonblocking = false;

@@ -1818,14 +1818,153 @@ int HostMessageFlags(int guest_flags) {
 /// the wider fields. The fields are therefore read out of the guest by offset rather than
 /// cast across. struct iovec happens to match on both, so the guest's array is handed
 /// over as-is once its buffers have been checked.
+// ---------------------------------------------------------------------------
+// NETLINK_ROUTE
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr uint16_t kNlmsgError = 2;
+constexpr uint16_t kNlmsgDone = 3;
+constexpr uint16_t kRtmNewLink = 16;
+constexpr uint16_t kRtmGetLink = 18;
+constexpr uint16_t kRtmNewAddr = 20;
+constexpr uint16_t kRtmGetAddr = 22;
+constexpr uint16_t kNlmFlagMulti = 0x2;
+constexpr uint16_t kNlmFlagRoot = 0x100;
+
+size_t NetlinkAlign(size_t length) {
+    return (length + 3) & ~static_cast<size_t>(3);
+}
+
+void PutBytes(std::vector<uint8_t>& out, const void* data, size_t length) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    out.insert(out.end(), bytes, bytes + length);
+    out.resize(NetlinkAlign(out.size()), 0);
+}
+
+void PutAttribute(std::vector<uint8_t>& out, uint16_t type, const void* data, uint16_t length) {
+    const uint16_t header = static_cast<uint16_t>(4 + length);
+    out.insert(out.end(), reinterpret_cast<const uint8_t*>(&header),
+               reinterpret_cast<const uint8_t*>(&header) + 2);
+    out.insert(out.end(), reinterpret_cast<const uint8_t*>(&type),
+               reinterpret_cast<const uint8_t*>(&type) + 2);
+    PutBytes(out, data, length);
+}
+
+/// Starts a netlink message and returns where its length field lives, so the caller can
+/// fill it in once the body is written.
+size_t BeginMessage(std::vector<uint8_t>& out, uint16_t type, uint16_t flags, uint32_t seq,
+                    uint32_t port) {
+    const size_t at = out.size();
+    const uint32_t placeholder = 0;
+    PutBytes(out, &placeholder, 4);
+    out.insert(out.end(), reinterpret_cast<const uint8_t*>(&type),
+               reinterpret_cast<const uint8_t*>(&type) + 2);
+    out.insert(out.end(), reinterpret_cast<const uint8_t*>(&flags),
+               reinterpret_cast<const uint8_t*>(&flags) + 2);
+    out.insert(out.end(), reinterpret_cast<const uint8_t*>(&seq),
+               reinterpret_cast<const uint8_t*>(&seq) + 4);
+    out.insert(out.end(), reinterpret_cast<const uint8_t*>(&port),
+               reinterpret_cast<const uint8_t*>(&port) + 4);
+    return at;
+}
+
+void EndMessage(std::vector<uint8_t>& out, size_t at) {
+    const uint32_t length = static_cast<uint32_t>(out.size() - at);
+    std::memcpy(out.data() + at, &length, sizeof(length));
+    out.resize(NetlinkAlign(out.size()), 0);
+}
+
+/// The answer to one request on a NETLINK_ROUTE socket.
+///
+/// Chromium asks the kernel what interfaces and addresses the machine has, over netlink,
+/// before its network service will finish starting -- and if the socket cannot be made
+/// at all it logs "Could not create NETLINK socket" and waits for an answer that never
+/// comes, which is a web helper that starts and never replies. There is no kernel here
+/// to ask, so the truthful minimum is described instead: one loopback interface, up,
+/// with 127.0.0.1 on it. Anything else the guest asks for is acknowledged and answered
+/// with an empty dump, which is a machine with no routes and no other interfaces rather
+/// than a machine that will not say.
+void AnswerNetlinkRoute(std::vector<uint8_t>& out, uint16_t type, uint16_t flags, uint32_t seq,
+                        uint32_t port) {
+    const bool dump = (flags & kNlmFlagRoot) != 0;
+    if (!dump) {
+        // An acknowledgement: NLMSG_ERROR carrying zero is how netlink says "done, fine".
+        const size_t at = BeginMessage(out, kNlmsgError, 0, seq, port);
+        const int32_t error = 0;
+        PutBytes(out, &error, sizeof(error));
+        EndMessage(out, at);
+        return;
+    }
+
+    if (type == kRtmGetLink) {
+        const size_t at = BeginMessage(out, kRtmNewLink, kNlmFlagMulti, seq, port);
+        struct IfInfo {
+            uint8_t family;
+            uint8_t pad;
+            uint16_t type;
+            int32_t index;
+            uint32_t flags;
+            uint32_t change;
+        } info {};
+        info.type = 772;    // ARPHRD_LOOPBACK
+        info.index = 1;
+        info.flags = 0x1 | 0x8 | 0x40; // IFF_UP | IFF_LOOPBACK | IFF_RUNNING
+        PutBytes(out, &info, sizeof(info));
+        PutAttribute(out, 3, "lo", 3); // IFLA_IFNAME, with its terminator
+        const uint32_t mtu = 65536;
+        PutAttribute(out, 4, &mtu, sizeof(mtu)); // IFLA_MTU
+        const uint8_t hardware[6] = {};
+        PutAttribute(out, 1, hardware, sizeof(hardware)); // IFLA_ADDRESS
+        EndMessage(out, at);
+    } else if (type == kRtmGetAddr) {
+        const size_t at = BeginMessage(out, kRtmNewAddr, kNlmFlagMulti, seq, port);
+        struct IfAddr {
+            uint8_t family;
+            uint8_t prefix_length;
+            uint8_t flags;
+            uint8_t scope;
+            uint32_t index;
+        } address {};
+        address.family = 2;         // AF_INET
+        address.prefix_length = 8;
+        address.flags = 0x80;       // IFA_F_PERMANENT
+        address.scope = 254;        // RT_SCOPE_HOST
+        address.index = 1;
+        PutBytes(out, &address, sizeof(address));
+        const uint8_t loopback[4] = {127, 0, 0, 1};
+        PutAttribute(out, 1, loopback, sizeof(loopback)); // IFA_ADDRESS
+        PutAttribute(out, 2, loopback, sizeof(loopback)); // IFA_LOCAL
+        PutAttribute(out, 3, "lo", 3);                    // IFA_LABEL
+        EndMessage(out, at);
+    }
+
+    const size_t at = BeginMessage(out, kNlmsgDone, kNlmFlagMulti, seq, port);
+    const int32_t done = 0;
+    PutBytes(out, &done, sizeof(done));
+    EndMessage(out, at);
+}
+
+} // namespace
+
 uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bool sending) {
+    bool netlink_route = false;
+    int netlink_write_fd = -1;
     {
         // A netlink socket here is a pipe with nothing on the other end. recvmsg on a pipe
         // is an error the guest has no reason to see; "nothing yet" is the truth.
         std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(fd);
         if (file != nullptr && file->is_netlink) {
-            return sending ? FailLinux(11) : FailLinux(11); // EAGAIN either way.
+            if (file->netlink_protocol != 0) {
+                // A uevent socket: a pipe with nothing on the other end. recvmsg on a
+                // pipe is an error the guest has no reason to see; "nothing yet" is the
+                // truth.
+                return FailLinux(11); // EAGAIN
+            }
+            netlink_route = true;
+            netlink_write_fd = file->netlink_peer;
         }
     }
     const int host_fd = HostFdFor(fd);
@@ -1885,6 +2024,78 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
         }
         vectors.push_back({data, static_cast<size_t>(length)});
     }
+    if (netlink_route) {
+        if (sending) {
+            // The requests, back to back in the iovecs. Each is answered into the pipe
+            // this socket reads from, so the guest's next recvmsg finds the reply.
+            std::vector<uint8_t> request;
+            for (const auto& piece : vectors) {
+                const auto* bytes = static_cast<const uint8_t*>(piece.iov_base);
+                if (bytes != nullptr) {
+                    request.insert(request.end(), bytes, bytes + piece.iov_len);
+                }
+            }
+            std::vector<uint8_t> reply;
+            size_t at = 0;
+            while (at + 16 <= request.size()) {
+                uint32_t length = 0;
+                uint16_t type = 0;
+                uint16_t message_flags = 0;
+                uint32_t sequence = 0;
+                std::memcpy(&length, request.data() + at, 4);
+                std::memcpy(&type, request.data() + at + 4, 2);
+                std::memcpy(&message_flags, request.data() + at + 6, 2);
+                std::memcpy(&sequence, request.data() + at + 8, 4);
+                if (length < 16 || at + length > request.size()) {
+                    break;
+                }
+                AnswerNetlinkRoute(reply, type, message_flags, sequence,
+                                   static_cast<uint32_t>(pid_));
+                at += NetlinkAlign(length);
+            }
+            if (!reply.empty() && netlink_write_fd >= 0) {
+                const ssize_t written = write(netlink_write_fd, reply.data(), reply.size());
+                if (written < 0) {
+                    return Fail(errno);
+                }
+            }
+            return request.size();
+        }
+        // Receiving: the answers written above, read back out of the pipe. The sender is
+        // the kernel, which on netlink means port zero.
+        size_t filled = 0;
+        for (const auto& piece : vectors) {
+            if (piece.iov_len == 0) {
+                continue;
+            }
+            const auto got = EnterBlockingWait();
+            const ssize_t bytes = read(host_fd, piece.iov_base, piece.iov_len);
+            (void)got;
+            if (bytes < 0) {
+                return filled > 0 ? static_cast<uint64_t>(filled) : Fail(errno);
+            }
+            filled += static_cast<size_t>(bytes);
+            if (static_cast<size_t>(bytes) < piece.iov_len) {
+                break;
+            }
+        }
+        if (name_address != 0 && name_length >= 12) {
+            auto* out = static_cast<unsigned char*>(GuestPointer(name_address, 12, true));
+            if (out != nullptr) {
+                unsigned char sender[12] = {};
+                const uint16_t family = 16;
+                std::memcpy(sender, &family, sizeof(family));
+                std::memcpy(out, sender, sizeof(sender));
+                std::memcpy(header + name_length_offset, &name_length, 4);
+            }
+        }
+        const uint32_t no_flags = 0;
+        std::memcpy(header + flags_offset, &no_flags, 4);
+        const uint64_t no_control = 0;
+        std::memcpy(header + control_length_offset, &no_control, width);
+        return static_cast<uint64_t>(filled);
+    }
+
     sockaddr_storage address {};
     msghdr host_header {};
     host_header.msg_iov = vectors.empty() ? nullptr : vectors.data();
@@ -5406,10 +5617,12 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         // there being nothing on it: SDL takes the refusal as a failure, reloads libudev
         // and tries again, several times a second, for as long as Steam is running.
         // A pipe nothing writes to says the truthful thing instead -- no events, ever.
+        constexpr int kNetlinkRoute = 0;
         if (static_cast<int>(arg1) == kGuestAfNetlink) {
-            if (static_cast<int>(arg3) != kNetlinkKobjectUevent) {
-                // Route and the rest expect answers to the requests sent on them, and a
-                // socket that never answers is worse than one that was never made.
+            const int protocol = static_cast<int>(arg3);
+            if (protocol != kNetlinkKobjectUevent && protocol != kNetlinkRoute) {
+                // The rest expect answers to the requests sent on them, and a socket that
+                // never answers is worse than one that was never made.
                 return FailLinux(93); // EPROTONOSUPPORT
             }
             fathom::net::HostType(static_cast<int>(arg2), &nonblocking, &cloexec);
@@ -5425,6 +5638,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             auto& file = shared_->files[fd];
             file.is_netlink = true;
             file.netlink_peer = pair[1];
+            file.netlink_protocol = protocol;
             return static_cast<uint64_t>(fd);
         }
         const int domain = fathom::net::HostDomain(static_cast<int>(arg1));
@@ -5552,6 +5766,50 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         const void* buffer = GuestPointer(arg2, arg3, false);
         if (buffer == nullptr && arg3 != 0) {
             return FailLinux(14);
+        }
+        {
+            // A request on a route socket, answered into the pipe the guest reads from.
+            // send() and sendmsg() are both used for this; glibc's getifaddrs picks one
+            // and Chromium's address tracker the other.
+            int reply_fd = -1;
+            {
+                std::scoped_lock lock {shared_->mutex};
+                auto* file = FindFile(static_cast<int>(arg1));
+                if (file != nullptr && file->is_netlink) {
+                    if (file->netlink_protocol != 0) {
+                        return arg3; // A uevent socket swallows whatever is sent to it.
+                    }
+                    reply_fd = file->netlink_peer;
+                }
+            }
+            if (reply_fd >= 0) {
+                const auto* request = static_cast<const uint8_t*>(buffer);
+                std::vector<uint8_t> reply;
+                size_t at = 0;
+                while (request != nullptr && at + 16 <= arg3) {
+                    uint32_t length = 0;
+                    uint16_t type = 0;
+                    uint16_t message_flags = 0;
+                    uint32_t sequence = 0;
+                    std::memcpy(&length, request + at, 4);
+                    std::memcpy(&type, request + at + 4, 2);
+                    std::memcpy(&message_flags, request + at + 6, 2);
+                    std::memcpy(&sequence, request + at + 8, 4);
+                    if (length < 16 || at + length > arg3) {
+                        break;
+                    }
+                    AnswerNetlinkRoute(reply, type, message_flags, sequence,
+                                       static_cast<uint32_t>(pid_));
+                    at += NetlinkAlign(length);
+                }
+                if (!reply.empty()) {
+                    const ssize_t written = write(reply_fd, reply.data(), reply.size());
+                    if (written < 0) {
+                        return Fail(errno);
+                    }
+                }
+                return arg3;
+            }
         }
         sockaddr_storage host_address {};
         socklen_t length = 0;

@@ -342,6 +342,10 @@ private:
         bool is_netlink {};
         /// The other end, kept open so reads block rather than see end-of-file.
         int netlink_peer {-1};
+        /// Which netlink protocol the guest asked for. NETLINK_ROUTE (0) is answered
+        /// here with a made-up loopback-only view of the machine; NETLINK_KOBJECT_UEVENT
+        /// (15) is a socket nothing ever writes to.
+        int netlink_protocol {-1};
         /// A directory made up for the guest -- /proc/self/fd is one -- to be removed when
         /// the descriptor onto it is closed.
         std::string scratch_directory;

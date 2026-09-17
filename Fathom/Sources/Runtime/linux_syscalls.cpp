@@ -45,6 +45,7 @@ namespace guest {
 
 /// clone(2) sharing the address space is a thread, not a process.
 constexpr uint64_t kCloneVm = 0x00000100;
+constexpr uint64_t kCloneThread = 0x00010000;
 
 constexpr int kOAccMode = 0x3;
 constexpr int kOCreat = 0x40;
@@ -4479,16 +4480,20 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             const uint64_t parent_tid = arguments[3];
             const uint64_t stack = arguments[5] + arguments[6];
             const uint64_t tls = arguments[7];
-            if ((flags & guest::kCloneVm) != 0) {
+            if ((flags & guest::kCloneThread) != 0) {
                 return static_cast<uint64_t>(
                     host_->CreateThread(pid_, flags, stack, parent_tid, child_tid, tls));
             }
-            return static_cast<uint64_t>(host_->ForkProcess(pid_));
+            return static_cast<uint64_t>(
+                host_->ForkProcess(pid_, (flags & guest::kCloneVm) != 0 ? stack : 0));
         }
 
-        // A clone that shares the address space is a thread, not a process, and goes
-        // somewhere else entirely: no memory is copied and no borrow is taken.
-        if (number == kSysClone && (arg1 & guest::kCloneVm) != 0) {
+        // Sharing the address space is not what makes a clone a thread -- CLONE_THREAD is,
+        // and posix_spawn asks for CLONE_VM|CLONE_VFORK without it: a process that shares
+        // its parent's memory, runs on a stack of its own, and holds the parent until it
+        // execs. Read as a thread it got no thread-local storage of its own and none
+        // inherited, and read its own control block out of guest address zero.
+        if (number == kSysClone && (arg1 & guest::kCloneThread) != 0) {
             // The argument order is not the same on the two architectures: i386 puts the
             // TLS descriptor where x86-64 puts the child's tid pointer, so a thread
             // created with the wrong one gets a tid written over its thread-local block.
@@ -4496,7 +4501,9 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             const uint64_t child_tid = config_.guest_is_32bit ? arg5 : arg4;
             return static_cast<uint64_t>(host_->CreateThread(pid_, arg1, arg2, arg3, child_tid, tls));
         }
-        return static_cast<uint64_t>(host_->ForkProcess(pid_));
+        const uint64_t shared_stack =
+            number == kSysClone && (arg1 & guest::kCloneVm) != 0 ? arg2 : 0;
+        return static_cast<uint64_t>(host_->ForkProcess(pid_, shared_stack));
     }
 
     case kSysExecve: {

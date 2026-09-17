@@ -383,7 +383,7 @@ struct fathom_session final : fathom::ProcessHost {
     void ReleaseParent(GuestProcess* process);
 
     // ProcessHost
-    int64_t ForkProcess(int caller_pid) override;
+    int64_t ForkProcess(int caller_pid, uint64_t stack = 0) override;
     int64_t ExecProcess(int caller_pid, const std::string& path, std::vector<std::string> argv,
                         std::vector<std::string> envp) override;
     int64_t WaitForChild(int caller_pid, int wanted_pid, int* exit_status, int options) override;
@@ -773,12 +773,8 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
                     // a thread holding a different one longjmps to a demangled address
                     // that is simply wrong -- and lands with both its instruction pointer
                     // and its stack pointer pointing at nothing.
-                    const uint64_t tcb = static_cast<uint64_t>(descriptor[1]) + process->guest_base;
-                    if (space->Validate(tcb, 32, fathom::kGuestProtRead)) {
-                        const auto* header = reinterpret_cast<const uint32_t*>(tcb);
-                        FATHOM_INFO("clone: tid %d tcb=%#x self=%#x stack guard=%#x pointer guard=%#x",
-                                    tid, descriptor[1], header[0], header[5], header[6]);
-                    }
+                    FATHOM_INFO("clone: tid %d entry %u base %#x limit %#x flags %#x", tid,
+                                entry, descriptor[1], descriptor[2], descriptor[3]);
                 } else {
                     // Not recoverable and not quiet: a thread whose TLS was never
                     // installed reads its own descriptor out of whatever is at zero.
@@ -807,13 +803,15 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
         return -11;
     }
     record_raw->started = true;
-    FATHOM_INFO("clone: pid %d created tid %d on stack %#llx, resuming at %#llx", caller_pid, tid,
+    FATHOM_INFO("clone: pid %d created tid %d on stack %#llx, resuming at %#llx "
+                "(flags %#llx, tls %#llx)", caller_pid, tid,
                 static_cast<unsigned long long>(stack),
-                static_cast<unsigned long long>(record_raw->thread->Rip()));
+                static_cast<unsigned long long>(record_raw->thread->Rip()),
+                static_cast<unsigned long long>(flags), static_cast<unsigned long long>(tls));
     return tid;
 }
 
-int64_t fathom_session::ForkProcess(int caller_pid) {
+int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
     GuestProcess* child_raw = nullptr;
     int child_pid = 0;
 
@@ -866,8 +864,9 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
 
         std::string reason;
         auto* engine = EngineFor(parent->is_32bit, reason);
-        child->thread = engine == nullptr ? nullptr
-                                          : engine->ForkThread(*caller, *child->syscalls, reason);
+        child->thread = engine == nullptr
+                            ? nullptr
+                            : engine->ForkThread(*caller, *child->syscalls, reason, stack);
         if (child->thread == nullptr) {
             FATHOM_ERROR("fork failed: %s", reason.c_str());
             return -11; // -EAGAIN
@@ -893,7 +892,13 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
         // loader reports it to the guest, the stack pointer because it comes out of a
         // guest register -- and for a relocated 32-bit guest the two are nowhere near
         // each other. Copying from a guest address here reads unmapped memory.
+        // Nothing is held when the child was given a stack of its own: it never returns
+        // through its parent's frames, so there is nothing of the parent's to put back.
         uint64_t held = 0;
+        if (stack != 0) {
+            FATHOM_INFO("fork: pid %d starts pid %d on its own stack %#llx", caller_pid,
+                        child_pid, static_cast<unsigned long long>(stack));
+        } else {
         // Whose stack, and how far down it: the calling thread's, which in a process with
         // more than one is usually not the first. Taking the main thread's bounds here
         // held a region the child never touches and left the frames it does touch -- the
@@ -1011,6 +1016,7 @@ int64_t fathom_session::ForkProcess(int caller_pid) {
                     static_cast<unsigned long long>(rsp),
                     static_cast<unsigned long long>(stack_low),
                     static_cast<unsigned long long>(stack_top), child_pid);
+        }
 
         child_raw = child.get();
         processes[child_pid] = std::move(child);

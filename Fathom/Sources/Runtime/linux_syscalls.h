@@ -71,7 +71,11 @@ public:
     /// Creates a child sharing this process's memory, and blocks the caller until that
     /// child execs or exits -- vfork's bargain, and what makes sharing memory safe.
     /// Returns the child's pid, or a negated errno.
-    virtual int64_t ForkProcess(int caller_pid) = 0;
+    /// `stack` is the top of a stack the caller has already allocated, or 0 for a plain
+    /// fork. posix_spawn asks for a process that shares its parent's memory but runs on a
+    /// stack of its own, and the difference matters: a child on its own stack overwrites
+    /// nothing of its parent's, so nothing has to be held for the parent and given back.
+    virtual int64_t ForkProcess(int caller_pid, uint64_t stack = 0) = 0;
 
     /// Loads `path` for the calling process. On success the caller does not return here:
     /// it unwinds out of the JIT and is restarted on the new image.

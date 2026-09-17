@@ -161,7 +161,21 @@ constexpr int kGdtEntries = 32;
 /// obvious failure.
 class GuestSegments {
 public:
-    void Initialise(FEXCore::Core::CPUState& state, bool guest_is_32bit = false) {
+    /// `inherit` is the descriptor table of the thread this one is being made from.
+    ///
+    /// A thread's descriptor table is its own -- it must not share its parent's array,
+    /// because set_thread_area on one would move the other's TLS -- but its *contents* are
+    /// inherited. clone without CLONE_SETTLS means "keep using the thread pointer you were
+    /// made with", which is how a program that starts a thread with a raw clone rather
+    /// than pthread_create gets its thread-local storage at all. Starting that thread with
+    /// an empty table gives it a %gs base of zero, and the first thing it reads out of its
+    /// own control block -- the function it was created to run -- comes back as whatever
+    /// is at guest address zero.
+    void Initialise(FEXCore::Core::CPUState& state, bool guest_is_32bit = false,
+                    const GuestSegments* inherit = nullptr) {
+        if (inherit != nullptr) {
+            gdt_ = inherit->gdt_;
+        }
         state.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = gdt_.data();
         state.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = gdt_.data();
         state.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
@@ -798,9 +812,10 @@ std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, Li
     }
 
     // The call/return stack and the segment table are reached through the register file,
-    // and the child must not share its parent's.
+    // and the child must not share its parent's -- but the descriptors in it carry over,
+    // the way they do across a real clone or fork.
     auto& state = impl->thread->CurrentFrame->State;
-    impl->segments.Initialise(state, impl->guest_is_32bit);
+    impl->segments.Initialise(state, impl->guest_is_32bit, &parent.impl_->segments);
     impl->callret->Attach(impl->thread);
 
     FATHOM_INFO("forked guest thread: rip=%#llx rsp=%#llx",

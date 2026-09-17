@@ -264,10 +264,10 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     // thousand faults a second, ending in "stack smashing detected".
     const auto faulting = reinterpret_cast<uint64_t>(info->si_addr);
     bool wild = false;
+    fathom::GuestRange neighbour {};
     if (auto* space = g_arena_space.load(std::memory_order_acquire)) {
-        fathom::GuestRange range {};
         bool known = false;
-        wild = !space->RangeForNoWait(faulting, &range, &known) && known;
+        wild = !space->RangeForNoWait(faulting, &neighbour, &known) && known;
     }
     if (wild) {
         // Stepping over the instruction is not a fix -- the guest carries on with a
@@ -280,9 +280,15 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
         const auto seen = wild_fixups.fetch_add(1, std::memory_order_relaxed) + 1;
         if (seen <= 8 || (seen & 0x3FF) == 0) {
             FATHOM_WARN("guest read %p, which is not mapped, from an instruction this can "
-                        "step over (%llu so far, guest rip %#llx)",
+                        "step over (%llu so far, guest rip %#llx; nearest mapping "
+                        "%#llx..%#llx, %lld bytes away)",
                         info->si_addr, static_cast<unsigned long long>(seen),
-                        static_cast<unsigned long long>(g_active.thread->CurrentFrame->State.rip));
+                        static_cast<unsigned long long>(g_active.thread->CurrentFrame->State.rip),
+                        static_cast<unsigned long long>(neighbour.begin),
+                        static_cast<unsigned long long>(neighbour.end()),
+                        static_cast<long long>(faulting < neighbour.begin
+                                                   ? neighbour.begin - faulting
+                                                   : faulting - neighbour.end()));
         }
         if (seen > 1024) {
             return false;

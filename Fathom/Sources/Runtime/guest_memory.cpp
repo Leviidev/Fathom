@@ -900,6 +900,15 @@ bool GuestAddressSpace::RangeForNoWait(uint64_t address, GuestRange* out, bool* 
     }
     const size_t index = FirstRangeEndingAfter(address);
     if (index >= committed_.size() || committed_[index].begin > address) {
+        // Not mapped -- but the caller often wants to know by how much it missed, so the
+        // neighbouring range is handed back anyway. A read four bytes past the end of a
+        // mapping and a read through a pointer made of text are both "not mapped", and
+        // they are completely different bugs.
+        if (out != nullptr && index > 0) {
+            *out = committed_[index - 1];
+        } else if (out != nullptr && index < committed_.size()) {
+            *out = committed_[index];
+        }
         return false;
     }
     if (out != nullptr) {

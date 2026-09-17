@@ -386,23 +386,25 @@ bool EndFaultedGuestThread(int signal, siginfo_t* info, void* raw_context) {
     if (raw_context == nullptr || g_current_guest_thread == nullptr) {
         return false;
     }
-    if (g_active.context == nullptr || g_active.thread == nullptr) {
-        return false;
-    }
     auto* context = static_cast<ucontext_t*>(raw_context);
     const auto pc = static_cast<uintptr_t>(arm_thread_state64_get_pc(context->uc_mcontext->__ss));
-    bool in_generated_code = g_active.context->IsAddressInCodeBuffer(g_active.thread, pc);
+    bool in_generated_code = g_active.context != nullptr && g_active.thread != nullptr &&
+                             g_active.context->IsAddressInCodeBuffer(g_active.thread, pc);
     if (!in_generated_code) {
         // A block compiled into a buffer another thread owns is still generated code, and
         // still this guest's fault -- FEXCore hands a thread whatever buffer had room.
         // Read without a lock: a handler that waits for a lock the thread it interrupted
         // is holding never returns.
+        // Every live thread, in any context: a fault in generated code is the guest's
+        // whichever buffer it landed in, and the thread that faulted may not be the one
+        // bound to this host thread's record any more.
         for (const auto& slot : g_live_slots) {
             auto* thread = slot.thread.load(std::memory_order_acquire);
-            if (thread == nullptr || slot.context.load(std::memory_order_acquire) != g_active.context) {
+            auto* owner = slot.context.load(std::memory_order_acquire);
+            if (thread == nullptr || owner == nullptr) {
                 continue;
             }
-            if (g_active.context->IsAddressInCodeBuffer(thread, pc)) {
+            if (owner->IsAddressInCodeBuffer(thread, pc)) {
                 in_generated_code = true;
                 break;
             }

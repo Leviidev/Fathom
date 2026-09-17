@@ -30,6 +30,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -692,7 +693,21 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
             continue;
         }
         const uint64_t begin = host_begin - entry.guest_base;
+        // Timed, because this wait is the one that can stop a guest mmap for minutes and
+        // there is no other way to see it happening: the thread is inside FEXCore, its
+        // guest rip has not moved, and from the outside it looks like a hung syscall.
+        const auto wanted = std::chrono::steady_clock::now();
         std::unique_lock guard {entry.context->GetCodeInvalidationMutex()};
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - wanted)
+                                .count();
+        if (waited > 1000) {
+            FATHOM_WARN("waited %lld ms for the code invalidation lock to throw away "
+                        "%#llx..%#llx",
+                        static_cast<long long>(waited),
+                        static_cast<unsigned long long>(host_begin),
+                        static_cast<unsigned long long>(host_end));
+        }
 
         // Deliberately not stopping the threads that might be *running* a block being
         // thrown away, tempting as it is: a thread looking a block up holds its own lookup
@@ -706,6 +721,15 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
                 entry.context->InvalidateThreadCachedCodeRange(thread.thread, begin,
                                                                host_end - host_begin);
             }
+        }
+        const auto swept = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - wanted)
+                               .count();
+        if (swept > 1000) {
+            FATHOM_WARN("throwing away %#llx..%#llx across %zu threads took %lld ms",
+                        static_cast<unsigned long long>(host_begin),
+                        static_cast<unsigned long long>(host_end), live.size(),
+                        static_cast<long long>(swept));
         }
     }
 }

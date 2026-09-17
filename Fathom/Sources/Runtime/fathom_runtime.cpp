@@ -298,6 +298,12 @@ struct GuestProcess {
     /// Address and contents of each region held for the parent.
     struct BorrowedRegion {
         uint64_t address {};
+        /// The arena's epoch for this address when the copy was taken. If it has changed
+        /// by the time the copy would go back, the parent released that memory while the
+        /// child was running and the arena has given it to something else -- often the
+        /// image the child itself is about to exec into. Writing the copy back there
+        /// would corrupt a program that had only just been loaded.
+        uint64_t epoch {};
         std::vector<uint8_t> bytes;
     };
     std::vector<BorrowedRegion> borrowed;
@@ -381,6 +387,11 @@ struct fathom_session final : fathom::ProcessHost {
     void StopAndJoinOtherThreadsOf(GuestProcess* process);
     void JoinFinishedChildren();
     void ReleaseParent(GuestProcess* process);
+    /// Puts back what this process borrowed from its parent, without yet letting the
+    /// parent run. Done before an exec loads anything, because the arena may hand the
+    /// memory the parent has since released to the image about to be loaded -- and then
+    /// the restore would write stale bytes over a program that had only just arrived.
+    void RestoreBorrowedMemory(GuestProcess* process);
 
     // ProcessHost
     int64_t ForkProcess(int caller_pid, uint64_t stack = 0) override;
@@ -595,7 +606,7 @@ void fathom_session::JoinFinishedChildren() {
     }
 }
 
-void fathom_session::ReleaseParent(GuestProcess* process) {
+void fathom_session::RestoreBorrowedMemory(GuestProcess* process) {
     {
         std::scoped_lock lock {process_mutex};
         for (auto& region : process->borrowed) {
@@ -603,10 +614,11 @@ void fathom_session::ReleaseParent(GuestProcess* process) {
             // its own unmapping a region, or the heap shrinking under it. Writing to a
             // page the arena has since protected away is a fault on the child's thread
             // with the parent's address in it, which reads as a wild pointer and is not.
-            if (!space->Validate(region.address, region.bytes.size(),
+            if (space->EpochAt(region.address) != region.epoch ||
+                !space->Validate(region.address, region.bytes.size(),
                                  fathom::kGuestProtWrite)) {
-                FATHOM_WARN("fork: not putting back %#llx..%#llx for pid %d -- it is no "
-                            "longer writable",
+                FATHOM_WARN("fork: not putting back %#llx..%#llx for pid %d -- it is not the "
+                            "memory the copy was taken from any more",
                             static_cast<unsigned long long>(region.address),
                             static_cast<unsigned long long>(region.address + region.bytes.size()),
                             process->ppid);
@@ -619,6 +631,16 @@ void fathom_session::ReleaseParent(GuestProcess* process) {
         }
         process->borrowed.clear();
         process->borrowed.shrink_to_fit();
+    }
+}
+
+void fathom_session::ReleaseParent(GuestProcess* process) {
+    // Anything still held is put back first. Ordinarily there is nothing left, because
+    // execve gave it back before it loaded anything; a child that exits without ever
+    // execing arrives here still holding it.
+    RestoreBorrowedMemory(process);
+    {
+        std::scoped_lock lock {process_mutex};
         process->released = true;
     }
     process_changed.notify_all();
@@ -1004,7 +1026,7 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
             for (const auto& piece : space->WritableRangesIn(from, to)) {
                 const auto* bytes = reinterpret_cast<const uint8_t*>(piece.begin);
                 child->borrowed.push_back(
-                    {piece.begin, std::vector<uint8_t>(bytes, bytes + piece.size)});
+                    {piece.begin, piece.epoch, std::vector<uint8_t>(bytes, bytes + piece.size)});
                 held += piece.size;
             }
         }
@@ -1123,6 +1145,11 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& path,
     }
 
     // Before anything is loaded or released: the threads of the image being replaced.
+    //
+    // What this process borrowed from its parent is *not* put back here, tempting as it
+    // is: the guest is still standing on it. execve was called from a frame on that very
+    // stack, and restoring it now rewrites the frame the child is about to return
+    // through. It goes back in RunProcess, once the new image is running.
     StopAndJoinOtherThreadsOf(process);
 
     // exec is where a process's word size is decided, and it need not match the one that
@@ -1367,6 +1394,12 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
         guest_is_32bit ? k32BitAddressSpace
                        : (config->address_space_size != 0 ? config->address_space_size : kDefaultAddressSpace);
     session->space.reset(fathom::GuestAddressSpace::Reserve(arena_size, reason));
+    if (session->space != nullptr) {
+        // Compiled code is cached by guest address, and guest addresses are handed out
+        // again the moment a program's image is released. Without this the next program
+        // loaded there runs the last one's code.
+        session->space->SetReleaseObserver(&fathom::InvalidateCompiledCode);
+    }
     if (session->space == nullptr) {
         return fail(reason);
     }

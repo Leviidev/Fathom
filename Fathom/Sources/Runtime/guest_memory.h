@@ -39,6 +39,11 @@ struct GuestRange {
     uint64_t begin {};
     uint64_t size {};
     int protection {};
+    /// Which allocation this range belongs to. Two ranges at the same address with
+    /// different epochs are different memory: the first was released and the address
+    /// handed out again. A caller holding a copy of guest memory taken earlier can ask
+    /// whether what is there now is still the same thing it copied.
+    uint64_t epoch {};
 
     uint64_t end() const { return begin + size; }
 };
@@ -114,6 +119,15 @@ public:
     /// and partly not mapped at all, and only the writable parts can be written back.
     std::vector<GuestRange> WritableRangesIn(uint64_t begin, uint64_t end) const;
 
+    /// Told whenever a range stops being what it was, so that anything caching something
+    /// derived from guest memory -- compiled code, most of all -- can drop it. Called
+    /// with the address space's own lock released.
+    using ReleaseObserver = void (*)(uint64_t host_begin, uint64_t host_end);
+    void SetReleaseObserver(ReleaseObserver observer) { release_observer_ = observer; }
+
+    /// The allocation epoch of whatever covers `address`, or 0 if nothing does.
+    uint64_t EpochAt(uint64_t address) const;
+
     std::vector<GuestRange> Snapshot() const;
 
     uint64_t CommittedBytes() const;
@@ -136,6 +150,9 @@ private:
 
     bool ProtectLocked(uint64_t address, uint64_t size, int protection);
 
+
+    ReleaseObserver release_observer_ {};
+    uint64_t next_epoch_ {1};
 
     mutable std::mutex mutex_;
     uint64_t base_ {};

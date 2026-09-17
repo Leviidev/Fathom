@@ -120,7 +120,7 @@ void GuestAddressSpace::ReturnFreeExtent(uint64_t address, uint64_t size) {
 }
 
 void GuestAddressSpace::RecordCommitted(uint64_t address, uint64_t size, int protection) {
-    GuestRange range {address, size, protection};
+    GuestRange range {address, size, protection, next_epoch_++};
     auto position = std::lower_bound(committed_.begin(), committed_.end(), range,
                                      [](const GuestRange& lhs, const GuestRange& rhs) { return lhs.begin < rhs.begin; });
     committed_.insert(position, range);
@@ -206,7 +206,7 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
         return false;
     }
 
-    std::scoped_lock lock {mutex_};
+    std::unique_lock lock {mutex_};
     const uint64_t begin = AlignDown(address);
     const uint64_t end = AlignUp(address + size);
     if (begin < base_ || end > base_ + size_) {
@@ -221,10 +221,10 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
             continue;
         }
         if (range.begin < begin) {
-            survivors.push_back(GuestRange {range.begin, begin - range.begin, range.protection});
+            survivors.push_back(GuestRange {range.begin, begin - range.begin, range.protection, range.epoch});
         }
         if (range.end() > end) {
-            survivors.push_back(GuestRange {end, range.end() - end, range.protection});
+            survivors.push_back(GuestRange {end, range.end() - end, range.protection, range.epoch});
         }
     }
     // Only the host pages nothing else is still living in.
@@ -254,6 +254,13 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
     }
 
     ReturnFreeExtent(begin, end - begin);
+
+    // Outside the lock: the observer goes into FEXCore, which asks this address space
+    // about ranges while it invalidates, and would deadlock on the lock just released.
+    lock.unlock();
+    if (release_observer_ != nullptr) {
+        release_observer_(begin, end);
+    }
     return true;
 }
 
@@ -297,14 +304,15 @@ bool GuestAddressSpace::ProtectLocked(uint64_t address, uint64_t size, int prote
         }
         touched = true;
         if (range.begin < begin) {
-            updated.push_back(GuestRange {range.begin, begin - range.begin, range.protection});
+            updated.push_back(GuestRange {range.begin, begin - range.begin, range.protection, range.epoch});
         }
         const uint64_t overlap_begin = std::max(range.begin, begin);
         const uint64_t overlap_end = std::min(range.end(), end);
         updated.push_back(GuestRange {overlap_begin, overlap_end - overlap_begin,
-                                      protection_for(overlap_begin, overlap_end, range.protection)});
+                                      protection_for(overlap_begin, overlap_end, range.protection),
+                                      range.epoch});
         if (range.end() > end) {
-            updated.push_back(GuestRange {end, range.end() - end, range.protection});
+            updated.push_back(GuestRange {end, range.end() - end, range.protection, range.epoch});
         }
     }
     if (!touched) {
@@ -348,10 +356,20 @@ std::vector<GuestRange> GuestAddressSpace::WritableRangesIn(uint64_t begin, uint
         const uint64_t low = std::max(range.begin, begin);
         const uint64_t high = std::min(range.end(), end);
         if (high > low) {
-            writable.push_back(GuestRange {low, high - low, range.protection});
+            writable.push_back(GuestRange {low, high - low, range.protection, range.epoch});
         }
     }
     return writable;
+}
+
+uint64_t GuestAddressSpace::EpochAt(uint64_t address) const {
+    std::scoped_lock lock {mutex_};
+    for (const auto& range : committed_) {
+        if (range.begin <= address && address < range.end()) {
+            return range.epoch;
+        }
+    }
+    return 0;
 }
 
 bool GuestAddressSpace::Contains(uint64_t address, uint64_t size) const {

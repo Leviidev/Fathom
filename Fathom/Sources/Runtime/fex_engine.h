@@ -104,6 +104,13 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+/// Drops every compiled block covering a host address range, in every live guest thread.
+///
+/// Guest addresses get handed out again -- an exec releases a program's image and the
+/// next one is loaded over it -- and FEXCore's block cache is keyed by guest address, so
+/// without this the new program runs the old program's compiled code.
+void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end);
+
 class FexEngine {
 public:
     static std::unique_ptr<FexEngine> Create(GuestAddressSpace& space, const EngineOptions& options,

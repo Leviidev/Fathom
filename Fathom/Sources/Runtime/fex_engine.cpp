@@ -437,6 +437,8 @@ public:
     explicit Impl(GuestAddressSpace& space)
         : space {space} {}
 
+    uint64_t guest_base {};
+
     ~Impl() {
         context.reset();
         if (config_held) {
@@ -455,6 +457,74 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Compiled code that is no longer the code it was compiled from
+// ---------------------------------------------------------------------------
+
+/// Every live guest thread, with the context it runs in and where that context's guest
+/// address space starts.
+///
+/// FEXCore caches compiled blocks by guest address. Guest addresses are handed out again
+/// -- an exec releases a program's image and the next one is loaded over it, a library is
+/// unmapped and another is mapped where it was -- and nothing in FEXCore notices, because
+/// nothing tells it. The new program then runs the old program's compiled code: the same
+/// addresses, the same block entries, the wrong instructions. It does not look like a
+/// stale cache from the outside. It looks like a program jumping to a nonsense address
+/// with a nonsense stack pointer, deterministically, in a place that makes no sense.
+struct LiveThread {
+    FEXCore::Context::Context* context {};
+    FEXCore::Core::InternalThreadState* thread {};
+    uint64_t guest_base {};
+};
+
+std::mutex g_live_threads_mutex;
+std::vector<LiveThread> g_live_threads;
+
+void RegisterLiveThread(FEXCore::Context::Context* context, FEXCore::Core::InternalThreadState* thread,
+                        uint64_t guest_base) {
+    if (context == nullptr || thread == nullptr) {
+        return;
+    }
+    std::scoped_lock lock {g_live_threads_mutex};
+    g_live_threads.push_back(LiveThread {context, thread, guest_base});
+}
+
+void ForgetLiveThread(FEXCore::Core::InternalThreadState* thread) {
+    std::scoped_lock lock {g_live_threads_mutex};
+    std::erase_if(g_live_threads, [thread](const LiveThread& live) { return live.thread == thread; });
+}
+
+/// Drops every compiled block covering [host_begin, host_end) in every live thread.
+///
+/// The range is a host one, because that is what the address space deals in; FEXCore
+/// keeps its cache in the guest's numbering, so each context's own base comes off first.
+void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
+    if (host_end <= host_begin) {
+        return;
+    }
+    std::vector<LiveThread> live;
+    {
+        std::scoped_lock lock {g_live_threads_mutex};
+        live = g_live_threads;
+    }
+    // Contexts first: a code buffer's lookup table is shared by every thread using it.
+    std::set<FEXCore::Context::Context*> contexts;
+    for (const auto& entry : live) {
+        if (!contexts.insert(entry.context).second) {
+            continue;
+        }
+        const uint64_t begin = host_begin - entry.guest_base;
+        std::unique_lock guard {entry.context->GetCodeInvalidationMutex()};
+        entry.context->InvalidateCodeBuffersCodeRange(begin, host_end - host_begin);
+        for (const auto& thread : live) {
+            if (thread.context == entry.context) {
+                entry.context->InvalidateThreadCachedCodeRange(thread.thread, begin,
+                                                               host_end - host_begin);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // A thread
 // ---------------------------------------------------------------------------
 
@@ -467,6 +537,7 @@ public:
 
     ~Impl() {
         if (context != nullptr && thread != nullptr) {
+            ForgetLiveThread(thread);
             context->DestroyThread(thread);
             thread = nullptr;
         }
@@ -475,6 +546,7 @@ public:
     FEXCore::Context::Context* context {};
     LinuxSyscalls& syscalls;
     bool guest_is_32bit {};
+    uint64_t guest_base {};
 
     // Per thread, all of it. The call/return stack and the segment table are pointed at
     // from the register file, so a forked child needs its own rather than the copies it
@@ -691,6 +763,7 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
     // Told before any code is compiled, because it changes every address the JIT emits.
     g_arena_begin.store(space.Base(), std::memory_order_release);
     g_arena_end.store(space.Base() + space.Size(), std::memory_order_release);
+    impl->guest_base = options.guest_memory_base;
     impl->context->SetGuestMemoryBase(options.guest_memory_base);
     if (options.guest_memory_base != 0) {
         FATHOM_INFO("32-bit guest: its address space is placed at %#llx in this process",
@@ -735,11 +808,13 @@ std::unique_ptr<GuestThread> FexEngine::StartThread(uint64_t rip, uint64_t rsp, 
         return nullptr;
     }
 
+    impl->guest_base = impl_->guest_base;
     impl->thread = impl_->context->CreateThread(rip, rsp);
     if (impl->thread == nullptr) {
         error = "FEXCore could not create the guest thread";
         return nullptr;
     }
+    RegisterLiveThread(impl->context, impl->thread, impl->guest_base);
 
     auto& state = impl->thread->CurrentFrame->State;
     impl->segments.Initialise(state, impl->guest_is_32bit);
@@ -804,12 +879,14 @@ std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, Li
         child_state.gregs[FEXCore::X86State::REG_RSP] = new_rsp;
     }
 
+    impl->guest_base = impl_->guest_base;
     impl->thread = impl_->context->CreateThread(resume, child_state.gregs[FEXCore::X86State::REG_RSP],
                                                 &child_state);
     if (impl->thread == nullptr) {
         error = "FEXCore could not create the child guest thread";
         return nullptr;
     }
+    RegisterLiveThread(impl->context, impl->thread, impl->guest_base);
 
     // The call/return stack and the segment table are reached through the register file,
     // and the child must not share its parent's -- but the descriptors in it carry over,

@@ -420,13 +420,6 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
     // outside, it looks like a jump into nonsense. Collected here and done once the lock
     // is dropped, because the observer goes into FEXCore and FEXCore asks this class
     // questions.
-    // Only when the guest can execute there. Throwing compiled code away takes FEXCore's
-    // invalidation lock, which gives writers priority, so one of these stops every thread
-    // in the session that wants to compile -- and with thirty of them compiling, a single
-    // mmap can wait indefinitely. Code only ever becomes runnable at an address by being
-    // mapped executable or protected executable, and both of those invalidate; memory
-    // handed out for data cannot run anything until then.
-    const bool executable = (protection & kGuestProtExec) != 0;
     uint64_t fresh_begin = 0;
     uint64_t fresh_end = 0;
     struct Notify {
@@ -455,7 +448,7 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
                 return 0;
             }
             RecordCommitted(aligned_hint, length, protection);
-            if (executable && NoteExecutable(aligned_hint, aligned_hint + length)) {
+            if (HasHeldCode(aligned_hint, aligned_hint + length)) {
                 fresh_begin = aligned_hint;
                 fresh_end = aligned_hint + length;
             }
@@ -485,7 +478,7 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
             return 0;
         }
         RecordCommitted(address, length, protection);
-        if (executable && NoteExecutable(address, address + length)) {
+        if (HasHeldCode(address, address + length)) {
             fresh_begin = address;
             fresh_end = address + length;
         }
@@ -549,8 +542,7 @@ bool GuestAddressSpace::CommitFixed(uint64_t address, uint64_t size, int protect
     RecordCommitted(begin, end - begin, protection);
     lock.unlock();
     // As in Allocate: only where the guest can execute.
-    if ((protection & kGuestProtExec) != 0 && NoteExecutable(begin, end) &&
-        release_observer_ != nullptr) {
+    if (HasHeldCode(begin, end) && release_observer_ != nullptr) {
         release_observer_(begin, end);
     }
     return true;
@@ -581,7 +573,7 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
             survivors.push_back(range);
             continue;
         }
-        had_code = had_code || (range.protection & kGuestProtExec) != 0;
+        had_code = true;
         if (range.begin < begin) {
             survivors.push_back(GuestRange {range.begin, begin - range.begin, range.protection, range.epoch});
         }
@@ -660,8 +652,7 @@ bool GuestAddressSpace::Protect(uint64_t address, uint64_t size, int protection)
     // Code can arrive at an address by being mapped there and then made executable, and
     // the blocks compiled from whatever used to be there have to go with it. Outside the
     // lock, because the observer goes into FEXCore and FEXCore asks this class questions.
-    if (changed && gained_exec &&
-        NoteExecutable(AlignDown(address), AlignUp(address + size)) &&
+    if (changed && HasHeldCode(AlignDown(address), AlignUp(address + size)) &&
         release_observer_ != nullptr) {
         release_observer_(AlignDown(address), AlignUp(address + size));
     }

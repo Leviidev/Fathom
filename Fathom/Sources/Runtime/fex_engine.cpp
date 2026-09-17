@@ -598,6 +598,10 @@ public:
         if (!space_.RangeFor(address, &range)) {
             return {address, 1, false};
         }
+        // Noted, because this is the moment the address space learns that code will be
+        // compiled from here -- and it decides on that basis whether reusing this memory
+        // later has to throw anything away.
+        space_.NoteExecutable(range.begin, range.end());
         return {range.begin, range.size, (range.protection & kGuestProtWrite) != 0};
     }
 

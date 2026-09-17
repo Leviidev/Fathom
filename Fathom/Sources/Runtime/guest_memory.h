@@ -134,6 +134,23 @@ public:
     using ReleaseObserver = void (*)(uint64_t host_begin, uint64_t host_end);
     void SetReleaseObserver(ReleaseObserver observer) { release_observer_ = observer; }
 
+    /// Says that guest code is about to be compiled from [begin, end), and answers
+    /// whether any part of it had already been. Called when the JIT asks what it may
+    /// compile, which is the only moment this is actually knowable: the guest's own
+    /// protection bits do not decide it, because FEXCore will compile from any mapping
+    /// this address space admits to having.
+    ///
+    /// Throwing compiled code away is the most expensive thing the runtime asks FEXCore
+    /// to do -- it takes a lock that gives writers priority, so one of them stops every
+    /// thread in the session that wants to compile -- and arena space nothing has ever
+    /// compiled from has nothing to throw away. Coarse and one-way on purpose: a bit set
+    /// that need not be costs an invalidation that was not needed, which is merely slow,
+    /// while the reverse runs stale code.
+    bool NoteExecutable(uint64_t begin, uint64_t end);
+
+    /// The same question without marking anything.
+    bool HasHeldCode(uint64_t begin, uint64_t end) const;
+
     /// Says that the bytes in this range are not the bytes that were there before, even
     /// though it was never released. A loader mapping a library's segments over a span it
     /// had already reserved does exactly this.
@@ -197,11 +214,6 @@ private:
     /// away. Coarse and one-way on purpose: a bit that is set and should not be costs an
     /// invalidation that was not needed, which is merely slow, while the reverse runs
     /// stale code. Lock-free because it sits on the mmap path.
-    bool NoteExecutable(uint64_t begin, uint64_t end);
-
-    /// The same question without marking anything: has any part of [begin, end) ever
-    /// held guest code?
-    bool HasHeldCode(uint64_t begin, uint64_t end) const;
 
     std::unique_ptr<std::atomic<uint64_t>[]> code_words_;
     uint64_t code_grain_ {};

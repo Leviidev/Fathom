@@ -182,6 +182,19 @@ bool CommitRange(uint64_t begin, uint64_t end, uint64_t page_size, int host_prot
 } // namespace
 
 void GuestAddressSpace::ReturnFreeExtent(uint64_t address, uint64_t size) {
+    if (size == 0) {
+        return;
+    }
+    for (const auto& extent : free_) {
+        if (extent.begin < address + size && address < extent.end()) {
+            FATHOM_WARN("arena: %#llx..%#llx is being freed while %#llx..%#llx is already free",
+                        static_cast<unsigned long long>(address),
+                        static_cast<unsigned long long>(address + size),
+                        static_cast<unsigned long long>(extent.begin),
+                        static_cast<unsigned long long>(extent.end()));
+            return;
+        }
+    }
     Extent freed {address, size};
     auto position = std::lower_bound(free_.begin(), free_.end(), freed,
                                      [](const Extent& lhs, const Extent& rhs) { return lhs.begin < rhs.begin; });
@@ -281,6 +294,15 @@ void GuestAddressSpace::RecordCommitted(uint64_t address, uint64_t size, int pro
             updated.push_back(range);
             continue;
         }
+        // Something was already living here. The arena only hands out what its free list
+        // says is free, so this means the free list and this one disagree -- and the
+        // program that was here is about to find its memory belongs to somebody else.
+        FATHOM_WARN("arena: committing %#llx..%#llx over %#llx..%#llx, which was already "
+                    "committed (epoch %llu, prot %d)",
+                    static_cast<unsigned long long>(address), static_cast<unsigned long long>(end),
+                    static_cast<unsigned long long>(range.begin),
+                    static_cast<unsigned long long>(range.end()),
+                    static_cast<unsigned long long>(range.epoch), range.protection);
         if (range.begin < address) {
             updated.push_back(GuestRange {range.begin, address - range.begin, range.protection,
                                           range.epoch});
@@ -425,6 +447,12 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
             survivors.push_back(GuestRange {end, range.end() - end, range.protection, range.epoch});
         }
     }
+    // Installed before anything below asks what is still committed -- both the sweep for
+    // pages nothing lives in and the decision about what goes back on the free list read
+    // this list, and reading it with the range still in it means nothing is ever dropped
+    // and the free list ends up holding memory the committed list also holds.
+    committed_ = std::move(survivors);
+
     // Only the host pages nothing else is still living in.
     //
     // The guest's pages are 4KB and the host's are 16KB, so one host page can hold four
@@ -478,7 +506,13 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
     }
     flush();
 
-    ReturnFreeExtent(begin, end - begin);
+    // And only the parts of it nothing else is still living in. A guest page is 4KB and a
+    // host page 16KB, so the rounding above reaches up to three neighbouring guest pages
+    // that are still in use; handing those back as free lets the arena allocate them to
+    // somebody else while their owner is still running there.
+    for (const auto& [free_begin, free_end] : UncommittedIn(begin, end)) {
+        ReturnFreeExtent(free_begin, free_end - free_begin);
+    }
 
     // Outside the lock: the observer goes into FEXCore, which asks this address space
     // about ranges while it invalidates, and would deadlock on the lock just released.

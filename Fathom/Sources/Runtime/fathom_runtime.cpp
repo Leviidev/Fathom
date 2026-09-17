@@ -680,10 +680,53 @@ void fathom_session::RestoreBorrowedMemory(GuestProcess* process) {
     size_t refused = 0;
     size_t refused_bytes = 0;
     size_t held = 0;
+    // Whatever this process is standing in now. A copy taken from the parent must never
+    // land on it, whatever the arena thinks: the parent's list of its own mappings
+    // outlives the mappings themselves, so a span it named at the fork can by now be the
+    // very image the child has just been loaded into -- and putting the parent's bytes
+    // back there leaves a program whose dynamic section is somebody else's memory, which
+    // its loader reports as "Inconsistency detected by ld.so" and nothing else explains.
+    std::vector<std::pair<uint64_t, uint64_t>> mine;
+    if (process->owns_program) {
+        const auto& loaded = process->program;
+        const uint64_t base = process->guest_base;
+        mine.emplace_back(loaded.image.image_begin + base, loaded.image.image_end + base);
+        if (loaded.dynamic) {
+            mine.emplace_back(loaded.interpreter.image_begin + base,
+                              loaded.interpreter.image_end + base);
+        }
+        if (loaded.stack.stack_base != 0) {
+            mine.emplace_back(loaded.stack.stack_base,
+                              loaded.stack.stack_base + loaded.stack.stack_size);
+        }
+        if (loaded.heap != 0) {
+            mine.emplace_back(loaded.heap + base, loaded.heap + base + kHeapReservation);
+        }
+    }
+    const auto is_mine = [&](uint64_t begin, uint64_t end) {
+        for (const auto& [low, high] : mine) {
+            if (begin < high && low < end) {
+                return true;
+            }
+        }
+        return false;
+    };
     {
         std::scoped_lock lock {process_mutex};
         held = process->borrowed.size();
         for (auto& region : process->borrowed) {
+            if (is_mine(region.address, region.address + region.bytes.size())) {
+                ++refused;
+                refused_bytes += region.bytes.size();
+                if (refused <= 4) {
+                    FATHOM_WARN("fork: not putting back %#llx..%#llx for pid %d -- pid %d is "
+                                "running there now",
+                                static_cast<unsigned long long>(region.address),
+                                static_cast<unsigned long long>(region.address + region.bytes.size()),
+                                process->ppid, process->pid);
+                }
+                continue;
+            }
             // The parent may have let this go while the child was running -- a thread of
             // its own unmapping a region, or the heap shrinking under it. Writing to a
             // page the arena has since protected away is a fault on the child's thread

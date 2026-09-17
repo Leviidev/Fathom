@@ -40,6 +40,17 @@ echo "==> installing over the root filesystem, following its symlinks"
 mkdir -p "$ROOT/root" "$ROOT/tmp"
 chmod 1777 "$ROOT/tmp"
 
+# A passwd entry for the user the guest actually is. Fathom reports uid 1000, and this
+# root filesystem came out of a container image that only ever had root in it -- so
+# getpwuid() finds nothing, and Steam, which asks it where home is rather than trusting
+# $HOME, gives up with "Home directory not accessible: Permission denied".
+if ! grep -q "^fathom:" "$ROOT/etc/passwd"; then
+    echo 'fathom:x:1000:1000:Fathom:/root:/bin/bash' >> "$ROOT/etc/passwd"
+fi
+if ! grep -q "^fathom:" "$ROOT/etc/group"; then
+    echo 'fathom:x:1000:' >> "$ROOT/etc/group"
+fi
+
 echo "==> installing the launcher"
 # One entry point for both the app and the host runner. Steam draws into an X server, so
 # something has to be listening on :0 before the client starts -- and it has to be the

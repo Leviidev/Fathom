@@ -777,6 +777,50 @@ struct FutexQueueState {
     uint64_t generation {};
 };
 
+/// Where a piece of shared memory came from, so two processes that mapped the same file
+/// can agree on what to call an address inside it.
+///
+/// A file mapped MAP_SHARED lands at a different host address in every process that maps
+/// it -- the arena hands each one its own range -- but it is the same memory. A futex
+/// word in there is therefore two different addresses, and a wake sent to one of them
+/// never reaches a thread waiting on the other. Naming it by the file and the offset
+/// instead gives both sides the same answer. Steam's client and its web helper talk
+/// through exactly such a mapping.
+struct SharedMapping {
+    uint64_t begin {};
+    uint64_t end {};
+    uint64_t device {};
+    uint64_t inode {};
+    uint64_t offset {};
+};
+
+std::mutex g_shared_mappings_mutex;
+std::vector<SharedMapping> g_shared_mappings;
+
+void NoteSharedMapping(uint64_t begin, uint64_t length, int host_fd, uint64_t offset) {
+    struct stat info {};
+    if (fstat(host_fd, &info) != 0) {
+        return;
+    }
+    std::scoped_lock lock {g_shared_mappings_mutex};
+    g_shared_mappings.push_back(SharedMapping {begin, begin + length,
+                                               static_cast<uint64_t>(info.st_dev),
+                                               static_cast<uint64_t>(info.st_ino), offset});
+}
+
+/// The name for a futex word: the file and offset when it lives in shared memory, and the
+/// address itself otherwise.
+uint64_t FutexKeyFor(uint64_t host_address) {
+    std::scoped_lock lock {g_shared_mappings_mutex};
+    for (const auto& mapping : g_shared_mappings) {
+        if (host_address >= mapping.begin && host_address < mapping.end) {
+            const uint64_t within = mapping.offset + (host_address - mapping.begin);
+            return mapping.inode * 0x9E3779B97F4A7C15ull + mapping.device + within;
+        }
+    }
+    return host_address;
+}
+
 /// One queue per address, near enough.
 ///
 /// A single queue for the whole session is correct -- a futex waiter must re-check its own
@@ -792,7 +836,7 @@ FutexQueueState& FutexQueue(uint64_t address = 0) {
     static FutexQueueState queues[kFutexBuckets];
     // The low two bits are always zero -- a futex word is four bytes and aligned -- and
     // neighbouring words belong to different locks, so the next bits are what to spread on.
-    return queues[(address >> 2) % kFutexBuckets];
+    return queues[(FutexKeyFor(address) >> 2) % kFutexBuckets];
 }
 
 } // namespace
@@ -2338,6 +2382,7 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
             if (mapped != MAP_FAILED) {
                 // The table's lock is already held by the block this sits in.
                 shared_->mappings.emplace_back(placed, length);
+                NoteSharedMapping(placed, rounded, file->host_fd, static_cast<uint64_t>(offset));
                 return ToGuest(placed);
             }
             FATHOM_WARN("shared mapping of %s failed (%s); falling back to a private copy",

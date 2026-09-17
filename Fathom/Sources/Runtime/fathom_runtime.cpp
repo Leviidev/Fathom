@@ -1274,6 +1274,17 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
         // The parent's own regions only. The arena is shared, so asking it for every
         // writable range sweeps in whatever sibling processes have mapped -- which on a
         // pipeline's second fork meant copying the first child's entire 128MB heap.
+        // A way to ask what the borrow is costing in correctness: with this set, nothing is
+        // held and nothing is put back, so a child scribbles on its parent freely. Any
+        // problem that goes away here is one this mechanism is causing.
+        static const bool borrow_disabled = getenv("FATHOM_NO_BORROW") != nullptr;
+        if (borrow_disabled) {
+            stopped = false;
+            if (threaded) {
+                ThawThreads(parent);
+            }
+        }
+
         // A thread that could not be stopped is a thread still writing here, and a copy
         // taken now and put back later throws away everything it does meanwhile -- which
         // is how the client dies a few seconds after forking, reading a pointer some
@@ -1281,7 +1292,9 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
         // the forking thread's own stack, which no other thread touches: the child gets
         // less protection for its parent than it should, and the parent stays alive.
         std::vector<std::pair<uint64_t, uint64_t>> owned;
-        if (!stopped) {
+        if (borrow_disabled) {
+            // Nothing at all.
+        } else if (!stopped) {
             FATHOM_WARN("fork: pid %d is still running in its own memory, so pid %d borrows "
                         "only the stack it forked from",
                         caller_pid, child_pid);

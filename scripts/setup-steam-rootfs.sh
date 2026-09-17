@@ -76,6 +76,11 @@ export STEAM_RUNTIME_STEAMRT="${STEAM_RUNTIME_STEAMRT:-/usr/local/lib/fathom-ste
 # pid file all describe a process from the last run that is no longer there. Left alone,
 # the server refuses to start and Steam decides it is already running and exits.
 rm -rf /tmp/.X0-lock /tmp/.X11-unix /tmp/fb /tmp/.fathom-abstract
+# Chromium's "am I already running" lock, left behind by the last session. It names the
+# process that held it, and process numbers here start again from the same place every
+# time -- so the lock always appears to belong to something still alive, and the web
+# helper spends its startup trying to hand over to an instance that is not there.
+rm -rf /tmp/.com.valvesoftware.Steam.*
 rm -f "$HOME/.steampid" "$HOME/.steam/steam.pid" "$HOME/.steam/steam.pipe"
 mkdir -p /tmp/fb /tmp/.X11-unix /tmp/.ICE-unix
 chmod 1777 /tmp/.X11-unix /tmp/.ICE-unix

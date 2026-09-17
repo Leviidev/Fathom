@@ -4724,6 +4724,13 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysSetpriority:
     case kSysSchedSetparam:
     case kSysSchedSetscheduler:
+        // Real-time policies are refused, the way Linux refuses them to a process without
+        // CAP_SYS_NICE, rather than accepted and ignored. Claiming success and then
+        // answering SCHED_OTHER to sched_getscheduler is a contradiction programs check
+        // for, and nothing here schedules differently anyway.
+        if (arg2 == 1 || arg2 == 2) {
+            return FailLinux(1); // EPERM
+        }
         return 0;
     case kSysGetpriority:
         return 20; // nice 0, in the encoding getpriority uses on Linux.
@@ -4740,9 +4747,31 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         return 0;
     }
     case kSysSchedGetPriorityMax:
-    case kSysSchedGetPriorityMin:
-        // SCHED_OTHER is the only policy here, and its range is zero to zero.
-        return 0;
+    case kSysSchedGetPriorityMin: {
+        // Linux's ranges, not this host's, and per policy rather than one answer for all
+        // of them. Nothing here actually schedules differently -- every guest thread is
+        // an ordinary host thread -- but the numbers are read by programs that then check
+        // their own arithmetic against them. Answering zero for SCHED_FIFO makes glibc's
+        // priority-protected mutexes assert ("__pthread_tpp_change_priority: Assertion
+        // `new_prio >= fifo_min_prio && new_prio <= fifo_max_prio' failed") and take the
+        // process down, which is how Steam's web helper died a minute into starting.
+        constexpr uint64_t kSchedOther = 0;
+        constexpr uint64_t kSchedFifo = 1;
+        constexpr uint64_t kSchedRr = 2;
+        constexpr uint64_t kSchedBatch = 3;
+        constexpr uint64_t kSchedIdle = 5;
+        switch (arg1) {
+        case kSchedFifo:
+        case kSchedRr:
+            return number == kSysSchedGetPriorityMax ? 99 : 1;
+        case kSchedOther:
+        case kSchedBatch:
+        case kSchedIdle:
+            return 0;
+        default:
+            return FailLinux(22); // EINVAL
+        }
+    }
 
     case kSysGetrandom: {
         void* out = GuestPointer(arg1, arg2, true);

@@ -259,6 +259,12 @@ struct GuestProcess {
     std::unique_ptr<fathom::LinuxSyscalls> syscalls;
     std::unique_ptr<fathom::GuestThread> thread;
     LoadedProgram program;
+    /// How many times this process has replaced its image. A child holding a copy of its
+    /// parent's memory records this at the fork; if it has moved on by the time the copy
+    /// would go back, the parent is a different program now and the copy belongs to the
+    /// one it used to be.
+    uint64_t generation {};
+
     /// Whether this process loaded `program` itself. A forked child does not: it shares
     /// its parent's image, stack and heap until it execs, and freeing them on its behalf
     /// pulls the ground out from under the still-running parent.
@@ -313,6 +319,8 @@ struct GuestProcess {
         std::vector<uint8_t> bytes;
     };
     std::vector<BorrowedRegion> borrowed;
+    /// The parent's generation when `borrowed` was taken.
+    uint64_t borrowed_generation {};
 
     /// The threads frozen while a child of this process borrows its memory, as mach
     /// ports. Kept on the parent, because it is the parent's threads that are stopped and
@@ -768,6 +776,14 @@ void fathom_session::RestoreBorrowedMemory(GuestProcess* process) {
     {
         std::scoped_lock lock {process_mutex};
         held = process->borrowed.size();
+        auto* parent = Find(process->ppid);
+        if (parent != nullptr && parent->generation != process->borrowed_generation) {
+            FATHOM_WARN("fork: pid %d is not putting anything back -- pid %d has loaded a "
+                        "different program since the copy was taken",
+                        process->pid, process->ppid);
+            process->borrowed.clear();
+            process->borrowed.shrink_to_fit();
+        }
         for (auto& region : process->borrowed) {
             if (is_mine(region.address, region.address + region.bytes.size())) {
                 ++refused;
@@ -1134,6 +1150,7 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
         auto child = std::make_unique<GuestProcess>();
         child->pid = child_pid;
         child->ppid = caller_pid;
+        child->borrowed_generation = parent->generation;
         child->path = parent->path;
         // Shared, not owned: until this child execs it is running inside its parent's
         // image and on its parent's stack.
@@ -1549,6 +1566,7 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& requested
         return -8; // -ENOEXEC
     }
 
+    ++process->generation;
     process->previous_program = process->program;
     process->has_previous = process->owns_program;
     process->program = loaded;

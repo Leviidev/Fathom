@@ -782,7 +782,8 @@ void GuestAddressSpace::FreeSpace(uint64_t* total, uint64_t* largest) const {
 }
 
 bool GuestAddressSpace::RestoreIfUnchanged(uint64_t address, const void* bytes, uint64_t size,
-                                           uint64_t epoch, const char** refusal) {
+                                           uint64_t epoch, const char** refusal,
+                                           bool* held_code) {
     static thread_local char why[192];
     const auto refuse = [&](const char* what, const GuestRange* range) {
         if (refusal != nullptr) {
@@ -827,16 +828,14 @@ bool GuestAddressSpace::RestoreIfUnchanged(uint64_t address, const void* bytes, 
                 return refuse("the host will not allow writing there", nullptr);
             }
             std::memcpy(reinterpret_cast<void*>(address), bytes, size);
-            const bool held_code = HasHeldCode(page_begin, page_end);
-            lock.unlock();
             // The bytes here are no longer the bytes that were here a moment ago, and the
             // child whose memory this overwrites has been running -- and compiling -- in
-            // it. Nothing else on this path releases or reprotects the range, so this is
-            // the only chance to say that compiled code from it is stale. Missing it
-            // shows up much later as FEXCore refusing to decode an instruction at an
-            // address that looked fine, in a process that has already moved on.
-            if (held_code) {
-                NotifyContentsReplaced(page_begin, page_end);
+            // it. Compiled code from this span is stale, and nothing else on this path
+            // releases or reprotects the range to say so; missing it shows up much later
+            // as FEXCore refusing to decode an instruction at an address that looked
+            // fine, in a process that has already moved on.
+            if (held_code != nullptr) {
+                *held_code = HasHeldCode(page_begin, page_end);
             }
             return true;
         }

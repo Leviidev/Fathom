@@ -148,7 +148,12 @@ public:
     /// which is the point: checking first and writing afterwards leaves a window in which
     /// another guest process -- which is not stopped, whatever the parent's own threads
     /// are doing -- releases the range and the write lands on nothing.
-    bool RestoreIfUnchanged(uint64_t address, const void* bytes, uint64_t size, uint64_t epoch, const char** refusal = nullptr);
+    /// `held_code`, when given, is set if the range that was overwritten had ever held
+    /// guest code. The caller invalidates rather than this function, because the caller
+    /// is holding the process table while it restores and throwing compiled code away
+    /// waits on FEXCore -- which is a lock order that stops the whole session.
+    bool RestoreIfUnchanged(uint64_t address, const void* bytes, uint64_t size, uint64_t epoch,
+                            const char** refusal = nullptr, bool* held_code = nullptr);
 
     /// The allocation epoch of whatever covers `address`, or 0 if nothing does.
     uint64_t EpochAt(uint64_t address) const;

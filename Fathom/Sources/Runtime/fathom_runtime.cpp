@@ -750,6 +750,11 @@ void fathom_session::RestoreBorrowedMemory(GuestProcess* process) {
     // back there leaves a program whose dynamic section is somebody else's memory, which
     // its loader reports as "Inconsistency detected by ld.so" and nothing else explains.
     std::vector<std::pair<uint64_t, uint64_t>> mine;
+    // Ranges whose contents changed under compiled code. Collected here and told to
+    // FEXCore below, once the process table is no longer held: throwing compiled code
+    // away waits on every thread that is compiling, and a thread that wants the process
+    // table while this one waits deadlocks the session.
+    std::vector<std::pair<uint64_t, uint64_t>> stale;
     if (process->owns_program) {
         const auto& loaded = process->program;
         const uint64_t base = process->guest_base;
@@ -807,8 +812,14 @@ void fathom_session::RestoreBorrowedMemory(GuestProcess* process) {
             // more, which happens when the parent released it while the child was running
             // and the arena has since given it to something else.
             const char* refusal = "";
-            if (!space->RestoreIfUnchanged(region.address, region.bytes.data(),
-                                           region.bytes.size(), region.epoch, &refusal)) {
+            bool held_code = false;
+            if (space->RestoreIfUnchanged(region.address, region.bytes.data(),
+                                          region.bytes.size(), region.epoch, &refusal,
+                                          &held_code)) {
+                if (held_code) {
+                    stale.emplace_back(region.address, region.address + region.bytes.size());
+                }
+            } else {
                 ++refused;
                 refused_bytes += region.bytes.size();
                 // A few, not all of them: a busy parent can have thousands of regions and
@@ -823,6 +834,9 @@ void fathom_session::RestoreBorrowedMemory(GuestProcess* process) {
         }
         process->borrowed.clear();
         process->borrowed.shrink_to_fit();
+    }
+    for (const auto& [begin, end] : stale) {
+        space->NotifyContentsReplaced(begin, end);
     }
     if (refused != 0) {
         FATHOM_WARN("fork: pid %d kept %zu of %zu regions (%zu KB) that are no longer its "

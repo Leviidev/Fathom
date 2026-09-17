@@ -48,29 +48,39 @@ GuestAddressSpace::GuestAddressSpace(uint64_t base, uint64_t size, uint64_t page
     }
 }
 
-bool GuestAddressSpace::NoteExecutable(uint64_t begin, uint64_t end) {
-    if (code_words_ == nullptr || end <= begin) {
-        return true;
-    }
-    // Outside the arena there is no map, so answer the safe way.
-    if (begin < base_ || end > base_ + size_) {
-        return true;
-    }
+static bool WalkCodeMap(std::atomic<uint64_t>* words, uint64_t word_count, uint64_t base,
+                        uint64_t grain, uint64_t begin, uint64_t end, bool set) {
     bool had = false;
-    const uint64_t first = (begin - base_) / code_grain_;
-    const uint64_t last = (end - 1 - base_) / code_grain_;
-    for (uint64_t grain = first; grain <= last; ++grain) {
-        const uint64_t word = grain / 64;
-        if (word >= code_word_count_) {
+    const uint64_t first = (begin - base) / grain;
+    const uint64_t last = (end - 1 - base) / grain;
+    for (uint64_t index = first; index <= last; ++index) {
+        const uint64_t word = index / 64;
+        if (word >= word_count) {
             return true;
         }
-        const uint64_t bit = 1ull << (grain % 64);
-        const uint64_t before = code_words_[word].fetch_or(bit, std::memory_order_relaxed);
+        const uint64_t bit = 1ull << (index % 64);
+        const uint64_t before = set ? words[word].fetch_or(bit, std::memory_order_relaxed)
+                                    : words[word].load(std::memory_order_relaxed);
         if ((before & bit) != 0) {
             had = true;
         }
     }
     return had;
+}
+
+bool GuestAddressSpace::NoteExecutable(uint64_t begin, uint64_t end) {
+    // Outside the arena there is no map, so answer the safe way.
+    if (code_words_ == nullptr || end <= begin || begin < base_ || end > base_ + size_) {
+        return true;
+    }
+    return WalkCodeMap(code_words_.get(), code_word_count_, base_, code_grain_, begin, end, true);
+}
+
+bool GuestAddressSpace::HasHeldCode(uint64_t begin, uint64_t end) const {
+    if (code_words_ == nullptr || end <= begin || begin < base_ || end > base_ + size_) {
+        return true;
+    }
+    return WalkCodeMap(code_words_.get(), code_word_count_, base_, code_grain_, begin, end, false);
 }
 
 GuestAddressSpace::~GuestAddressSpace() {
@@ -817,6 +827,17 @@ bool GuestAddressSpace::RestoreIfUnchanged(uint64_t address, const void* bytes, 
                 return refuse("the host will not allow writing there", nullptr);
             }
             std::memcpy(reinterpret_cast<void*>(address), bytes, size);
+            const bool held_code = HasHeldCode(page_begin, page_end);
+            lock.unlock();
+            // The bytes here are no longer the bytes that were here a moment ago, and the
+            // child whose memory this overwrites has been running -- and compiling -- in
+            // it. Nothing else on this path releases or reprotects the range, so this is
+            // the only chance to say that compiled code from it is stale. Missing it
+            // shows up much later as FEXCore refusing to decode an instruction at an
+            // address that looked fine, in a process that has already moved on.
+            if (held_code) {
+                NotifyContentsReplaced(page_begin, page_end);
+            }
             return true;
         }
     }

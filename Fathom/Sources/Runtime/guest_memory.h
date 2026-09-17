@@ -189,6 +189,10 @@ private:
     /// stale code. Lock-free because it sits on the mmap path.
     bool NoteExecutable(uint64_t begin, uint64_t end);
 
+    /// The same question without marking anything: has any part of [begin, end) ever
+    /// held guest code?
+    bool HasHeldCode(uint64_t begin, uint64_t end) const;
+
     std::unique_ptr<std::atomic<uint64_t>[]> code_words_;
     uint64_t code_grain_ {};
     uint64_t code_word_count_ {};

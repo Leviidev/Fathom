@@ -283,10 +283,10 @@ private:
   // futex style APIs" -- compare-and-wait / wake-by-address, the same fundamental primitive.
   // One real gap versus Linux's FUTEX_WAIT_BITSET/FUTEX_WAKE_BITSET: there's no bitset filter
   // to selectively wake only the writer-waiters or only the reader-waiters sharing this one
-  // Futex word. Waking the unfiltered set is still *correct* (never a hang or a lost wakeup) --
-  // every wait loop in this class already re-checks the atomic state and tolerates spurious
-  // wakeups by design (see the "Can get some spurious wake-ups" comment in lock_shared()) --
-  // just occasionally less efficient than Linux's selective wake.
+  // Futex word. Waking *everyone* is still correct -- every wait loop here re-checks the
+  // atomic state and tolerates spurious wakeups by design (see the "Can get some spurious
+  // wake-ups" comment in lock_shared()) -- and waking everyone is what both wakes below
+  // therefore do. Waking only one is not correct here, however tempting: see FutexWakeWriter.
   void FutexWaitForWriteAvailable(uint32_t Expected) {
     os_sync_wait_on_address(&Futex, Expected, sizeof(Futex), OS_SYNC_WAIT_ON_ADDRESS_NONE);
   }
@@ -296,7 +296,13 @@ private:
   }
 
   void FutexWakeWriter() {
-    os_sync_wake_by_address_any(&Futex, sizeof(Futex), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+    // Everyone, not one. Linux can name the writers with a bitset and wake exactly one of
+    // them; Darwin cannot, so waking one waiter can wake a *reader* instead. That reader
+    // re-checks, sees a writer waiting, and goes back to sleep without passing the wakeup
+    // on -- and the writer sleeps for good. It is a whole-session hang from one lost
+    // wakeup: the writer is a guest mmap throwing compiled code away, and every thread
+    // that wants to compile queues behind it.
+    os_sync_wake_by_address_all(&Futex, sizeof(Futex), OS_SYNC_WAKE_BY_ADDRESS_NONE);
   }
 
   void FutexWakeReaders() {

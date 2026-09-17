@@ -378,6 +378,12 @@ void RetireLiveThread(FEXCore::Core::InternalThreadState* thread) {
 }
 /// How many sweeps are using a copy of that list. A thread may not be destroyed while any
 /// of them is, because the sweep reaches into it.
+///
+/// On a lock of its own, and deliberately not on the one guarding the list. A sweep can
+/// take a long time, and a thread waiting for one to finish must not be holding the lock
+/// that every *starting* thread needs -- that is a guest process that forks while
+/// another is exiting and does not execute a single instruction until the sweep ends.
+std::mutex g_invalidators_mutex;
 size_t g_invalidators {0};
 std::condition_variable g_invalidations_done;
 
@@ -714,14 +720,16 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
     // instead and thread destruction waits on that.
     std::vector<LiveThread> live;
     {
-        std::scoped_lock lock {g_live_threads_mutex};
+        std::scoped_lock lock {g_live_threads_mutex, g_invalidators_mutex};
         live = g_live_threads;
         ++g_invalidators;
     }
     struct Finished {
         ~Finished() {
-            std::scoped_lock lock {g_live_threads_mutex};
-            --g_invalidators;
+            {
+                std::scoped_lock lock {g_invalidators_mutex};
+                --g_invalidators;
+            }
             g_invalidations_done.notify_all();
         }
     } finished;
@@ -880,7 +888,7 @@ public:
             ForgetLiveThread(thread);
             {
                 // Nothing may be halfway through a sweep that names this thread.
-                std::unique_lock wait {g_live_threads_mutex};
+                std::unique_lock wait {g_invalidators_mutex};
                 g_invalidations_done.wait(wait, [] { return g_invalidators == 0; });
             }
             std::scoped_lock guard {g_thread_lifecycle};

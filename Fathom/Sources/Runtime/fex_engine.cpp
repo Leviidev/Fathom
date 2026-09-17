@@ -231,6 +231,10 @@ thread_local ActiveExecution g_active;
 /// never touched an odd address or the handler is not being reached.
 std::atomic<uint64_t> g_alignment_fixups {0};
 
+/// The guest's arena, so that a signal handler can tell a guest address from any other.
+std::atomic<fathom::GuestAddressSpace*> g_arena_space {nullptr};
+std::atomic<uint64_t> g_arena_begin {0};
+
 /// Fixes up a guest alignment fault and resumes, rather than letting it kill the app.
 ///
 /// x86 lets a program read or write at any address. ARM64 mostly does too -- but not for
@@ -346,9 +350,6 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
 /// context to go on.
 thread_local GuestThread* g_current_guest_thread = nullptr;
 
-/// The guest's arena, so that a signal handler can tell a guest address from any other.
-std::atomic<fathom::GuestAddressSpace*> g_arena_space {nullptr};
-std::atomic<uint64_t> g_arena_begin {0};
 
 std::atomic<uint64_t> g_arena_end {0};
 

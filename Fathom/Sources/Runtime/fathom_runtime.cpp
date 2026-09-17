@@ -415,7 +415,8 @@ struct fathom_session final : fathom::ProcessHost {
     /// parent run. Done before an exec loads anything, because the arena may hand the
     /// memory the parent has since released to the image about to be loaded -- and then
     /// the restore would write stale bytes over a program that had only just arrived.
-    void RestoreBorrowedMemory(GuestProcess* process);
+    void RestoreBorrowedMemory(GuestProcess* process,
+                               std::vector<std::pair<uint64_t, uint64_t>>* stale);
 
     // ProcessHost
     bool DescribeProcess(int pid, int* ppid, std::string* name) override {
@@ -739,7 +740,8 @@ void fathom_session::JoinFinishedChildren() {
     }
 }
 
-void fathom_session::RestoreBorrowedMemory(GuestProcess* process) {
+void fathom_session::RestoreBorrowedMemory(GuestProcess* process,
+                                           std::vector<std::pair<uint64_t, uint64_t>>* stale_out) {
     size_t refused = 0;
     size_t refused_bytes = 0;
     size_t held = 0;
@@ -835,8 +837,8 @@ void fathom_session::RestoreBorrowedMemory(GuestProcess* process) {
         process->borrowed.clear();
         process->borrowed.shrink_to_fit();
     }
-    for (const auto& [begin, end] : stale) {
-        space->NotifyContentsReplaced(begin, end);
+    if (stale_out != nullptr) {
+        stale_out->insert(stale_out->end(), stale.begin(), stale.end());
     }
     if (refused != 0) {
         FATHOM_WARN("fork: pid %d kept %zu of %zu regions (%zu KB) that are no longer its "
@@ -849,7 +851,12 @@ void fathom_session::ReleaseParent(GuestProcess* process) {
     // Anything still held is put back first. Ordinarily there is nothing left, because
     // execve gave it back before it loaded anything; a child that exits without ever
     // execing arrives here still holding it.
-    RestoreBorrowedMemory(process);
+    // Which ranges hold compiled code that is no longer the code that is there. FEXCore
+    // is told below, after the parent's threads are running again: a frozen thread can be
+    // holding FEXCore's code-invalidation lock shared, and waiting for it here -- with
+    // the thaw that would release it still ahead of us -- stops the session for good.
+    std::vector<std::pair<uint64_t, uint64_t>> stale;
+    RestoreBorrowedMemory(process, &stale);
     {
         std::scoped_lock lock {process_mutex};
         // The parent's other threads were stopped for the duration of the borrow, and its
@@ -860,6 +867,12 @@ void fathom_session::ReleaseParent(GuestProcess* process) {
         process->released = true;
     }
     process_changed.notify_all();
+    // Now that nothing is suspended, compiled code from the ranges that were written
+    // back can be thrown away. Blocks compiled while the child was running reflect bytes
+    // the child put there, and the parent is about to run in that memory again.
+    for (const auto& [begin, end] : stale) {
+        space->NotifyContentsReplaced(begin, end);
+    }
 }
 
 namespace {

@@ -573,11 +573,13 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
         FATHOM_INFO("%llu code invalidations so far",
                     static_cast<unsigned long long>(count));
     }
-    std::vector<LiveThread> live;
-    {
-        std::scoped_lock lock {g_live_threads_mutex};
-        live = g_live_threads;
-    }
+    // Held for the whole sweep, not just long enough to copy the list. A thread that ends
+    // while its entry is being used takes its lookup cache with it, and the invalidation
+    // walks into freed memory -- a null dereference inside FEXCore, reached from an
+    // ordinary guest mmap. Forgetting a thread takes this same lock, so holding it here
+    // means no thread named in this list can go away until the sweep is done.
+    std::scoped_lock lock {g_live_threads_mutex};
+    const auto& live = g_live_threads;
     // Contexts first: a code buffer's lookup table is shared by every thread using it.
     std::set<FEXCore::Context::Context*> contexts;
     for (const auto& entry : live) {

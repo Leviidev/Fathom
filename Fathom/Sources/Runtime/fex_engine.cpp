@@ -322,6 +322,15 @@ std::atomic<uint64_t> g_arena_end {0};
 /// process, so the default action takes the emulator down with it -- one crashing helper
 /// and the whole session is gone.
 ///
+struct LiveThread {
+    FEXCore::Context::Context* context {};
+    FEXCore::Core::InternalThreadState* thread {};
+    uint64_t guest_base {};
+};
+
+std::mutex g_live_threads_mutex;
+std::vector<LiveThread> g_live_threads;
+
 /// Unwinding out of a signal handler is only safe because of the check below: the fault
 /// must have happened inside FEXCore's generated code, where the guest holds no lock of
 /// ours and owns nothing that has to be put back. A fault anywhere else is a bug in
@@ -337,7 +346,24 @@ bool EndFaultedGuestThread(int signal, siginfo_t* info, void* raw_context) {
     }
     auto* context = static_cast<ucontext_t*>(raw_context);
     const auto pc = static_cast<uintptr_t>(arm_thread_state64_get_pc(context->uc_mcontext->__ss));
-    if (!g_active.context->IsAddressInCodeBuffer(g_active.thread, pc)) {
+    bool in_generated_code = g_active.context->IsAddressInCodeBuffer(g_active.thread, pc);
+    if (!in_generated_code) {
+        // A block compiled into a buffer another thread owns is still generated code, and
+        // still this guest's fault -- FEXCore hands a thread whatever buffer had room.
+        // try_lock rather than lock: this runs in a signal handler, and a handler that
+        // waits for a lock the interrupted thread is holding never returns.
+        std::unique_lock guard {g_live_threads_mutex, std::try_to_lock};
+        if (guard.owns_lock()) {
+            for (const auto& live : g_live_threads) {
+                if (live.context == g_active.context &&
+                    g_active.context->IsAddressInCodeBuffer(live.thread, pc)) {
+                    in_generated_code = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!in_generated_code) {
         // Not in generated code -- but a guest that jumps to an address with nothing at it
         // faults inside FEXCore's instruction decoder rather than in the code it was
         // about to run, because the decoder is what reads guest memory first. The address
@@ -531,15 +557,6 @@ public:
 /// addresses, the same block entries, the wrong instructions. It does not look like a
 /// stale cache from the outside. It looks like a program jumping to a nonsense address
 /// with a nonsense stack pointer, deterministically, in a place that makes no sense.
-struct LiveThread {
-    FEXCore::Context::Context* context {};
-    FEXCore::Core::InternalThreadState* thread {};
-    uint64_t guest_base {};
-};
-
-std::mutex g_live_threads_mutex;
-std::vector<LiveThread> g_live_threads;
-
 void RegisterLiveThread(FEXCore::Context::Context* context, FEXCore::Core::InternalThreadState* thread,
                         uint64_t guest_base) {
     if (context == nullptr || thread == nullptr) {

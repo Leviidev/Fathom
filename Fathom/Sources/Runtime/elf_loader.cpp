@@ -447,6 +447,32 @@ bool LoadElf(const std::string& path, GuestAddressSpace& space, uint64_t preferr
         space.Protect(load_base + segment.p_vaddr, segment.p_memsz, ToGuestProtection(segment.p_flags));
     }
 
+    // What the program is about to be told about itself, checked against what is actually
+    // there. A loader reads its own program headers through AT_PHDR and its own variables
+    // out of zero-initialised data; if either is not what it should be, everything it
+    // computes afterwards is nonsense and the failure surfaces somewhere unrecognisable.
+    if (getenv("FATHOM_VERIFY_IMAGES") != nullptr) {
+        for (const auto& segment : segments) {
+            if (segment.p_type != kPtLoad || segment.p_memsz <= segment.p_filesz) {
+                continue;
+            }
+            const auto* zero_from =
+                reinterpret_cast<const uint8_t*>(load_base + segment.p_vaddr + segment.p_filesz);
+            const uint64_t zero_bytes = segment.p_memsz - segment.p_filesz;
+            uint64_t nonzero = 0;
+            for (uint64_t index = 0; index < zero_bytes; ++index) {
+                nonzero += zero_from[index] != 0 ? 1 : 0;
+            }
+            if (nonzero != 0) {
+                FATHOM_ERROR("%s: %llu of %llu bytes that should be zero are not, at %#llx",
+                             path.c_str(), static_cast<unsigned long long>(nonzero),
+                             static_cast<unsigned long long>(zero_bytes),
+                             static_cast<unsigned long long>(load_base + segment.p_vaddr +
+                                                             segment.p_filesz));
+            }
+        }
+    }
+
     out_image->load_base = load_base;
     out_image->entry = load_base + header.e_entry;
     out_image->phentsize = header.e_phentsize;

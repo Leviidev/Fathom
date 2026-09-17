@@ -337,7 +337,11 @@ enum : uint64_t {
     kSysEpollCreate1 = 291,
     kSysPipe2 = 293,
     kSysPrlimit64 = 302,
+    kSysInotifyInit = 253,
+    kSysInotifyAddWatch = 254,
+    kSysInotifyRmWatch = 255,
     kSysFallocate = 285,
+    kSysInotifyInit1 = 294,
     kSysGetrandom = 318,
     kSysMemfdCreate = 319,
     kSysStatx = 332,
@@ -747,6 +751,10 @@ const char* SyscallName(uint64_t number) {
     case kSysReadlinkat: return "readlinkat";
     case kSysSetRobustList: return "set_robust_list";
     case kSysPrlimit64: return "prlimit64";
+    case kSysInotifyInit: return "inotify_init";
+    case kSysInotifyInit1: return "inotify_init1";
+    case kSysInotifyAddWatch: return "inotify_add_watch";
+    case kSysInotifyRmWatch: return "inotify_rm_watch";
     case kSysFallocate: return "fallocate";
     case kSysMemfdCreate: return "memfd_create";
     case kSysPwrite64: return "pwrite64";
@@ -3985,6 +3993,44 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             }
         }
         return 0;
+    }
+
+    // Watching files for changes. Nothing here changes a file behind a program's back --
+    // the root filesystem is read only in practice and there is no other writer -- so a
+    // watch that never fires is the truthful answer. What matters is that asking for one
+    // succeeds: told "not implemented", Chromium logs an error for every watch it wanted
+    // and takes a worse path, and the descriptor it expects to poll does not exist.
+    case kSysInotifyInit:
+    case kSysInotifyInit1: {
+        constexpr int kInNonBlock = 0x800;
+        constexpr int kInCloexec = 0x80000;
+        const int flags = number == kSysInotifyInit1 ? static_cast<int>(arg1) : 0;
+        int pair[2] = {-1, -1};
+        if (pipe(pair) != 0) {
+            return Fail(errno);
+        }
+        if ((flags & kInNonBlock) != 0) {
+            fcntl(pair[0], F_SETFL, fcntl(pair[0], F_GETFL, 0) | O_NONBLOCK);
+        }
+        std::scoped_lock lock {shared_->mutex};
+        const int fd = RegisterFile(pair[0], "anon_inode:inotify", (flags & kInCloexec) != 0);
+        // The writing end is kept so a read waits rather than seeing end-of-file, which
+        // is what a watch with nothing to report looks like.
+        shared_->files[fd].netlink_peer = pair[1];
+        return static_cast<uint64_t>(fd);
+    }
+    case kSysInotifyAddWatch: {
+        std::scoped_lock lock {shared_->mutex};
+        auto* file = FindFile(static_cast<int>(arg1));
+        if (file == nullptr) {
+            return FailLinux(9);
+        }
+        // Watch descriptors are only ever handed back to inotify_rm_watch, and start at 1.
+        return static_cast<uint64_t>(++next_watch_);
+    }
+    case kSysInotifyRmWatch: {
+        std::scoped_lock lock {shared_->mutex};
+        return FindFile(static_cast<int>(arg1)) == nullptr ? FailLinux(9) : 0;
     }
 
     case kSysReadv:

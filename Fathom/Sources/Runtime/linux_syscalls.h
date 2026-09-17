@@ -487,6 +487,7 @@ private:
     int pid_ {1};
     int tid_ {0};
     bool reported_missing_fd_ {false};
+    int next_watch_ {0};
     int ppid_ {0};
     ProcessHost* host_ {};
 

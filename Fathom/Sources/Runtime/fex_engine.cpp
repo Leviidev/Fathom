@@ -431,7 +431,20 @@ bool EndFaultedGuestThread(int signal, siginfo_t* info, void* raw_context) {
         const uint64_t begin = g_arena_begin.load(std::memory_order_acquire);
         const uint64_t end = g_arena_end.load(std::memory_order_acquire);
         if (begin == 0 || address < begin || address >= end) {
-            return false;
+            // Neither generated code nor an address the guest owns -- but this host thread
+            // is inside ExecuteThread, so it is running a guest program and nothing else.
+            // A guest that jumps into memory holding no instruction FEXCore knows arrives
+            // here rather than at either check above: the trap is emitted by the JIT but
+            // reached through FEXCore's own frames, and the address it names is the
+            // instruction, not the data. Ending the one guest process is right whichever
+            // of the two it turns out to be, and it is much better than ending the
+            // session -- an X server and a browser die with it for another program's bug.
+            if (g_active.thread == nullptr) {
+                return false;
+            }
+            FATHOM_WARN("fault (signal %d) inside the emulator at %p while running guest "
+                        "code; ending this guest process",
+                        signal, info == nullptr ? nullptr : info->si_addr);
         }
     }
     // What the guest was reaching for, and what the address space thinks is there. A fault

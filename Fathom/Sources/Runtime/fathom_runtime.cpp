@@ -1542,8 +1542,16 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
         // in milliseconds. One that does not is a shell running a whole script inside the
         // fork, and stopping the rest of its parent for that long would look like a hang;
         // better to let them go and give up the guarantee than to stop answering.
+        // Short, because the wait is not only a wait. The parent's other threads are
+        // stopped for its duration, and a lock one of them was holding when the fork
+        // happened is a lock the child cannot take -- the memory is shared, so there is
+        // no second copy of it to unlock. The child then spins in its parent's memory
+        // until this gives up and lets the parent run, and everything it does in the
+        // meantime it does while holding the whole session still. Nearly every fork
+        // execs within a millisecond; the ones that do not are better off untangled
+        // quickly than protected thoroughly.
         const bool released = process_changed.wait_for(
-            lock, std::chrono::seconds(5),
+            lock, std::chrono::milliseconds(400),
             [&] { return child_raw->released || console.StopRequested(); });
         if (!released) {
             if (auto* parent = Find(caller_pid)) {
@@ -1553,7 +1561,7 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
                 uint64_t samples[4] = {};
                 for (auto& sample : samples) {
                     sample = child_raw->thread == nullptr ? 0 : child_raw->thread->Rip();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(15));
                 }
                 // And where the *host* thread is. A guest rip that never moves says the
                 // child has not started; it does not say what is stopping it, and the
@@ -1582,7 +1590,7 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
                     }
                     thread_resume(port);
                 }
-                FATHOM_WARN("fork: pid %d has held its parent's memory for five seconds "
+                FATHOM_WARN("fork: pid %d has held its parent's memory too long "
                             "(syscall %llu, rip %#llx %#llx %#llx %#llx, rsp %#llx); letting "
                             "pid %d's other threads run again and giving up the copy",
                             child_pid,

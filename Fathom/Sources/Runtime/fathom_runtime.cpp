@@ -791,32 +791,46 @@ struct ThreadStart {
     fathom_session* session;
     GuestProcess* process;
     GuestProcess::GuestThreadRecord* record;
+    // Copied rather than read back out of the record. Everything else here is a pointer
+    // into the process table, and reading one of those before the thread is properly
+    // running is how a thread that started a moment too late ends up dereferencing a
+    // record its process has already torn down.
+    int tid {};
+    int pid {};
+    bool is_32bit {};
+    fathom::GuestThread* thread {};
+    char program[96] {};
 };
 
 void* RunGuestThread(void* raw) {
     std::unique_ptr<ThreadStart> start {static_cast<ThreadStart*>(raw)};
-    FATHOM_INFO("tid %d: running", start->record->tid);
-    fathom::NoteGuestIdentity(start->process->pid, start->record->tid,
-                              start->process->is_32bit, start->process->path.c_str());
-    const auto result = start->record->thread->Run();
+    FATHOM_INFO("tid %d: running", start->tid);
+    fathom::NoteGuestIdentity(start->pid, start->tid, start->is_32bit, start->program);
+    if (start->thread == nullptr) {
+        FATHOM_ERROR("tid %d has no guest thread to run", start->tid);
+        start->record->finished.store(true, std::memory_order_release);
+        return nullptr;
+    }
+    const auto result = start->thread->Run();
 
     // A thread's descriptors are the process's, so nothing is closed here. What does have
     // to happen is the kernel's own parting act: clear the word the thread was created
     // with and wake whoever is waiting on it, which is how pthread_join returns.
     start->record->syscalls->ReleaseThreadId();
-    start->record->finished.store(true, std::memory_order_release);
     // A fault in one thread ends the whole thread group on Linux, and a process left
     // running with a thread missing is worse than one that stopped: whatever that thread
     // was holding is never released and the rest deadlock on it.
     if (result.outcome == fathom::RunOutcome::Faulted) {
-        FATHOM_WARN("tid %d faulted; ending pid %d with it", start->record->tid,
-                    start->process->pid);
+        FATHOM_WARN("tid %d faulted; ending pid %d with it", start->tid, start->pid);
         start->process->syscalls->RequestProcessStop();
         start->session->NotifyProcessChanged();
     }
-    FATHOM_INFO("tid %d: finished (%s, status %d, rip=%#llx)", start->record->tid,
+    FATHOM_INFO("tid %d: finished (%s, status %d, rip=%#llx)", start->tid,
                 result.message.c_str(), result.status,
                 static_cast<unsigned long long>(result.rip));
+    // Last, and after everything that reads the record: the moment this is set the record
+    // can be joined and erased by whoever creates the next thread.
+    start->record->finished.store(true, std::memory_order_release);
     return nullptr;
 }
 
@@ -952,7 +966,10 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
         process_raw = process;
     }
 
-    auto* start = new ThreadStart {this, process_raw, record_raw};
+    auto* start = new ThreadStart {this,           process_raw,       record_raw,
+                                   record_raw->tid, process_raw->pid, process_raw->is_32bit,
+                                   record_raw->thread.get()};
+    std::snprintf(start->program, sizeof(start->program), "%s", process_raw->path.c_str());
     pthread_attr_t attributes;
     pthread_attr_init(&attributes);
     pthread_attr_setstacksize(&attributes, kGuestThreadStack);

@@ -188,6 +188,10 @@ case "$1" in
         # launch and nothing to wait for.
         extra="--no-zygote --disable-gpu --disable-gpu-compositing --disable-software-rasterizer"
         extra="$extra --enable-features=NetworkServiceInProcess2,NetworkServiceInProcess"
+        # --no-proxy-server: the last thing the helper does before it goes quiet is ask
+        # D-Bus for the desktop's proxy settings, twice, and there is no D-Bus here. With
+        # no proxy to configure there is nothing to ask.
+        extra="$extra --no-proxy-server"
         # Set FATHOM_WEBHELPER_VERBOSE to have Chromium say what it is doing; its log
         # goes wherever Steam pointed --log-file, which is the Steam logs directory.
         if [ -n "${FATHOM_WEBHELPER_VERBOSE:-}" ]; then

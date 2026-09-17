@@ -15,6 +15,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <mach/mach.h>
+#include <pthread.h>
+
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -308,6 +311,11 @@ struct GuestProcess {
     };
     std::vector<BorrowedRegion> borrowed;
 
+    /// The threads frozen while a child of this process borrows its memory, as mach
+    /// ports. Kept on the parent, because it is the parent's threads that are stopped and
+    /// the child that decides when they start again.
+    std::vector<uint32_t> frozen_threads;
+
     /// One thread of this process beyond the first.
     ///
     /// A thread is far less machinery than a process: it shares the address space and the
@@ -382,6 +390,11 @@ struct fathom_session final : fathom::ProcessHost {
 
     /// Joins this process's threads that have already finished, before another is made.
     void JoinFinishedThreadsOf(GuestProcess* process);
+
+    /// Stops the process's other threads for as long as a child of it is borrowing its
+    /// memory, and starts them again afterwards.
+    void FreezeOtherThreads(GuestProcess* process, const fathom::GuestThread* caller);
+    void ThawThreads(GuestProcess* process);
 
     /// The same, but leaving the thread that asked -- which is what execve needs.
     void StopAndJoinOtherThreadsOf(GuestProcess* process);
@@ -496,6 +509,57 @@ fathom::RunResult fathom_session::RunProcess(GuestProcess* process) {
         }
     }
     return result;
+}
+
+void fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::GuestThread* caller) {
+    // Everything a fork's child does to its parent's memory is only safe to put back if
+    // nothing else was writing to it meanwhile. Linux gives the child a private copy and
+    // the question does not arise; here the memory really is shared, so the parent's other
+    // threads are stopped for as long as the child is using it. That is what vfork
+    // promises about the parent, applied to all of it.
+    //
+    // A thread is never stopped while it is inside the syscall layer: it may be holding
+    // the address space's lock or the descriptor table's, and the child needs both to
+    // exec. Suspending and looking is the only way to ask without a race -- the answer can
+    // change the instant after it is given -- so a thread caught in there is let go and
+    // tried again.
+    for (auto& thread : process->threads) {
+        if (!thread->started || thread->finished.load(std::memory_order_acquire)) {
+            continue;
+        }
+        if (thread->thread.get() == caller) {
+            continue;
+        }
+        const auto port = pthread_mach_thread_np(thread->host_thread);
+        if (port == MACH_PORT_NULL) {
+            continue;
+        }
+        bool frozen = false;
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            if (thread_suspend(port) != KERN_SUCCESS) {
+                break;
+            }
+            if (!thread->syscalls->InRuntime()) {
+                frozen = true;
+                break;
+            }
+            thread_resume(port);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+        if (frozen) {
+            process->frozen_threads.push_back(port);
+        } else {
+            FATHOM_WARN("fork: tid %d would not stop; pid %d's child shares its memory with it",
+                        thread->tid, process->pid);
+        }
+    }
+}
+
+void fathom_session::ThawThreads(GuestProcess* process) {
+    for (const auto port : process->frozen_threads) {
+        thread_resume(port);
+    }
+    process->frozen_threads.clear();
 }
 
 void fathom_session::StopAndJoinOtherThreadsOf(GuestProcess* process) {
@@ -644,6 +708,11 @@ void fathom_session::ReleaseParent(GuestProcess* process) {
     RestoreBorrowedMemory(process);
     {
         std::scoped_lock lock {process_mutex};
+        // The parent's other threads were stopped for the duration of the borrow, and its
+        // memory is now back as they left it, so they can go again.
+        if (auto* parent = Find(process->ppid)) {
+            ThawThreads(parent);
+        }
         process->released = true;
     }
     process_changed.notify_all();
@@ -973,12 +1042,16 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
         // seven hundred megabytes twice per fork, which is the difference between a fork
         // costing a millisecond and costing a second.
         bool threaded = false;
-        if (getenv("FATHOM_FORK_FULL") != nullptr) { threaded = false; } else
         for (const auto& thread : parent->threads) {
             if (thread->started && !thread->finished.load(std::memory_order_acquire)) {
                 threaded = true;
                 break;
             }
+        }
+        if (threaded) {
+            // Before the copy is taken, not after: a copy taken while the parent's other
+            // threads are still running is already out of date when it is made.
+            FreezeOtherThreads(parent, caller);
         }
 
         // The parent's own regions only. The arena is shared, so asking it for every
@@ -1084,7 +1157,25 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
     // its memory, which happens at the child's execve or at its exit, whichever is first.
     {
         std::unique_lock lock {process_mutex};
-        process_changed.wait(lock, [&] { return child_raw->released || console.StopRequested(); });
+        // Bounded, because the parent's other threads are stopped while this waits. A
+        // child that execs promptly -- which is what nearly every fork is for -- releases
+        // in milliseconds. One that does not is a shell running a whole script inside the
+        // fork, and stopping the rest of its parent for that long would look like a hang;
+        // better to let them go and give up the guarantee than to stop answering.
+        const bool released = process_changed.wait_for(
+            lock, std::chrono::seconds(5),
+            [&] { return child_raw->released || console.StopRequested(); });
+        if (!released) {
+            if (auto* parent = Find(caller_pid)) {
+                if (!parent->frozen_threads.empty()) {
+                    FATHOM_WARN("fork: pid %d has held its parent's memory for five seconds; "
+                                "letting pid %d's other threads run again",
+                                child_pid, caller_pid);
+                    ThawThreads(parent);
+                }
+            }
+            process_changed.wait(lock, [&] { return child_raw->released || console.StopRequested(); });
+        }
     }
 
     FATHOM_INFO("fork: pid %d created pid %d", caller_pid, child_pid);

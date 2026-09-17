@@ -3445,6 +3445,15 @@ uint64_t LinuxSyscalls::DoIpc(uint64_t call, uint64_t first, uint64_t second, ui
 
 uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3,
                                uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    // Marks this thread as being inside the syscall layer for as long as it is, so that a
+    // fork elsewhere in this process knows not to freeze it here -- it may be holding a
+    // lock the forking child is about to need.
+    in_runtime_.store(true, std::memory_order_release);
+    struct LeaveRuntime {
+        std::atomic<bool>* flag;
+        ~LeaveRuntime() { flag->store(false, std::memory_order_release); }
+    } leave_runtime {&in_runtime_};
+
     // An i386 guest numbers its syscalls entirely differently -- its 4 is write, where
     // x86-64's 4 is stat -- so the number is translated before anything looks at it, and
     // one implementation of each syscall serves both.

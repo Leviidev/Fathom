@@ -187,6 +187,13 @@ public:
     /// A process whose first thread has returned has to bring its others back before it
     /// can be destroyed: they are still inside the JIT holding references to state that
     /// goes away with it.
+    /// True while this thread is inside the syscall layer rather than running guest code.
+    ///
+    /// A fork freezes the rest of the parent's threads while its child borrows the
+    /// parent's memory, and a thread must not be frozen in here: it may be holding the
+    /// address space's lock or the descriptor table's, and the child needs both to exec.
+    bool InRuntime() const { return in_runtime_.load(std::memory_order_acquire); }
+
     void RequestProcessStop() { process_stopping_->store(true, std::memory_order_release); }
     void ClearProcessStop() { process_stopping_->store(false, std::memory_order_release); }
 
@@ -452,6 +459,7 @@ private:
 
     /// Set for the duration of one i386 time32 syscall. See TimeWidth.
     bool narrow_time_ {};
+    std::atomic<bool> in_runtime_ {false};
 
     /// What prctl(PR_SET_NAME) was told to call this thread.
     std::string thread_name_;

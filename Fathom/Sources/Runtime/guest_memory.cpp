@@ -481,11 +481,18 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
 
     std::vector<GuestRange> survivors;
     survivors.reserve(committed_.size());
+    // Whether anything being given up here was ever something the guest could execute.
+    // Only then is there compiled code to throw away, and throwing it away stops every
+    // thread in the session for the duration -- Chromium's allocator unmaps constantly,
+    // and doing it for each of those unmaps is most of what the session spends its time
+    // on.
+    bool had_code = false;
     for (const auto& range : committed_) {
         if (range.end() <= begin || range.begin >= end) {
             survivors.push_back(range);
             continue;
         }
+        had_code = had_code || (range.protection & kGuestProtExec) != 0;
         if (range.begin < begin) {
             survivors.push_back(GuestRange {range.begin, begin - range.begin, range.protection, range.epoch});
         }
@@ -548,7 +555,7 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
     // Outside the lock: the observer goes into FEXCore, which asks this address space
     // about ranges while it invalidates, and would deadlock on the lock just released.
     lock.unlock();
-    if (release_observer_ != nullptr) {
+    if (had_code && release_observer_ != nullptr) {
         release_observer_(begin, end);
     }
     return true;

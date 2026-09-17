@@ -56,6 +56,10 @@ export LANG="${LANG:-C}"
 # Steam's own runtime is a second copy of a distribution, and this root already is one.
 export STEAMOS=0
 export STEAM_RUNTIME="${STEAM_RUNTIME:-0}"
+# Steam's web helper is started through pressure-vessel, which builds a container out of
+# bubblewrap and user namespaces. Pointed here instead, at an entry point that runs the
+# helper directly under the runtime's own loader -- see usr/local/lib/fathom-steamrt.
+export STEAM_RUNTIME_STEAMRT="${STEAM_RUNTIME_STEAMRT:-/usr/local/lib/fathom-steamrt}"
 
 # Starting a session is starting a machine: the X server's lock, its socket and Steam's
 # pid file all describe a process from the last run that is no longer there. Left alone,
@@ -81,6 +85,79 @@ fi
 exec /root/.local/share/Steam/steam.sh "$@"
 LAUNCHER
 chmod +x "$ROOT/usr/local/bin/fathom-steam"
+
+mkdir -p "$ROOT/usr/local/lib/fathom-steamrt"
+cat > "$ROOT/usr/local/lib/fathom-steamrt/_v2-entry-point" <<'ENTRYPOINT'
+#!/bin/bash
+# Fathom's stand-in for pressure-vessel's entry point.
+#
+# Steam runs its web helper inside a container that pressure-vessel builds with
+# bubblewrap and user namespaces. There are none of those here -- there is no kernel to
+# ask -- so the container is skipped and the helper is run directly. What the container
+# was mostly there for is the runtime's own libraries, and those are on disk either way:
+# the helper is started under that runtime's loader, with its library path, because its
+# glibc and this root's are different versions and a loader can only load the libc it was
+# built against.
+#
+# Reached through STEAM_RUNTIME_STEAMRT, so none of Valve's own files are modified.
+
+# pressure-vessel's own options come first, then "--", then the command.
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        (--) shift; break ;;
+        (*) shift ;;
+    esac
+done
+if [ "$#" -eq 0 ]; then
+    echo "fathom: the steam runtime entry point was given nothing to run" >&2
+    exit 1
+fi
+
+depot="${HOME:-/root}/.local/share/Steam/steamrt64/pv-runtime/steam-runtime-steamrt"
+files=
+for candidate in "$depot"/*/files; do
+    [ -d "$candidate" ] && files="$candidate"
+done
+
+# The depot ships each library under its own file name -- libgobject-2.0.so.0.6600.8,
+# libc-2.31.so -- and nothing under the name a program actually asks for. pressure-vessel
+# makes those links while it builds the container; with no container to build, ldconfig
+# makes them here instead, once. It reads each library's own SONAME, which for glibc's
+# own libraries cannot be worked out from the file name at all.
+links=/usr/local/lib/fathom-steamrt/links
+if [ -n "$files" ] && [ ! -e "$links/.ready" ]; then
+    mkdir -p "$links"
+    for library in "$files"/lib/x86_64-linux-gnu/*.so*; do
+        [ -f "$library" ] && ln -sf "$library" "$links/${library##*/}"
+    done
+    /sbin/ldconfig -n "$links"
+    : > "$links/.ready"
+fi
+
+loader=
+if [ -n "$files" ]; then
+    for candidate in "$links"/ld-linux-x86-64.so.2 "$files"/lib/x86_64-linux-gnu/ld-*.so; do
+        [ -x "$candidate" ] && { loader="$candidate"; break; }
+    done
+fi
+
+# The command Steam passes is a wrapper whose whole job is to set LD_LIBRARY_PATH=. and
+# exec ./steamwebhelper. Done here instead, because the loader has to be named explicitly.
+case "$1" in
+    (*steamwebhelper_sniper_wrap.sh)
+        directory="$(dirname "$1")"
+        shift
+        if [ -n "$loader" ]; then
+            exec "$loader" --library-path "$directory:$links" "$directory/steamwebhelper" "$@"
+        fi
+        export LD_LIBRARY_PATH="$directory:$links${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        exec "$directory/steamwebhelper" "$@"
+        ;;
+esac
+
+exec "$@"
+ENTRYPOINT
+chmod +x "$ROOT/usr/local/lib/fathom-steamrt/_v2-entry-point"
 
 echo "==> checking the root filesystem still works"
 if [[ ! -L "$ROOT/lib" ]]; then

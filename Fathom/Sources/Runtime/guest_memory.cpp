@@ -101,6 +101,23 @@ bool GuestAddressSpace::TakeFreeExtent(uint64_t address, uint64_t size) {
     return false;
 }
 
+namespace {
+
+/// Commits a range of the arena as fresh, zeroed, anonymous memory.
+///
+/// Not mprotect: a guest that mapped a file into the arena left a mapping whose *maximum*
+/// protection is whatever the file allowed, and a read-only file leaves a range that can
+/// never be made writable again. The next program placed there fails to commit with
+/// EACCES, a long way from the mmap that caused it. Mapping over it restores both the
+/// protection ceiling and the guarantee that new guest memory reads as zero.
+bool CommitAnonymous(uint64_t address, uint64_t length, int host_protection) {
+    void* placed = mmap(reinterpret_cast<void*>(address), length, host_protection,
+                        MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return placed != MAP_FAILED && reinterpret_cast<uint64_t>(placed) == address;
+}
+
+} // namespace
+
 void GuestAddressSpace::ReturnFreeExtent(uint64_t address, uint64_t size) {
     Extent freed {address, size};
     auto position = std::lower_bound(free_.begin(), free_.end(), freed,
@@ -138,7 +155,7 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
         const uint64_t aligned_hint = AlignDown(hint);
         if (aligned_hint >= base_ && aligned_hint + length <= base_ + size_ &&
             TakeFreeExtent(aligned_hint, length)) {
-            if (mprotect(reinterpret_cast<void*>(aligned_hint), length, ToHostProtection(protection)) != 0) {
+            if (!CommitAnonymous(aligned_hint, length, ToHostProtection(protection))) {
                 FATHOM_WARN("commit at hint %#llx failed: %s",
                             static_cast<unsigned long long>(aligned_hint), std::strerror(errno));
                 ReturnFreeExtent(aligned_hint, length);
@@ -159,9 +176,12 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
         if (!TakeFreeExtent(address, length)) {
             continue;
         }
-        if (mprotect(reinterpret_cast<void*>(address), length, ToHostProtection(protection)) != 0) {
-            FATHOM_WARN("commit of %llu bytes failed: %s", static_cast<unsigned long long>(length),
-                        std::strerror(errno));
+        if (!CommitAnonymous(address, length, ToHostProtection(protection))) {
+            FATHOM_WARN("commit of %llu bytes at %#llx failed: %s (arena %#llx..%#llx)",
+                        static_cast<unsigned long long>(length),
+                        static_cast<unsigned long long>(address), std::strerror(errno),
+                        static_cast<unsigned long long>(base_),
+                        static_cast<unsigned long long>(base_ + size_));
             ReturnFreeExtent(address, length);
             return 0;
         }
@@ -169,8 +189,18 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
         return address;
     }
 
-    FATHOM_WARN("guest arena exhausted: no free extent for %llu bytes",
-                static_cast<unsigned long long>(length));
+    uint64_t total = 0;
+    uint64_t largest = 0;
+    for (const auto& extent : free_) {
+        total += extent.size;
+        largest = std::max(largest, extent.size);
+    }
+    FATHOM_WARN("guest arena exhausted: no free extent for %llu KB; %llu KB free in %llu "
+                "pieces, largest %llu KB",
+                static_cast<unsigned long long>(length / 1024),
+                static_cast<unsigned long long>(total / 1024),
+                static_cast<unsigned long long>(free_.size()),
+                static_cast<unsigned long long>(largest / 1024));
     return 0;
 }
 
@@ -190,7 +220,7 @@ bool GuestAddressSpace::CommitFixed(uint64_t address, uint64_t size, int protect
         // ELF segments routinely share a host page with the segment before them.
         return ProtectLocked(begin, end - begin, protection);
     }
-    if (mprotect(reinterpret_cast<void*>(begin), end - begin, ToHostProtection(protection)) != 0) {
+    if (!CommitAnonymous(begin, end - begin, ToHostProtection(protection))) {
         FATHOM_ERROR("fixed commit at %#llx (%llu bytes) failed: %s",
                      static_cast<unsigned long long>(begin),
                      static_cast<unsigned long long>(end - begin), std::strerror(errno));
@@ -235,6 +265,33 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
     // sharing its last host page with something being freed dies sixteen bytes below its
     // own stack pointer. So each host page in the span is protected only if nothing that
     // survived this release still overlaps it.
+    // In runs, not page by page. Each mprotect splits the kernel's map of this process,
+    // and a 128MB heap released one 16KB page at a time is eight thousand of them; a few
+    // of those and Darwin stops accepting mprotect at all, with EACCES, which surfaces
+    // much later as a program that cannot be loaded. Consecutive pages that are all free
+    // go in one call, which is almost always the whole span.
+    uint64_t run_begin = 0;
+    uint64_t run_end = 0;
+    const auto flush = [&] {
+        if (run_end <= run_begin) {
+            return;
+        }
+        const uint64_t length = run_end - run_begin;
+        // Mapped fresh rather than protected, which returns the range to exactly the state
+        // the arena was reserved in. Protecting is not enough: a guest that mapped a file
+        // here left a mapping whose *maximum* protection is the file's, and a read-only
+        // file gives a range that can never be made writable again -- so the next program
+        // loaded at that address fails to commit, with EACCES, a long way from the mmap
+        // that caused it. This also drops the pages, which is what the madvise was for.
+        void* fresh = mmap(reinterpret_cast<void*>(run_begin), length, PROT_NONE,
+                           MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (fresh == MAP_FAILED) {
+            FATHOM_WARN("release at %#llx (%llu KB) failed: %s",
+                        static_cast<unsigned long long>(run_begin),
+                        static_cast<unsigned long long>(length / 1024), std::strerror(errno));
+        }
+        run_begin = run_end = 0;
+    };
     for (uint64_t page = begin; page < end; page += page_size_) {
         bool occupied = false;
         for (const auto& range : committed_) {
@@ -244,14 +301,16 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
             }
         }
         if (occupied) {
+            flush();
             continue;
         }
-        if (mprotect(reinterpret_cast<void*>(page), page_size_, PROT_NONE) != 0) {
-            FATHOM_WARN("release protect at %#llx failed: %s",
-                        static_cast<unsigned long long>(page), std::strerror(errno));
+        if (run_end != page) {
+            flush();
+            run_begin = page;
         }
-        madvise(reinterpret_cast<void*>(page), page_size_, MADV_FREE);
+        run_end = page + page_size_;
     }
+    flush();
 
     ReturnFreeExtent(begin, end - begin);
 
@@ -360,6 +419,22 @@ std::vector<GuestRange> GuestAddressSpace::WritableRangesIn(uint64_t begin, uint
         }
     }
     return writable;
+}
+
+void GuestAddressSpace::FreeSpace(uint64_t* total, uint64_t* largest) const {
+    std::scoped_lock lock {mutex_};
+    uint64_t sum = 0;
+    uint64_t biggest = 0;
+    for (const auto& extent : free_) {
+        sum += extent.size;
+        biggest = std::max(biggest, extent.size);
+    }
+    if (total != nullptr) {
+        *total = sum;
+    }
+    if (largest != nullptr) {
+        *largest = biggest;
+    }
 }
 
 uint64_t GuestAddressSpace::EpochAt(uint64_t address) const {

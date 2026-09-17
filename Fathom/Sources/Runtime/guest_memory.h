@@ -125,6 +125,11 @@ public:
     using ReleaseObserver = void (*)(uint64_t host_begin, uint64_t host_end);
     void SetReleaseObserver(ReleaseObserver observer) { release_observer_ = observer; }
 
+    /// How much of the arena is still free, and the largest single run of it. Only for
+    /// reporting: an allocation that fails wants to say whether the arena is full or
+    /// merely shredded.
+    void FreeSpace(uint64_t* total, uint64_t* largest) const;
+
     /// The allocation epoch of whatever covers `address`, or 0 if nothing does.
     uint64_t EpochAt(uint64_t address) const;
 

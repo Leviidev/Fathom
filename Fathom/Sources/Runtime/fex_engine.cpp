@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <vector>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -668,6 +669,12 @@ void ForgetLiveThread(FEXCore::Core::InternalThreadState* thread) {
 /// keeps its cache in the guest's numbering, so each context's own base comes off first.
 std::atomic<uint64_t> g_invalidations {0};
 
+/// How many guest processes have threads suspended, and what could not be thrown away
+/// while they were.
+std::atomic<int> g_freezes {0};
+std::mutex g_deferred_mutex;
+std::vector<std::pair<uint64_t, uint64_t>> g_deferred;
+
 void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
     if (host_end <= host_begin) {
         return;
@@ -680,6 +687,13 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
     static const bool disabled = getenv("FATHOM_NO_INVALIDATE") != nullptr;
     if (disabled) {
         return;
+    }
+    if (g_freezes.load(std::memory_order_acquire) > 0) {
+        std::scoped_lock lock {g_deferred_mutex};
+        if (g_freezes.load(std::memory_order_acquire) > 0) {
+            g_deferred.emplace_back(host_begin, host_end);
+            return;
+        }
     }
     // Counted because throwing compiled code away is not free and it is easy to do far
     // more often than intended: every block dropped is recompiled from scratch, and every
@@ -755,6 +769,24 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
                         static_cast<unsigned long long>(host_end), live.size(),
                         static_cast<long long>(swept));
         }
+    }
+}
+
+void HoldInvalidations() {
+    g_freezes.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void ReleaseInvalidations() {
+    if (g_freezes.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+        return;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> pending;
+    {
+        std::scoped_lock lock {g_deferred_mutex};
+        pending.swap(g_deferred);
+    }
+    for (const auto& [begin, end] : pending) {
+        InvalidateCompiledCode(begin, end);
     }
 }
 

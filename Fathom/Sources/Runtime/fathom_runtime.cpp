@@ -593,7 +593,10 @@ bool fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::Gue
                 all_stopped = false;
                 return;
             }
-            if (syscalls == nullptr || !syscalls->InRuntime()) {
+                if (syscalls == nullptr || !syscalls->InRuntime()) {
+                if (process->frozen_threads.empty()) {
+                    fathom::HoldInvalidations();
+                }
                 process->frozen_threads.push_back(port);
                 return;
             }
@@ -626,10 +629,14 @@ bool fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::Gue
 }
 
 void fathom_session::ThawThreads(GuestProcess* process) {
+    if (process->frozen_threads.empty()) {
+        return;
+    }
     for (const auto port : process->frozen_threads) {
         thread_resume(port);
     }
     process->frozen_threads.clear();
+    fathom::ReleaseInvalidations();
 }
 
 void fathom_session::StopAndJoinOtherThreadsOf(GuestProcess* process) {

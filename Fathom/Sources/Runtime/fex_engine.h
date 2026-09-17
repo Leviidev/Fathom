@@ -112,6 +112,18 @@ private:
 /// without this the new program runs the old program's compiled code.
 void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end);
 
+/// Puts invalidation off until every suspended guest thread is running again.
+///
+/// A fork suspends the parent's other threads so the child can borrow its memory, and a
+/// thread stopped in the middle of the JIT is holding FEXCore's code-invalidation lock
+/// shared. Nothing can take that lock exclusively until it runs again -- and the thaw
+/// that would let it run is on the far side of the child's exec, which is itself waiting
+/// for the lock. Every other guest process waits there too, because there is one lock
+/// for the session. So while anything is suspended, invalidation is recorded rather than
+/// performed, and the ranges are dropped together when the last thread is thawed.
+void HoldInvalidations();
+void ReleaseInvalidations();
+
 class FexEngine {
 public:
     static std::unique_ptr<FexEngine> Create(GuestAddressSpace& space, const EngineOptions& options,

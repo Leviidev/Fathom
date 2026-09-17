@@ -311,6 +311,7 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
 thread_local GuestThread* g_current_guest_thread = nullptr;
 
 /// The guest's arena, so that a signal handler can tell a guest address from any other.
+std::atomic<fathom::GuestAddressSpace*> g_arena_space {nullptr};
 std::atomic<uint64_t> g_arena_begin {0};
 
 std::atomic<uint64_t> g_arena_end {0};
@@ -381,6 +382,23 @@ bool EndFaultedGuestThread(int signal, siginfo_t* info, void* raw_context) {
         const uint64_t end = g_arena_end.load(std::memory_order_acquire);
         if (begin == 0 || address < begin || address >= end) {
             return false;
+        }
+    }
+    // What the guest was reaching for, and what the address space thinks is there. A fault
+    // on memory the arena says is mapped and writable is a different bug from a fault on
+    // memory nothing is mapped at, and from outside they look identical.
+    if (info != nullptr) {
+        const auto address = reinterpret_cast<uint64_t>(info->si_addr);
+        auto* space = g_arena_space.load(std::memory_order_acquire);
+        fathom::GuestRange range {};
+        if (space != nullptr && space->RangeFor(address, &range)) {
+            FATHOM_WARN("guest fault at %#llx: mapped %#llx..%#llx, protection %d",
+                        static_cast<unsigned long long>(address),
+                        static_cast<unsigned long long>(range.begin),
+                        static_cast<unsigned long long>(range.end()), range.protection);
+        } else {
+            FATHOM_WARN("guest fault at %#llx: nothing is mapped there",
+                        static_cast<unsigned long long>(address));
         }
     }
     return g_current_guest_thread->EndOnFault(signal);
@@ -901,6 +919,7 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
     }
 
     // Told before any code is compiled, because it changes every address the JIT emits.
+    g_arena_space.store(&space, std::memory_order_release);
     g_arena_begin.store(space.Base(), std::memory_order_release);
     g_arena_end.store(space.Base() + space.Size(), std::memory_order_release);
     impl->guest_base = options.guest_memory_base;

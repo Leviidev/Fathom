@@ -276,7 +276,16 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     arm_thread_state64_set_fp(state, registers[29]);
     arm_thread_state64_set_lr_fptr(state, reinterpret_cast<void*>(registers[30]));
     arm_thread_state64_set_pc_fptr(state, reinterpret_cast<void*>(pc + *adjustment));
-    g_alignment_fixups.fetch_add(1, std::memory_order_relaxed);
+    // Counted, and reported every so often. Each faulting site is meant to be patched
+    // once and never fault again; a count that keeps climbing says the patches are not
+    // sticking, and that is the difference between memory-ordering emulation costing
+    // nothing and costing most of the run.
+    const auto fixups = g_alignment_fixups.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((fixups & 0xFFFFF) == 0) {
+        FATHOM_INFO("%llu unaligned accesses emulated so far -- an atomic one cannot be\n"
+                    "  patched away, so each execution of it costs a signal",
+                    static_cast<unsigned long long>(fixups));
+    }
     return true;
 #else
     (void)signal;
@@ -539,9 +548,20 @@ void ForgetLiveThread(FEXCore::Core::InternalThreadState* thread) {
 ///
 /// The range is a host one, because that is what the address space deals in; FEXCore
 /// keeps its cache in the guest's numbering, so each context's own base comes off first.
+std::atomic<uint64_t> g_invalidations {0};
+
 void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
     if (host_end <= host_begin) {
         return;
+    }
+    // Counted because throwing compiled code away is not free and it is easy to do far
+    // more often than intended: every block dropped is recompiled from scratch, and every
+    // unaligned access inside it faults again, because the patch that stopped it faulting
+    // was part of the code that was just discarded.
+    const auto count = g_invalidations.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((count & 0x3FF) == 0) {
+        FATHOM_INFO("%llu code invalidations so far",
+                    static_cast<unsigned long long>(count));
     }
     std::vector<LiveThread> live;
     {

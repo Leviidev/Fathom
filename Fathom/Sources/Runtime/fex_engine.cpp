@@ -255,7 +255,6 @@ bool Readable(const void* address, size_t size) {
 /// Declared here and defined below: the fault handler wants to name the guest process
 /// it is reporting on, and the definition sits with the rest of the syscall plumbing.
 extern thread_local LinuxSyscalls* g_current_syscalls;
-size_t DescribeGuestState(char* buffer, size_t capacity);
 
 /// How many times this exact instruction has faulted, roughly.
 ///
@@ -326,11 +325,6 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
         // twenty-seven million signals in five minutes, which is most of the run.
         static std::atomic<uint64_t> wild_fixups {0};
         const auto seen = wild_fixups.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (seen == 1) {
-            char registers_text[1024] = {};
-            DescribeGuestState(registers_text, sizeof(registers_text));
-            FATHOM_WARN("the guest state at the first of them:\n%s", registers_text);
-        }
         if (seen <= 8 || (seen & 0x3FF) == 0) {
             FATHOM_WARN("pid %d tid %d read %p, which is not mapped, from an instruction "
                         "this can step over (%llu so far, guest rip %#llx)",

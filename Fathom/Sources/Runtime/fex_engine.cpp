@@ -252,6 +252,29 @@ bool Readable(const void* address, size_t size) {
     return write(fd, address, size) == static_cast<ssize_t>(size);
 }
 
+/// How many times this exact instruction has faulted, roughly.
+///
+/// A few hundred slots, indexed by address, with no locking and no exactness: two sites
+/// can land in the same slot and the count then belongs to neither of them, which costs
+/// a site the cheaper patch it might have kept. That is the right trade for something on
+/// the fault path, where a mutex would be both a deadlock risk and the cost being
+/// measured.
+uint32_t RepeatedFaultSite(uintptr_t pc) {
+    constexpr size_t kSlots = 512;
+    struct Slot {
+        std::atomic<uintptr_t> pc {0};
+        std::atomic<uint32_t> count {0};
+    };
+    static Slot slots[kSlots];
+    auto& slot = slots[(pc >> 2) % kSlots];
+    if (slot.pc.load(std::memory_order_relaxed) != pc) {
+        slot.pc.store(pc, std::memory_order_relaxed);
+        slot.count.store(1, std::memory_order_relaxed);
+        return 1;
+    }
+    return slot.count.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 /// Fixes up a guest alignment fault and resumes, rather than letting it kill the app.
 ///
 /// x86 lets a program read or write at any address. ARM64 mostly does too -- but not for
@@ -332,14 +355,29 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     const auto writable_pc =
         reinterpret_cast<uintptr_t>(FEXCore::Allocator::GetWritableAddress(reinterpret_cast<void*>(pc)));
 
-    // Half-barrier, not non-atomic. Non-atomic patches more sites permanently and looked
-    // like the answer to a fault storm, but FEXCore declines some instructions outright
-    // in that mode -- and a declined fixup is fatal to the guest process, which is how
-    // Steam's client started dying twenty seconds in. The storm turned out to be wild
-    // reads rather than real alignment faults, and is capped above instead.
-    const auto adjustment = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
-        g_active.thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier,
-        writable_pc, registers.data());
+    // Half-barrier first, and non-atomic for a site that will not stop faulting.
+    //
+    // A half-barrier patch is still an atomic instruction, so where the address really
+    // is unaligned the patched instruction faults again -- every execution, for the life
+    // of the process. Steam reached a hundred and twenty-seven million signals in five
+    // minutes that way, and a signal costs about ninety seconds on a device with a
+    // debugger attached, which JIT requires. Patching to non-atomic instead cannot fault
+    // again, at the cost of atomicity through that site, but FEXCore declines some
+    // instructions outright in that mode and a declined fixup kills the guest process.
+    // So: the ordinary patch for everything, and the lossy one only for the handful of
+    // sites that have proved they need it.
+    auto type = FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier;
+    if (RepeatedFaultSite(pc) > 64) {
+        type = FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic;
+    }
+    auto adjustment = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
+        g_active.thread, type, writable_pc, registers.data());
+    if (!adjustment.has_value() &&
+        type == FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic) {
+        adjustment = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
+            g_active.thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier,
+            writable_pc, registers.data());
+    }
     if (!adjustment.has_value()) {
         return false;
     }

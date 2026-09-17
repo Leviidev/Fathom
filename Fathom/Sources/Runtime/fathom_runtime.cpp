@@ -536,6 +536,24 @@ bool fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::Gue
     // exec. Suspending and looking is the only way to ask without a race -- the answer can
     // change the instant after it is given -- so a thread caught in there is let go and
     // tried again.
+    // Nothing may be halfway through compiling a block when a thread is stopped: the
+    // compiler holds FEXCore's code-invalidation lock while it works, and a thread stopped
+    // holding it takes the whole session with it -- the child's own exec waits on that
+    // lock to load its image, so the thaw that would have freed it never runs.
+    std::string reason;
+    auto* engine = EngineFor(process->is_32bit, reason);
+    if (engine != nullptr) {
+        engine->PauseCompilation();
+    }
+    struct Resume {
+        fathom::FexEngine* engine;
+        ~Resume() {
+            if (engine != nullptr) {
+                engine->ResumeCompilation();
+            }
+        }
+    } resume {engine};
+
     bool all_stopped = true;
     const auto freeze = [&](pthread_t host_thread, const fathom::LinuxSyscalls* syscalls, int tid) {
         const auto port = pthread_mach_thread_np(host_thread);

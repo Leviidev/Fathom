@@ -136,6 +136,16 @@ public:
     /// needs the thread that actually made the call, not the process's first one.
     static GuestThread* Current();
 
+    /// Stops this context compiling anything until the pause is lifted.
+    ///
+    /// Suspending a guest thread that is halfway through compiling a block leaves it
+    /// holding FEXCore's code-invalidation lock, which nothing can then take -- the next
+    /// program load waits on it forever, and because that lock gives writers priority,
+    /// every other thread stops behind it. Waiting for compilation to stop before any
+    /// thread is suspended is what makes stopping them safe.
+    void PauseCompilation();
+    void ResumeCompilation();
+
     static const char* FexRevision();
 
 private:

@@ -806,6 +806,14 @@ GuestThread* FexEngine::Current() {
     return g_current_guest_thread;
 }
 
+void FexEngine::PauseCompilation() {
+    impl_->context->GetCodeInvalidationMutex().lock();
+}
+
+void FexEngine::ResumeCompilation() {
+    impl_->context->GetCodeInvalidationMutex().unlock();
+}
+
 const char* FexEngine::FexRevision() {
 #ifdef GIT_DESCRIBE_STRING
     return GIT_DESCRIBE_STRING;

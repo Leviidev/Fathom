@@ -516,61 +516,87 @@ bool Readable(const void* address, size_t size) {
     return write(fd, address, size) == static_cast<ssize_t>(size);
 }
 
+/// Appends text to a fixed buffer, and says where the next append should start.
+///
+/// Hand-rolled rather than snprintf, because this runs in a signal handler. snprintf is
+/// not async-signal-safe: formatting reaches into the C library's locale machinery,
+/// which takes a lock, and a thread interrupted while holding that lock never gets it
+/// back. That deadlock is worse than the crash it is trying to describe -- the faulting
+/// thread stops inside FEXCore's decoder still holding the code-invalidation lock
+/// shared, and every other guest thread in the session queues behind it forever.
+struct Appender {
+    char* buffer;
+    size_t capacity;
+    size_t used {};
+
+    void Text(const char* text) {
+        while (*text != '\0' && used + 1 < capacity) {
+            buffer[used++] = *text++;
+        }
+        buffer[used] = '\0';
+    }
+
+    void Hex(uint64_t value, int digits) {
+        static const char kDigits[] = "0123456789abcdef";
+        char scratch[17] = {};
+        for (int index = digits - 1; index >= 0; --index) {
+            scratch[digits - 1 - index] = kDigits[(value >> (index * 4)) & 0xF];
+        }
+        Text(scratch);
+    }
+};
+
 size_t DescribeGuestState(char* buffer, size_t capacity) {
     if (g_active.thread == nullptr || buffer == nullptr || capacity == 0) {
         return 0;
     }
     const auto& state = g_active.thread->CurrentFrame->State;
     static const char* kNames[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
-                                   "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
-    int written = std::snprintf(buffer, capacity, "  rip %016llx\n",
-                                static_cast<unsigned long long>(state.rip));
-    for (size_t index = 0; index < 16 && written > 0 && static_cast<size_t>(written) < capacity; ++index) {
-        written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
-                                 "  %-3s %016llx%s", kNames[index],
-                                 static_cast<unsigned long long>(state.gregs[index]),
-                                 (index % 2 == 1) ? "\n" : "");
+                                   "r8 ", "r9 ", "r10", "r11", "r12", "r13", "r14", "r15"};
+    Appender out {buffer, capacity};
+    out.Text("  rip ");
+    out.Hex(state.rip, 16);
+    out.Text("\n");
+    for (size_t index = 0; index < 16; ++index) {
+        out.Text("  ");
+        out.Text(kNames[index]);
+        out.Text(" ");
+        out.Hex(state.gregs[index], 16);
+        out.Text((index % 2 == 1) ? "\n" : "");
     }
 
     // The bytes the guest believes are its next instructions. Worth having in a crash
     // report because the two explanations for a program dying in a function that could
     // not possibly do this look identical from the registers alone: either the data it
     // was given is wrong, or what is at that address is not the code that belongs there.
-    // Comparing these against the file it was loaded from says which.
     const uint64_t host_rip = state.rip + g_current_guest_base;
-    if (written > 0 && static_cast<size_t>(written) + 64 < capacity) {
-        const auto* code = reinterpret_cast<const unsigned char*>(
-            g_active.context == nullptr ? nullptr : reinterpret_cast<const void*>(host_rip));
-        if (!Readable(code, 16)) {
-            code = nullptr;
+    const auto* code = reinterpret_cast<const unsigned char*>(host_rip);
+    if (g_active.context != nullptr && Readable(code, 16)) {
+        out.Text("  code");
+        for (int index = 0; index < 16; ++index) {
+            out.Text(" ");
+            out.Hex(code[index], 2);
         }
-        written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
-                                 "  code");
-        for (int index = 0; index < 16 && code != nullptr; ++index) {
-            written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
-                                     " %02x", code[index]);
-        }
-        written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written), "\n");
+        out.Text("\n");
     }
 
     // And what is on the stack. A guest that has jumped somewhere it should not have gives
     // nothing away in its registers, but the words below its stack pointer are the return
     // addresses of everything that called it -- which is the shape of the path it took.
     const uint64_t stack = state.gregs[FEXCore::X86State::REG_RSP] + g_current_guest_base;
-    if (written > 0 && stack != 0 && Readable(reinterpret_cast<const void*>(stack), 64)) {
-        const auto* words = reinterpret_cast<const uint32_t*>(stack);
-        for (int row = 0; row < 4 && static_cast<size_t>(written) + 80 < capacity; ++row) {
-            written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
-                                     "  stack+%02x", row * 16);
+    const auto* words = reinterpret_cast<const uint32_t*>(stack);
+    if (stack != 0 && Readable(words, 64)) {
+        for (int row = 0; row < 4; ++row) {
+            out.Text("  stack+");
+            out.Hex(static_cast<uint64_t>(row * 16), 2);
             for (int column = 0; column < 4; ++column) {
-                written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
-                                         " %08x", words[row * 4 + column]);
+                out.Text(" ");
+                out.Hex(words[row * 4 + column], 8);
             }
-            written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
-                                     "\n");
+            out.Text("\n");
         }
     }
-    return written < 0 ? 0 : static_cast<size_t>(written);
+    return out.used;
 }
 
 class FathomSyscallHandler final : public FEXCore::HLE::SyscallHandler {

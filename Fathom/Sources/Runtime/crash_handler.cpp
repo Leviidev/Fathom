@@ -23,6 +23,9 @@ namespace fathom {
 namespace {
 
 int g_crash_fd = -1;
+/// A descriptor onto /dev/null, for asking the kernel whether an address is readable:
+/// write() answers EFAULT where a load would raise a second fault inside this handler.
+int g_null_fd = -1;
 std::atomic<FaultRecovery> g_recovery {nullptr};
 std::atomic<GuestStateDescriber> g_describer {nullptr};
 std::atomic<GuestFaultEnder> g_fault_ender {nullptr};
@@ -202,12 +205,18 @@ void Handle(int number, siginfo_t* info, void* context) {
         if (fault == pc) {
             WriteText("\nfaulting instruction: unreadable -- the fault was the fetch itself,"
                       " so this is a jump to an address with no code at it\n");
-        } else {
+        } else if (write(g_null_fd, reinterpret_cast<const void*>(pc), sizeof(uint32_t)) ==
+                   static_cast<ssize_t>(sizeof(uint32_t))) {
             uint32_t instruction = 0;
             std::memcpy(&instruction, reinterpret_cast<const void*>(pc), sizeof(instruction));
             WriteText("\nfaulting instruction: ");
             WriteHex(instruction);
             WriteText("\n");
+        } else {
+            // Not readable. Generated code is mapped execute-only, so this is the normal
+            // answer for a fault inside the JIT -- and reading it anyway faults a second
+            // time, inside this handler, with the signal already blocked.
+            WriteText("\nfaulting instruction: not readable from here\n");
         }
     }
 
@@ -309,6 +318,9 @@ extern "C" void fathom_install_crash_handler(const char* log_path) {
     action.sa_flags = SA_SIGINFO;
     sigemptyset(&action.sa_mask);
 
+    if (fathom::g_null_fd < 0) {
+        fathom::g_null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    }
     for (const int number : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP}) {
         sigaction(number, &action, nullptr);
     }

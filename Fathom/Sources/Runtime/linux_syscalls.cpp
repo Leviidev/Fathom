@@ -887,6 +887,10 @@ void LinuxSyscalls::ShareInto(LinuxSyscalls& thread) const {
 }
 
 void LinuxSyscalls::AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const std::string& path) {
+    // A new program starts with all three of i386's thread-local slots free. Carrying the
+    // count across an exec means a process that has exec'd a few times is told there are
+    // none left, and its loader gives up with "cannot set up thread-local storage".
+    next_tls_entry_ = 12;
     InitialiseHeap(heap_base, heap_reserved);
     config_.work_dir = path;
     program_path_ = path;
@@ -2494,8 +2498,10 @@ uint64_t LinuxSyscalls::DoSetThreadArea(uint64_t descriptor_address) {
     uint32_t entry = descriptor[0];
     if (entry == 0xFFFF'FFFFU) {
         // "Any free one." Linux picks a slot and writes the number back, and glibc reads
-        // it to build the selector it loads into %gs.
+        // it to build the selector it loads into %gs. Three is all i386 has; asking for a
+        // fourth is the caller's own bug, and telling it so is what Linux does.
         if (next_tls_entry_ > 14) {
+            FATHOM_WARN("set_thread_area: all three thread-local slots are already taken");
             return FailLinux(22);
         }
         entry = next_tls_entry_++;

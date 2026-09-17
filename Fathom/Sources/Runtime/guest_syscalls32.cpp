@@ -115,10 +115,16 @@ int64_t X86_64SyscallForI386(uint64_t i386_number) {
         {132, 121},  // getpgid
         {147, 124},  // getsid
         {148, 75},   // fdatasync
+        {96, 140},   // getpriority
+        {97, 141},   // setpriority
         {150, 149},  // mlock
         {151, 150},  // munlock
         {152, 151},  // mlockall
         {153, 152},  // munlockall
+        {154, 142},  // sched_setparam
+        {155, 143},  // sched_getparam
+        {156, 144},  // sched_setscheduler
+        {157, 145},  // sched_getscheduler
         {158, 24},   // sched_yield
         {159, 146},  // sched_get_priority_max
         {160, 147},  // sched_get_priority_min
@@ -159,6 +165,7 @@ int64_t X86_64SyscallForI386(uint64_t i386_number) {
         {237, 199},  // fremovexattr
         {238, 200},  // tkill
         {239, 40},   // sendfile64 -> sendfile
+        {241, 203},  // sched_setaffinity
         {242, 203},  // sched_setaffinity
         {250, 221},  // fadvise64
         {254, 213},  // epoll_create

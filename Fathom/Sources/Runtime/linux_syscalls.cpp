@@ -270,6 +270,14 @@ enum : uint64_t {
     kSysSigaltstack = 131,
     kSysStatfs = 137,
     kSysFstatfs = 138,
+    kSysGetpriority = 140,
+    kSysSetpriority = 141,
+    kSysSchedSetparam = 142,
+    kSysSchedGetparam = 143,
+    kSysSchedSetscheduler = 144,
+    kSysSchedGetscheduler = 145,
+    kSysSchedGetPriorityMax = 146,
+    kSysSchedGetPriorityMin = 147,
     kSysSchedGetaffinity = 204,
     kSysArchPrctl = 158,
     kSysGettid = 186,
@@ -672,6 +680,15 @@ const char* SyscallName(uint64_t number) {
     case kSysGetgroups: return "getgroups";
     case kSysSetgroups: return "setgroups";
     case kSysWaitid: return "waitid";
+    case kSysGetpriority: return "getpriority";
+    case kSysSetpriority: return "setpriority";
+    case kSysSchedSetparam: return "sched_setparam";
+    case kSysSchedGetparam: return "sched_getparam";
+    case kSysSchedSetscheduler: return "sched_setscheduler";
+    case kSysSchedGetscheduler: return "sched_getscheduler";
+    case kSysSchedGetPriorityMax: return "sched_get_priority_max";
+    case kSysSchedGetPriorityMin: return "sched_get_priority_min";
+    case kSysFaccessat2: return "faccessat2";
     case kSysSchedSetaffinity: return "sched_setaffinity";
     case kSysRecvmmsg: return "recvmmsg";
     case kSysSendmmsg: return "sendmmsg";
@@ -4229,6 +4246,34 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
 
     case kSysSchedYield:
         sched_yield();
+        return 0;
+
+    // Scheduling, answered rather than refused. Nothing here can change how this host
+    // schedules a guest thread -- they are ordinary threads of one process and Darwin
+    // decides -- but a program that is told "not implemented" concludes something is
+    // seriously wrong: Steam prints a warning for every thread it starts, and Chromium's
+    // renderer treats a failed priority change as a reason to log and retry.
+    case kSysSetpriority:
+    case kSysSchedSetparam:
+    case kSysSchedSetscheduler:
+        return 0;
+    case kSysGetpriority:
+        return 20; // nice 0, in the encoding getpriority uses on Linux.
+    case kSysSchedGetscheduler:
+        return 0; // SCHED_OTHER
+    case kSysSchedGetparam: {
+        // One field, sched_priority, and it is zero for SCHED_OTHER.
+        void* out = GuestPointer(arg2, sizeof(int32_t), true);
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        const int32_t priority = 0;
+        std::memcpy(out, &priority, sizeof(priority));
+        return 0;
+    }
+    case kSysSchedGetPriorityMax:
+    case kSysSchedGetPriorityMin:
+        // SCHED_OTHER is the only policy here, and its range is zero to zero.
         return 0;
 
     case kSysGetrandom: {

@@ -367,6 +367,25 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
         return 0;
     }
 
+    // Anything this hands out is memory with new contents, whoever had it before. Blocks
+    // compiled from what used to be there have to go, or the next program to run at that
+    // address runs the last one's code -- which does not look like a stale cache from the
+    // outside, it looks like a jump into nonsense. Collected here and done once the lock
+    // is dropped, because the observer goes into FEXCore and FEXCore asks this class
+    // questions.
+    uint64_t fresh_begin = 0;
+    uint64_t fresh_end = 0;
+    struct Notify {
+        GuestAddressSpace* space;
+        uint64_t* begin;
+        uint64_t* end;
+        ~Notify() {
+            if (*end > *begin && space->release_observer_ != nullptr) {
+                space->release_observer_(*begin, *end);
+            }
+        }
+    } notify {this, &fresh_begin, &fresh_end};
+
     std::unique_lock lock {mutex_};
     const uint64_t length = AlignUp(size);
 
@@ -382,6 +401,9 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
                 return 0;
             }
             RecordCommitted(aligned_hint, length, protection);
+            fresh_begin = aligned_hint;
+            fresh_end = aligned_hint + length;
+            lock.unlock();
             return aligned_hint;
         }
     }
@@ -407,6 +429,9 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
             return 0;
         }
         RecordCommitted(address, length, protection);
+        fresh_begin = address;
+        fresh_end = address + length;
+        lock.unlock();
         return address;
     }
 
@@ -464,6 +489,10 @@ bool GuestAddressSpace::CommitFixed(uint64_t address, uint64_t size, int protect
         return false;
     }
     RecordCommitted(begin, end - begin, protection);
+    lock.unlock();
+    if (release_observer_ != nullptr) {
+        release_observer_(begin, end);
+    }
     return true;
 }
 

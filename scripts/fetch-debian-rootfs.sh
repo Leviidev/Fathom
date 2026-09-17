@@ -23,10 +23,13 @@ fi
 # Steam's own Depends line names these. xz-utils matters most: Debian's tar shells out to
 # an external xz for a .tar.xz, and the Steam bootstrap is exactly that -- without it tar
 # reports "xz: Cannot exec" and the installation stops before it starts.
-PACKAGES="${PACKAGES:-xz-utils python3 ca-certificates file libgl1-mesa-dri libglx-mesa0 libgl1 libegl1 libgbm1}"
-# The Mesa packages are for the 64-bit side: Steam's web helper is Chromium, it asks
-# for GL before it draws anything, and the i386 drivers the client uses are no help to
-# it. Without them it stops at "MESA-LOADER: failed to open swrast".
+PACKAGES="${PACKAGES:-xz-utils python3 ca-certificates file}"
+# Deliberately no 64-bit Mesa. Steam's web helper runs against the Steam runtime's own
+# glibc, and this root filesystem's is a different version; installing Mesa here makes the
+# helper's libGL load a driver from this root, which drags this root's glibc into a process
+# already running the runtime's -- and GObject's type system, which keeps its state in
+# whichever copy initialised it, falls apart. The helper is told not to look for GL at all
+# instead (see setup-steam-rootfs.sh).
 
 echo "==> building an image from $IMAGE with: $PACKAGES"
 docker rm -f fathom-debian-build fathom-debian-export >/dev/null 2>&1 || true

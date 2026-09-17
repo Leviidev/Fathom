@@ -162,13 +162,25 @@ case "$1" in
         # from it. A fork here shares its parent's memory rather than copying it, and the
         # zygote is forked out of a browser process that already has a dozen threads, so
         # the child comes up holding locks nothing will ever release. Without the zygote
+        # each child is started with fork and exec straight away.
+        #
+        # --disable-gpu: there is no GL here for a 64-bit program. Left to look, the
+        # helper's libGL loads a driver out of this root filesystem, which is built
+        # against a different glibc from the one the helper is running -- two C libraries
+        # in one process, and GLib's type system stops working. Chromium draws in
+        # software instead, which is what it does on any machine without a GPU.
+        extra="--no-zygote --disable-gpu --disable-gpu-compositing --disable-software-rasterizer"
+        # --no-zygote: Chromium normally forks a zygote early and forks every renderer
+        # from it. A fork here shares its parent's memory rather than copying it, and the
+        # zygote is forked out of a browser process that already has a dozen threads, so
+        # the child comes up holding locks nothing will ever release. Without the zygote
         # each child is started with fork and exec straight away, which is the path
         # everything else in this root already takes.
         if [ -n "$loader" ]; then
-            exec "$loader" --library-path "$directory:$links" "$directory/steamwebhelper" "$@" --no-zygote
+            exec "$loader" --library-path "$directory:$links" "$directory/steamwebhelper" "$@" $extra
         fi
         export LD_LIBRARY_PATH="$directory:$links${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-        exec "$directory/steamwebhelper" "$@" --no-zygote
+        exec "$directory/steamwebhelper" "$@" $extra
         ;;
 esac
 

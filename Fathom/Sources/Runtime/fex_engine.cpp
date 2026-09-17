@@ -817,6 +817,35 @@ void InvalidateCompiledCodeLater(uint64_t host_begin, uint64_t host_end) {
     Queue({{host_begin, host_end}});
 }
 
+void DescribeCodeLocks(char* buffer, size_t capacity) {
+    if (buffer == nullptr || capacity == 0) {
+        return;
+    }
+    buffer[0] = '\0';
+    std::unique_lock lock {g_live_threads_mutex, std::try_to_lock};
+    if (!lock.owns_lock()) {
+        std::snprintf(buffer, capacity, "busy");
+        return;
+    }
+    std::set<FEXCore::Context::Context*> seen;
+    size_t written = 0;
+    for (const auto& entry : g_live_threads) {
+        if (entry.context == nullptr || !seen.insert(entry.context).second) {
+            continue;
+        }
+        const uint32_t state = entry.context->GetCodeInvalidationMutex().State();
+        const int added = std::snprintf(buffer + written, capacity - written,
+                                        "%s%u readers, %u writers waiting%s",
+                                        written == 0 ? "" : "; ", state & 0xFFFFu,
+                                        (state >> 16) & 0x7FFFu,
+                                        (state & 0x80000000u) != 0 ? ", write-owned" : "");
+        if (added <= 0 || written + static_cast<size_t>(added) >= capacity) {
+            return;
+        }
+        written += static_cast<size_t>(added);
+    }
+}
+
 void HoldInvalidations() {
     g_freezes.fetch_add(1, std::memory_order_acq_rel);
 }

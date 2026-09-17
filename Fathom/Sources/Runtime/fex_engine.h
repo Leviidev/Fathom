@@ -129,6 +129,12 @@ void ReleaseInvalidations();
 /// that must not stop here. The range is dropped as soon as nothing is suspended.
 void InvalidateCompiledCodeLater(uint64_t host_begin, uint64_t host_end);
 
+/// The code-invalidation lock's raw state, for the watchdog. Readers in the low bits,
+/// waiting writers above them, and the top bit set while a writer owns it. A session
+/// that has stopped with a writer waiting and a reader count that never falls is a
+/// reader that went away without letting go.
+void DescribeCodeLocks(char* buffer, size_t capacity);
+
 class FexEngine {
 public:
     static std::unique_ptr<FexEngine> Create(GuestAddressSpace& space, const EngineOptions& options,

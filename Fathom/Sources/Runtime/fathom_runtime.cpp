@@ -567,6 +567,16 @@ bool fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::Gue
     // compiler holds FEXCore's code-invalidation lock while it works, and a thread stopped
     // holding it takes the whole session with it -- the child's own exec waits on that
     // lock to load its image, so the thaw that would have freed it never runs.
+    // A way to ask what suspending threads is costing. Stopping a thread at an arbitrary
+    // instruction stops it wherever it happens to be, including inside the JIT holding a
+    // lock the rest of the session needs, and no amount of care at the point of stopping
+    // can make that safe. With this set nothing is suspended: the fork keeps only the
+    // caller's own stack, which is the same degraded mode a thread that would not stop
+    // already produces.
+    static const bool freeze_disabled = getenv("FATHOM_NO_FREEZE") != nullptr;
+    if (freeze_disabled) {
+        return false;
+    }
     std::string reason;
     auto* engine = EngineFor(process->is_32bit, reason);
     if (engine != nullptr) {
@@ -1144,6 +1154,11 @@ void fathom_session::StartWatchdog() {
                     return;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            char locks[192] = {};
+            fathom::DescribeCodeLocks(locks, sizeof(locks));
+            if (locks[0] != '\0') {
+                FATHOM_INFO("watchdog: code lock: %s", locks);
             }
             std::unique_lock lock {process_mutex, std::try_to_lock};
             if (!lock.owns_lock()) {

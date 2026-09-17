@@ -3333,6 +3333,18 @@ bool LinuxSyscalls::ProcFileContents(const std::string& guest_path, std::string*
         *out = "0\n";
         return true;
     }
+    // How many files may be watched at once. The number is arbitrary -- nothing here ever
+    // reports a change -- but a program that cannot read it says so and sizes itself for
+    // the worst.
+    if (guest_path == "/proc/sys/fs/inotify/max_user_watches") {
+        *out = "524288\n";
+        return true;
+    }
+    if (guest_path == "/proc/sys/fs/inotify/max_user_instances" ||
+        guest_path == "/proc/sys/fs/inotify/max_queued_events") {
+        *out = "128\n";
+        return true;
+    }
     if (guest_path == "/proc/version") {
         *out = "Linux version 6.6.0-fathom (fathom@fathom) (gcc version 12.2.0) #1 SMP Fathom\n";
         return true;

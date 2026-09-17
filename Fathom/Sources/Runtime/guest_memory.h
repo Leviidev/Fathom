@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -180,7 +181,11 @@ private:
     ReleaseObserver release_observer_ {};
     uint64_t next_epoch_ {1};
 
-    mutable std::mutex mutex_;
+    /// Shared, because nearly every use of this class is a question rather than a change:
+    /// a pointer handed to a syscall is checked against it, and with thirty guest threads
+    /// making syscalls at once an exclusive lock here is the whole session's speed limit.
+    /// An X server sharing a session with Steam simply stopped answering.
+    mutable std::shared_mutex mutex_;
     uint64_t base_ {};
     uint64_t size_ {};
     uint64_t page_size_ {};

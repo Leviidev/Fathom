@@ -431,6 +431,17 @@ struct fathom_session final : fathom::ProcessHost {
         std::scoped_lock lock {message_mutex};
         return message;
     }
+
+    /// Says, every few seconds, what every guest process and thread is doing.
+    ///
+    /// A guest that has stopped making progress and a guest that is working hard look
+    /// identical from outside -- the log simply stops -- and the interesting case is
+    /// usually a process waiting for another one that is waiting for it. Started only
+    /// when FATHOM_WATCHDOG names an interval in seconds.
+    std::thread watchdog;
+    std::atomic<bool> watchdog_stopping {false};
+    void StartWatchdog();
+    void StopWatchdog();
 };
 
 // ---------------------------------------------------------------------------
@@ -987,6 +998,66 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
                 static_cast<unsigned long long>(record_raw->thread->Rip()),
                 static_cast<unsigned long long>(flags), static_cast<unsigned long long>(tls));
     return tid;
+}
+
+void fathom_session::StartWatchdog() {
+    const char* setting = getenv("FATHOM_WATCHDOG");
+    if (setting == nullptr) {
+        return;
+    }
+    const int seconds = std::atoi(setting);
+    if (seconds <= 0) {
+        return;
+    }
+    watchdog = std::thread {[this, seconds] {
+        std::map<int, uint64_t> previous;
+        while (!watchdog_stopping.load(std::memory_order_acquire)) {
+            for (int slept = 0; slept < seconds * 10; ++slept) {
+                if (watchdog_stopping.load(std::memory_order_acquire)) {
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            std::unique_lock lock {process_mutex, std::try_to_lock};
+            if (!lock.owns_lock()) {
+                FATHOM_INFO("watchdog: the process table is busy");
+                continue;
+            }
+            for (const auto& [pid, process] : processes) {
+                if (process == nullptr || process->finished) {
+                    continue;
+                }
+                const uint64_t rip = process->thread == nullptr ? 0 : process->thread->Rip();
+                const bool moved = previous[pid] != rip;
+                previous[pid] = rip;
+                FATHOM_INFO("watchdog: pid %d (%s) in syscall %llu, rip %#llx%s", pid,
+                            process->path.c_str(),
+                            static_cast<unsigned long long>(process->syscalls == nullptr
+                                                                ? 0
+                                                                : process->syscalls->CurrentSyscall()),
+                            static_cast<unsigned long long>(rip), moved ? "" : " (unchanged)");
+                for (const auto& thread : process->threads) {
+                    if (!thread->started || thread->finished.load(std::memory_order_acquire)) {
+                        continue;
+                    }
+                    FATHOM_INFO("watchdog:   tid %d in %llu, rip %#llx", thread->tid,
+                                static_cast<unsigned long long>(thread->syscalls == nullptr
+                                                                    ? 0
+                                                                    : thread->syscalls->CurrentSyscall()),
+                                static_cast<unsigned long long>(thread->thread == nullptr
+                                                                    ? 0
+                                                                    : thread->thread->Rip()));
+                }
+            }
+        }
+    }};
+}
+
+void fathom_session::StopWatchdog() {
+    watchdog_stopping.store(true, std::memory_order_release);
+    if (watchdog.joinable()) {
+        watchdog.join();
+    }
 }
 
 int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
@@ -1815,6 +1886,7 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     session->state.store(FATHOM_STATE_IDLE);
     session->SetMessage("ready");
     FATHOM_INFO("session ready for %s", session->program_path.c_str());
+    session->StartWatchdog();
     return session.release();
 }
 
@@ -1939,6 +2011,7 @@ void fathom_session_destroy(fathom_session* session) {
     if (session == nullptr) {
         return;
     }
+    session->StopWatchdog();
     // Ordering matters. Every process holds a FEXCore thread that can still call into
     // its syscall layer, and those hold descriptors into the address space, so the
     // processes go first -- and any still running are stopped and joined before their

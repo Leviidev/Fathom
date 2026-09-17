@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <shared_mutex>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -51,7 +52,7 @@ bool GuestAddressSpace::AdoptExternalMapping(uint64_t address, uint64_t size, in
     if (size == 0) {
         return false;
     }
-    std::scoped_lock lock {mutex_};
+    std::unique_lock lock {mutex_};
     external_.push_back(Extent {address, size});
     RecordCommitted(address, size, protection);
     return true;
@@ -366,7 +367,7 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
         return 0;
     }
 
-    std::scoped_lock lock {mutex_};
+    std::unique_lock lock {mutex_};
     const uint64_t length = AlignUp(size);
 
     if (hint != 0) {
@@ -429,7 +430,7 @@ bool GuestAddressSpace::CommitFixed(uint64_t address, uint64_t size, int protect
         return false;
     }
 
-    std::scoped_lock lock {mutex_};
+    std::unique_lock lock {mutex_};
     const uint64_t begin = AlignDown(address);
     const uint64_t end = AlignUp(address + size);
     if (begin < base_ || end > base_ + size_) {
@@ -553,7 +554,7 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
 }
 
 bool GuestAddressSpace::Protect(uint64_t address, uint64_t size, int protection) {
-    std::scoped_lock lock {mutex_};
+    std::unique_lock lock {mutex_};
     return ProtectLocked(address, size, protection);
 }
 
@@ -621,7 +622,7 @@ bool GuestAddressSpace::ProtectLocked(uint64_t address, uint64_t size, int prote
 }
 
 std::vector<GuestRange> GuestAddressSpace::WritableRanges() const {
-    std::scoped_lock lock {mutex_};
+    std::shared_lock lock {mutex_};
     std::vector<GuestRange> writable;
     writable.reserve(committed_.size());
     for (const auto& range : committed_) {
@@ -633,7 +634,7 @@ std::vector<GuestRange> GuestAddressSpace::WritableRanges() const {
 }
 
 std::vector<GuestRange> GuestAddressSpace::WritableRangesIn(uint64_t begin, uint64_t end) const {
-    std::scoped_lock lock {mutex_};
+    std::shared_lock lock {mutex_};
     std::vector<GuestRange> writable;
     for (size_t index = FirstRangeEndingAfter(begin); index < committed_.size(); ++index) {
         const auto& range = committed_[index];
@@ -653,7 +654,7 @@ std::vector<GuestRange> GuestAddressSpace::WritableRangesIn(uint64_t begin, uint
 }
 
 void GuestAddressSpace::FreeSpace(uint64_t* total, uint64_t* largest) const {
-    std::scoped_lock lock {mutex_};
+    std::shared_lock lock {mutex_};
     uint64_t sum = 0;
     uint64_t biggest = 0;
     for (const auto& extent : free_) {
@@ -686,7 +687,7 @@ bool GuestAddressSpace::RestoreIfUnchanged(uint64_t address, const void* bytes, 
         }
         return false;
     };
-    std::scoped_lock lock {mutex_};
+    std::shared_lock lock {mutex_};
     uint64_t cursor = address;
     const uint64_t end = address + size;
     for (size_t index = FirstRangeEndingAfter(cursor); index < committed_.size(); ++index) {
@@ -721,7 +722,7 @@ bool GuestAddressSpace::RestoreIfUnchanged(uint64_t address, const void* bytes, 
 }
 
 uint64_t GuestAddressSpace::EpochAt(uint64_t address) const {
-    std::scoped_lock lock {mutex_};
+    std::shared_lock lock {mutex_};
     const size_t index = FirstRangeEndingAfter(address);
     if (index < committed_.size() && committed_[index].begin <= address) {
         return committed_[index].epoch;
@@ -741,7 +742,7 @@ bool GuestAddressSpace::Validate(uint64_t address, uint64_t size, int required) 
         return false;
     }
 
-    std::scoped_lock lock {mutex_};
+    std::shared_lock lock {mutex_};
     uint64_t cursor = address;
     const uint64_t end = address + size;
     for (size_t index = FirstRangeEndingAfter(cursor); index < committed_.size(); ++index) {
@@ -761,7 +762,7 @@ bool GuestAddressSpace::Validate(uint64_t address, uint64_t size, int required) 
 }
 
 bool GuestAddressSpace::RangeFor(uint64_t address, GuestRange* out) const {
-    std::scoped_lock lock {mutex_};
+    std::shared_lock lock {mutex_};
     for (const auto& range : committed_) {
         if (address >= range.begin && address < range.end()) {
             if (out != nullptr) {
@@ -774,12 +775,12 @@ bool GuestAddressSpace::RangeFor(uint64_t address, GuestRange* out) const {
 }
 
 std::vector<GuestRange> GuestAddressSpace::Snapshot() const {
-    std::scoped_lock lock {mutex_};
+    std::shared_lock lock {mutex_};
     return committed_;
 }
 
 uint64_t GuestAddressSpace::CommittedBytes() const {
-    std::scoped_lock lock {mutex_};
+    std::shared_lock lock {mutex_};
     uint64_t total = 0;
     for (const auto& range : committed_) {
         total += range.size;

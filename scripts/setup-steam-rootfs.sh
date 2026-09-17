@@ -81,6 +81,13 @@ rm -rf /tmp/.X0-lock /tmp/.X11-unix /tmp/fb /tmp/.fathom-abstract
 # time -- so the lock always appears to belong to something still alive, and the web
 # helper spends its startup trying to hand over to an instance that is not there.
 rm -rf /tmp/.com.valvesoftware.Steam.*
+# And the half of that lock that lives in the profile. It is a symlink naming the process
+# that held it -- "fathom-83" -- and process numbers here start again from the same place
+# every session, so the web helper reads it, finds a process 83 alive, decides that is
+# another copy of itself holding the profile, and waits for a copy that does not exist.
+rm -f "$HOME/.local/share/Steam/config/htmlcache/SingletonLock" \
+      "$HOME/.local/share/Steam/config/htmlcache/SingletonCookie" \
+      "$HOME/.local/share/Steam/config/htmlcache/SingletonSocket"
 rm -f "$HOME/.steampid" "$HOME/.steam/steam.pid" "$HOME/.steam/steam.pipe"
 mkdir -p /tmp/fb /tmp/.X11-unix /tmp/.ICE-unix
 chmod 1777 /tmp/.X11-unix /tmp/.ICE-unix

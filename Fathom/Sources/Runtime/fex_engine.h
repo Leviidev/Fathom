@@ -88,7 +88,8 @@ public:
     // GuestThreadControl
     void SetFsBase(uint64_t base) override;
     uint64_t GetFsBase() const override;
-    void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit) override;
+    void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit,
+                          bool point_gs_at_it = false) override;
     uint64_t GuestRip() const override { return Rip(); }
 
     /// Unwinds this thread out of the JIT with a fatal signal recorded, so that the guest

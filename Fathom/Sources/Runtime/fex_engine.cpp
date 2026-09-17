@@ -1190,7 +1190,8 @@ uint64_t GuestThread::GetFsBase() const {
     return impl_->thread == nullptr ? 0 : impl_->thread->CurrentFrame->State.fs_cached;
 }
 
-void GuestThread::SetTlsDescriptor(int entry, uint32_t base, uint32_t limit) {
+void GuestThread::SetTlsDescriptor(int entry, uint32_t base, uint32_t limit,
+                                   bool point_gs_at_it) {
     if (impl_->thread == nullptr || entry < 0 || entry >= kGdtEntries) {
         return;
     }
@@ -1207,6 +1208,19 @@ void GuestThread::SetTlsDescriptor(int entry, uint32_t base, uint32_t limit) {
     // The guest loads %gs from this entry immediately afterwards, and that load recomputes
     // the cached base itself. Refreshing it here matters only when the entry it is
     // rewriting is the one %gs already points at, which is what a second thread does.
+    //
+    // A thread created by clone never does that load at all. Linux hands it a register
+    // file copied from its parent, with %gs already holding the TLS selector, and sets
+    // the base behind that selector to the one the clone asked for; the thread resumes
+    // at the instruction after the clone and simply uses it. Here the register file is
+    // new and zeroed, so %gs points at entry zero with a base of zero -- and every
+    // thread-local read in that thread lands a hundred or so bytes below address zero,
+    // which is the top of the address space. glibc's stack canary lives in thread-local
+    // storage, so this reads as "*** stack smashing detected ***" a long way from the
+    // thread that has the problem.
+    if (point_gs_at_it) {
+        state.gs_idx = static_cast<uint16_t>((entry << 3) | 3);
+    }
     if ((state.gs_idx >> 3) == entry) {
         state.gs_cached = FEXCore::Core::CPUState::CalculateGDTBase(*descriptor);
     }

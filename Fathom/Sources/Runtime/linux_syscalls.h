@@ -48,7 +48,13 @@ public:
     /// 32-bit guest does what a 64-bit one does with arch_prctl: set_thread_area fills in
     /// a descriptor, and the guest then loads %gs with (entry << 3) | 3 so that every
     /// %gs-relative access lands on its thread's storage. `base` is a guest address.
-    virtual void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit) = 0;
+    /// `point_gs_at_it` also loads %gs with that entry's selector, which is what the
+    /// kernel does for a thread created with CLONE_SETTLS: the new thread never executes
+    /// a segment load of its own, so unless %gs is pointed at its descriptor here it
+    /// keeps whatever the register file was created with -- a base of zero, which turns
+    /// every thread-local read into an address near the top of the address space.
+    virtual void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit,
+                                  bool point_gs_at_it = false) = 0;
 
     /// Where the guest is, for a trace line. A syscall's number says what a program
     /// asked for; the address it asked from says which of its several callers did.

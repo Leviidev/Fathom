@@ -108,9 +108,10 @@ public:
 
     uint64_t GuestRip() const override { return target_ == nullptr ? 0 : target_->GuestRip(); }
 
-    void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit) override {
+    void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit,
+                          bool point_gs_at_it = false) override {
         if (target_ != nullptr) {
-            target_->SetTlsDescriptor(entry, base, limit);
+            target_->SetTlsDescriptor(entry, base, limit, point_gs_at_it);
         }
     }
 
@@ -1054,7 +1055,8 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
                     const uint32_t limit = (descriptor[3] & kLimitInPages) != 0
                                                ? descriptor[2]
                                                : descriptor[2] >> 12;
-                    record->control->SetTlsDescriptor(static_cast<int>(entry), descriptor[1], limit);
+                    record->control->SetTlsDescriptor(static_cast<int>(entry), descriptor[1],
+                                                      limit, true);
                     // The TCB header's first words are the thread pointer, the stack
                     // guard and the pointer guard. glibc mangles the stack pointer and
                     // return address it stores in a jmp_buf against that pointer guard, so

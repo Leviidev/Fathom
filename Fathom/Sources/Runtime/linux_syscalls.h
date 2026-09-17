@@ -252,6 +252,11 @@ public:
     /// would sweep up the memory of unrelated ones.
     std::vector<std::pair<uint64_t, uint64_t>> Mappings() const;
 
+    /// The parts of [begin, end) that another guest process shares. A fork must not copy
+    /// and restore these: the bytes belong to every process that mapped the same file,
+    /// and putting a copy back undoes what the others wrote meanwhile.
+    static std::vector<std::pair<uint64_t, uint64_t>> SharedRangesIn(uint64_t begin, uint64_t end);
+
     /// The writable parts of the images this process has mapped -- every loaded library's
     /// data and bss. This is where a C library keeps the things that belong to the process
     /// rather than to any one thread: malloc's arenas, the list of live thread stacks, the

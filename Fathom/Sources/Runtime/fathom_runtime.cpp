@@ -1473,10 +1473,29 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
             // Copying read-only memory would be pointless -- nothing can change it -- and
             // trying to write it back afterwards would fault.
             for (const auto& piece : space->WritableRangesIn(from, to)) {
-                const auto* bytes = reinterpret_cast<const uint8_t*>(piece.begin);
-                child->borrowed.push_back(
-                    {piece.begin, piece.epoch, std::vector<uint8_t>(bytes, bytes + piece.size)});
-                held += piece.size;
+                // Minus anything shared with another process. Those bytes are not the
+                // parent's alone, so a copy of them put back at the child's exec undoes
+                // whatever the other process wrote in between -- which on Steam is the
+                // client rewinding the segment it talks to its web helper through, and
+                // the helper then dying on a pointer into memory that moved back.
+                uint64_t cursor = piece.begin;
+                const uint64_t finish = piece.begin + piece.size;
+                auto shared = fathom::LinuxSyscalls::SharedRangesIn(cursor, finish);
+                std::sort(shared.begin(), shared.end());
+                const auto take = [&](uint64_t from_here, uint64_t to_here) {
+                    if (to_here <= from_here) {
+                        return;
+                    }
+                    const auto* bytes = reinterpret_cast<const uint8_t*>(from_here);
+                    child->borrowed.push_back({from_here, piece.epoch,
+                                               std::vector<uint8_t>(bytes, bytes + (to_here - from_here))});
+                    held += to_here - from_here;
+                };
+                for (const auto& [shared_begin, shared_end] : shared) {
+                    take(cursor, std::min(shared_begin, finish));
+                    cursor = std::max(cursor, shared_end);
+                }
+                take(cursor, finish);
             }
         }
 

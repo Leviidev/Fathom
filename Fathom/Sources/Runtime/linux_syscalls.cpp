@@ -839,6 +839,33 @@ void NoteSharedMapping(uint64_t begin, uint64_t length, int host_fd, uint64_t of
     }
 }
 
+/// The parts of [begin, end) that are shared with another guest process.
+///
+/// A fork copies the parent's writable memory and puts it back when the child execs, and
+/// memory mapped MAP_SHARED must be left out of that: the bytes in it belong to every
+/// process that mapped the same file, so putting a copy back undoes whatever the others
+/// wrote while the child was running. On Steam that is the client's IPC segment with its
+/// web helper, and the helper follows a pointer the client's fork has just rewound.
+std::vector<std::pair<uint64_t, uint64_t>> SharedMappingsIn(uint64_t begin, uint64_t end) {
+    std::vector<std::pair<uint64_t, uint64_t>> found;
+    if (end <= begin || begin >= g_shared_high.load(std::memory_order_acquire) ||
+        end <= g_shared_low.load(std::memory_order_acquire)) {
+        return found;
+    }
+    const size_t count =
+        std::min(g_shared_mapping_count.load(std::memory_order_acquire), kSharedMappingSlots);
+    for (size_t index = 0; index < count; ++index) {
+        const auto& slot = g_shared_mappings[index];
+        const uint64_t slot_end = slot.end.load(std::memory_order_acquire);
+        const uint64_t slot_begin = slot.begin.load(std::memory_order_relaxed);
+        if (slot_end == 0 || slot_end <= begin || slot_begin >= end) {
+            continue;
+        }
+        found.emplace_back(std::max(begin, slot_begin), std::min(end, slot_end));
+    }
+    return found;
+}
+
 /// The name for a futex word: the file and offset when it lives in shared memory, and the
 /// address itself otherwise.
 uint64_t FutexKeyFor(uint64_t host_address) {
@@ -1279,6 +1306,11 @@ bool LinuxSyscalls::ReadGuestString(uint64_t address, std::string* out, size_t l
 LinuxSyscalls::OpenFile* LinuxSyscalls::FindFile(int fd) {
     const auto entry = shared_->files.find(fd);
     return entry == shared_->files.end() ? nullptr : &entry->second;
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> LinuxSyscalls::SharedRangesIn(uint64_t begin,
+                                                                             uint64_t end) {
+    return SharedMappingsIn(begin, end);
 }
 
 std::vector<std::pair<uint64_t, uint64_t>> LinuxSyscalls::Mappings() const {

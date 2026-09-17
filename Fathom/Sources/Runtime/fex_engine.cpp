@@ -292,6 +292,7 @@ thread_local GuestThread* g_current_guest_thread = nullptr;
 
 /// The guest's arena, so that a signal handler can tell a guest address from any other.
 std::atomic<uint64_t> g_arena_begin {0};
+
 std::atomic<uint64_t> g_arena_end {0};
 
 /// Ends the guest process whose code just faulted, instead of the whole session.
@@ -357,6 +358,11 @@ thread_local LinuxSyscalls* g_current_syscalls = nullptr;
 /// Writes the executing guest thread's registers out for a crash record. Signal-handler
 /// context: no allocation, no locks, and g_active is thread-local so it describes the
 /// thread that actually faulted.
+/// Where this host thread's guest address space starts, for turning a guest address into
+/// something this process can read. Zero for a 64-bit guest, whose addresses are already
+/// this process's.
+thread_local uint64_t g_current_guest_base = 0;
+
 size_t DescribeGuestState(char* buffer, size_t capacity) {
     if (g_active.thread == nullptr || buffer == nullptr || capacity == 0) {
         return 0;
@@ -371,6 +377,24 @@ size_t DescribeGuestState(char* buffer, size_t capacity) {
                                  "  %-3s %016llx%s", kNames[index],
                                  static_cast<unsigned long long>(state.gregs[index]),
                                  (index % 2 == 1) ? "\n" : "");
+    }
+
+    // The bytes the guest believes are its next instructions. Worth having in a crash
+    // report because the two explanations for a program dying in a function that could
+    // not possibly do this look identical from the registers alone: either the data it
+    // was given is wrong, or what is at that address is not the code that belongs there.
+    // Comparing these against the file it was loaded from says which.
+    const uint64_t host_rip = state.rip + g_current_guest_base;
+    if (written > 0 && static_cast<size_t>(written) + 64 < capacity) {
+        const auto* code = reinterpret_cast<const unsigned char*>(
+            g_active.context == nullptr ? nullptr : reinterpret_cast<const void*>(host_rip));
+        written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
+                                 "  code");
+        for (int index = 0; index < 16 && code != nullptr; ++index) {
+            written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written),
+                                     " %02x", code[index]);
+        }
+        written += std::snprintf(buffer + written, capacity - static_cast<size_t>(written), "\n");
     }
     return written < 0 ? 0 : static_cast<size_t>(written);
 }
@@ -579,6 +603,7 @@ RunResult GuestThread::Run() {
     // the context and finds this thread's syscall state through it.
     g_current_syscalls = &impl_->syscalls;
     g_current_guest_thread = this;
+    g_current_guest_base = impl_->guest_base;
 
     // The guest leaves the JIT one of two ways. A clean HLT returns from ExecuteThread
     // normally; exit_group happens deep inside a syscall with JIT frames still on the

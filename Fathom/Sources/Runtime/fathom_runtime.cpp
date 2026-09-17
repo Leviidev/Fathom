@@ -999,6 +999,15 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
                 owned.emplace_back(heap_low, kHeapReservation);
             }
         }
+        // Held either way: the writable parts of every image the process has mapped. That
+        // is where a C library keeps what belongs to the process rather than to a thread
+        // -- malloc's arenas, the list of live thread stacks, the locks over both -- and
+        // the child rewrites all of it on its way to exec. Left alone, the parent's next
+        // allocation reads a chunk header the child rewrote and glibc aborts with
+        // "malloc(): unaligned tcache chunk detected", a long way from the fork.
+        for (const auto& region : parent->syscalls->ImageData()) {
+            owned.push_back(region);
+        }
         // The stack is held either way: the child returns out of fork through its parent's
         // frames whatever else is true, and it is a few kilobytes.
         owned.emplace_back(stack_low, stack_top - stack_low);

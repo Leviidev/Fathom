@@ -204,6 +204,13 @@ public:
     /// would sweep up the memory of unrelated ones.
     std::vector<std::pair<uint64_t, uint64_t>> Mappings() const;
 
+    /// The writable parts of the images this process has mapped -- every loaded library's
+    /// data and bss. This is where a C library keeps the things that belong to the process
+    /// rather than to any one thread: malloc's arenas, the list of live thread stacks, the
+    /// locks over both. A fork's child rewrites all of it before it execs, so a fork has
+    /// to hold it for the parent the same way it holds the stack.
+    std::vector<std::pair<uint64_t, uint64_t>> ImageData() const;
+
     /// Closes everything this process had open. Called when it *exits*, not when it is
     /// reaped: a pipe reaches end-of-file only once every copy of its write end is gone,
     /// and a parent blocked reading that pipe is in no position to reap anybody.
@@ -288,6 +295,12 @@ private:
         uint64_t heap_break {};
         /// Address and length of each live mmap the process made.
         std::vector<std::pair<uint64_t, uint64_t>> mappings;
+        /// The writable parts of mapped images: a library's data and bss, which a loader
+        /// makes as a file mapping with write permission, or as an anonymous mapping
+        /// placed at a fixed address inside the span it reserved for that library. A
+        /// thread's stack is neither -- it is anonymous and wherever the kernel likes --
+        /// which is what keeps those out of this list.
+        std::vector<std::pair<uint64_t, uint64_t>> image_data;
     };
 
     /// Lowest unused guest descriptor, which is the number open() and pipe() must return:

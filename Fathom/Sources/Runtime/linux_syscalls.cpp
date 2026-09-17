@@ -865,6 +865,7 @@ void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
     // of those regions, so whatever it writes there is never put back and the child it was
     // forked from carries on with a heap somebody else has been scribbling in.
     child.shared_->mappings = shared_->mappings;
+    child.shared_->image_data = shared_->image_data;
     child.config_.work_dir = config_.work_dir;
     // A fork is running the same program as its parent until it execs, so it answers
     // /proc/self/exe the same way -- which is how busybox re-runs itself as an applet.
@@ -900,6 +901,7 @@ void LinuxSyscalls::AdoptImage(uint64_t heap_base, uint64_t heap_reserved, const
     // which corrupts whichever process is now living there.
     std::scoped_lock lock {shared_->mutex};
     shared_->mappings.clear();
+    shared_->image_data.clear();
 }
 
 void LinuxSyscalls::InitialiseHeap(uint64_t base, uint64_t reserved) {
@@ -1114,6 +1116,11 @@ LinuxSyscalls::OpenFile* LinuxSyscalls::FindFile(int fd) {
 std::vector<std::pair<uint64_t, uint64_t>> LinuxSyscalls::Mappings() const {
     std::scoped_lock lock {shared_->mutex};
     return shared_->mappings;
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> LinuxSyscalls::ImageData() const {
+    std::scoped_lock lock {shared_->mutex};
+    return shared_->image_data;
 }
 
 int LinuxSyscalls::AllocateFd() {
@@ -2034,6 +2041,14 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         if (placed == 0) {
             return FailLinux(12);
         }
+    }
+
+    // A library's data and bss: a file mapping with write permission, or an anonymous one
+    // placed at a fixed address, which is how a loader lays a library's bss over the span
+    // it reserved for it. Recorded so that a fork can hold it for the parent.
+    if ((guest_protection & kGuestProtWrite) != 0 && (fixed || !anonymous)) {
+        std::scoped_lock lock {shared_->mutex};
+        shared_->image_data.emplace_back(placed, length);
     }
 
     if (anonymous) {

@@ -4175,7 +4175,18 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             return 0;
         }
         if (command == kGuestFSetfd) {
-            if (HostFdFor(fd) >= 0 || IsConsole(fd)) {
+            // Anything this process has open, whether or not it is backed by a host
+            // descriptor. An epoll set, an eventfd and a timer are all real descriptors to
+            // the guest and have none of their own here, and answering "bad descriptor"
+            // for them makes a library that marks its own descriptors close-on-exec --
+            // libevent does, on every one it creates -- believe they were never opened.
+            {
+                std::scoped_lock lock {shared_->mutex};
+                if (shared_->files.count(fd) != 0) {
+                    return 0;
+                }
+            }
+            if (IsConsole(fd)) {
                 return 0;
             }
             // Said once per process: a descriptor a program believes it has and this
@@ -4203,8 +4214,15 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         // socket buffer holds and waits for a short write that never comes.
         const int host_fd = HostFdFor(fd);
         if (host_fd < 0) {
-            // The console, which has no host descriptor. Answer for it directly.
-            return IsConsole(fd) ? (command == kGuestFGetfl ? 2 : 0) : FailLinux(9);
+            // The console, an epoll set, an eventfd, a timer: real to the guest, with no
+            // host descriptor of their own. Read-write and blocking is the truthful answer
+            // for all of them.
+            bool known = IsConsole(fd);
+            if (!known) {
+                std::scoped_lock lock {shared_->mutex};
+                known = shared_->files.count(fd) != 0;
+            }
+            return known ? (command == kGuestFGetfl ? 2 : 0) : FailLinux(9);
         }
         if (command == kGuestFGetfl) {
             const int host_flags = fcntl(host_fd, F_GETFL, 0);

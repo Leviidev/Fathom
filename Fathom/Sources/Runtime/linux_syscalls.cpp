@@ -1417,6 +1417,7 @@ uint64_t LinuxSyscalls::DoSelect(int count, uint64_t read_address, uint64_t writ
 }
 
 uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout_ms) {
+    const auto waiting = EnterBlockingWait();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
 
     // poll(NULL, 0, ms) is just a sleep, and some programs use it as one.
@@ -2859,6 +2860,7 @@ uint64_t LinuxSyscalls::DoEpollWait(int epoll_fd, uint64_t events_address, int m
         return FailLinux(14);
     }
 
+    const auto waiting = EnterBlockingWait();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
     for (;;) {
         if (ShouldStop()) {
@@ -4475,6 +4477,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                 timed = true;
             }
 
+            const auto waiting = EnterBlockingWait();
             std::unique_lock lock {FutexQueue().mutex};
             if (*value != static_cast<uint32_t>(arg3)) {
                 return FailLinux(11); // EAGAIN: the value moved, which is the common case.

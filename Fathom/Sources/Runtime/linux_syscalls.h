@@ -192,7 +192,24 @@ public:
     /// A fork freezes the rest of the parent's threads while its child borrows the
     /// parent's memory, and a thread must not be frozen in here: it may be holding the
     /// address space's lock or the descriptor table's, and the child needs both to exec.
-    bool InRuntime() const { return in_runtime_.load(std::memory_order_acquire); }
+    bool InRuntime() const {
+        return in_runtime_.load(std::memory_order_acquire) &&
+               !in_blocking_wait_.load(std::memory_order_acquire);
+    }
+
+    /// Marks a stretch of a syscall spent waiting for something to happen -- a futex, a
+    /// descriptor, a child -- rather than doing anything. A thread parked in one of those
+    /// is not writing to guest memory and holds nothing a forking child needs, so it can
+    /// be stopped; threads spend most of their lives in here, and without this a process
+    /// with a thread pool could never be stopped at all.
+    struct BlockingWait {
+        std::atomic<bool>* flag;
+        explicit BlockingWait(std::atomic<bool>* on) : flag {on} {
+            flag->store(true, std::memory_order_release);
+        }
+        ~BlockingWait() { flag->store(false, std::memory_order_release); }
+    };
+    BlockingWait EnterBlockingWait() { return BlockingWait {&in_blocking_wait_}; }
 
     void RequestProcessStop() { process_stopping_->store(true, std::memory_order_release); }
     void ClearProcessStop() { process_stopping_->store(false, std::memory_order_release); }
@@ -460,6 +477,7 @@ private:
     /// Set for the duration of one i386 time32 syscall. See TimeWidth.
     bool narrow_time_ {};
     std::atomic<bool> in_runtime_ {false};
+    std::atomic<bool> in_blocking_wait_ {false};
 
     /// What prctl(PR_SET_NAME) was told to call this thread.
     std::string thread_name_;

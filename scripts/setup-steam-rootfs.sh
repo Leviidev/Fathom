@@ -195,6 +195,11 @@ case "$1" in
         # D-Bus for the desktop's proxy settings, twice, and there is no D-Bus here. With
         # no proxy to configure there is nothing to ask.
         extra="$extra --no-proxy-server"
+        # Chromium's own software renderer, which Steam ships beside the helper
+        # (libvk_swiftshader.so, libEGL.so, libGLESv2.so). Without this it goes looking
+        # for a system GL driver, and the only 64-bit one available drags a second C
+        # library into the process.
+        extra="$extra --use-gl=angle --use-angle=swiftshader"
         # Set FATHOM_WEBHELPER_VERBOSE to have Chromium say what it is doing; its log
         # goes wherever Steam pointed --log-file, which is the Steam logs directory.
         if [ -n "${FATHOM_WEBHELPER_VERBOSE:-}" ]; then

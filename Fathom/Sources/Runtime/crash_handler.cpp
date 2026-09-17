@@ -205,18 +205,12 @@ void Handle(int number, siginfo_t* info, void* context) {
         if (fault == pc) {
             WriteText("\nfaulting instruction: unreadable -- the fault was the fetch itself,"
                       " so this is a jump to an address with no code at it\n");
-        } else if (write(g_null_fd, reinterpret_cast<const void*>(pc), sizeof(uint32_t)) ==
-                   static_cast<ssize_t>(sizeof(uint32_t))) {
-            uint32_t instruction = 0;
-            std::memcpy(&instruction, reinterpret_cast<const void*>(pc), sizeof(instruction));
-            WriteText("\nfaulting instruction: ");
-            WriteHex(instruction);
-            WriteText("\n");
         } else {
-            // Not readable. Generated code is mapped execute-only, so this is the normal
-            // answer for a fault inside the JIT -- and reading it anyway faults a second
-            // time, inside this handler, with the signal already blocked.
-            WriteText("\nfaulting instruction: not readable from here\n");
+            // Not read at all. Generated code is mapped execute-only, the interesting
+            // faults are the ones where this address is not there, and a load that faults
+            // inside this handler stops the thread here for good -- holding whatever
+            // FEXCore lock it was holding when it faulted, which stops the session.
+            WriteText("\nfaulting instruction: not read, to avoid faulting again here\n");
         }
     }
 

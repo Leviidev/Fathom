@@ -150,6 +150,23 @@ void OpDispatchBuilder::NOPOp(OpcodeArgs) {}
 void OpDispatchBuilder::RETOp(OpcodeArgs) {
   const auto GPRSize = GetGPROpSize();
 
+  // A relocated guest keeps its stack pointer as a guest value and only relocates the
+  // access, which is what the one-argument Pop does. The read-modify-write handle below
+  // cannot: it holds one register that is both dereferenced and incremented, so for a
+  // relocated guest it has to be a host address the whole way through, and the stack
+  // pointer that comes back out of it has been through two conversions that only agree
+  // while nothing else touches it.
+  if (GuestMemoryBase != 0) {
+    Ref NewRIP = Pop(GPRSize);
+    if (Op->OP == 0xC2) {
+      auto Offset = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
+      StoreGPRRegister(X86State::REG_RSP, Add(GPRSize, LoadGPRRegister(X86State::REG_RSP), Offset));
+    }
+    ExitFunction(NewRIP, BranchHint::Return);
+    BlockSetRIP = true;
+    return;
+  }
+
   Ref SP = StackHandle(LoadGPRRegister(X86State::REG_RSP));
   Ref NewRIP = Pop(GPRSize, SP);
 
@@ -497,6 +514,15 @@ void OpDispatchBuilder::POPSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
 void OpDispatchBuilder::LEAVEOp(OpcodeArgs) {
   const auto GPRSize = GetGPROpSize();
   const auto OperandSize = (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_OPERAND_SIZE) ? OpSize::i16Bit : GPRSize;
+
+  // As in RETOp: a relocated guest uses the plain lowering, where the stack pointer stays
+  // a guest value and only the access is relocated.
+  if (GuestMemoryBase != 0) {
+    StoreGPRRegister(X86State::REG_RSP, LoadGPRRegister(X86State::REG_RBP), GPRSize);
+    Ref NewBP = Pop(OperandSize);
+    StoreGPRRegister(X86State::REG_RBP, NewBP, OperandSize);
+    return;
+  }
 
   // First we move RBP in to RSP and then behave effectively like a pop
   auto SP = StackHandle(LoadGPRRegister(X86State::REG_RBP));

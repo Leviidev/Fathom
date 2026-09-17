@@ -1259,6 +1259,12 @@ uint64_t LinuxSyscalls::DoOpenAt(int dirfd, uint64_t path_address, int flags, in
         return static_cast<uint64_t>(RegisterFile(backing, guest_path));
     }
 
+    // Shared memory, said out loud. There are a handful of these in a session and they are
+    // how separate programs find each other's memory -- Steam's client and its web helper
+    // share one -- so an open that does not happen is worth seeing.
+    if (guest_path.rfind("/dev/shm/", 0) == 0) {
+        FATHOM_INFO("[pid %d] opening %s", pid_, guest_path.c_str());
+    }
     const int host_fd = open(host_path.c_str(), ToHostOpenFlags(flags), static_cast<mode_t>(mode));
     if (host_fd < 0) {
         if (config_.trace) {

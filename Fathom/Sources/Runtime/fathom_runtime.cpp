@@ -1257,16 +1257,28 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
             [&] { return child_raw->released || console.StopRequested(); });
         if (!released) {
             if (auto* parent = Find(caller_pid)) {
+                // Sampled rather than read once: a child stuck in a spin loop and a child
+                // blocked inside the JIT look identical from a single reading, and they
+                // are diagnosed completely differently.
+                uint64_t samples[4] = {};
+                for (auto& sample : samples) {
+                    sample = child_raw->thread == nullptr ? 0 : child_raw->thread->Rip();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+                }
                 FATHOM_WARN("fork: pid %d has held its parent's memory for five seconds "
-                            "(rip %#llx, syscall %llu); letting pid %d's other threads run "
-                            "again and giving up the copy",
+                            "(syscall %llu, rip %#llx %#llx %#llx %#llx, rsp %#llx); letting "
+                            "pid %d's other threads run again and giving up the copy",
                             child_pid,
-                            static_cast<unsigned long long>(child_raw->control == nullptr
-                                                                ? 0
-                                                                : child_raw->control->GuestRip()),
                             static_cast<unsigned long long>(child_raw->syscalls == nullptr
                                                                 ? 0
                                                                 : child_raw->syscalls->CurrentSyscall()),
+                            static_cast<unsigned long long>(samples[0]),
+                            static_cast<unsigned long long>(samples[1]),
+                            static_cast<unsigned long long>(samples[2]),
+                            static_cast<unsigned long long>(samples[3]),
+                            static_cast<unsigned long long>(child_raw->thread == nullptr
+                                                                ? 0
+                                                                : child_raw->thread->Rsp()),
                             caller_pid);
                 if (!parent->frozen_threads.empty()) {
                     ThawThreads(parent);

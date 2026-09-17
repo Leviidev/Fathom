@@ -147,11 +147,17 @@ case "$1" in
     (*steamwebhelper_sniper_wrap.sh)
         directory="$(dirname "$1")"
         shift
+        # --no-zygote: Chromium normally forks a zygote early and forks every renderer
+        # from it. A fork here shares its parent's memory rather than copying it, and the
+        # zygote is forked out of a browser process that already has a dozen threads, so
+        # the child comes up holding locks nothing will ever release. Without the zygote
+        # each child is started with fork and exec straight away, which is the path
+        # everything else in this root already takes.
         if [ -n "$loader" ]; then
-            exec "$loader" --library-path "$directory:$links" "$directory/steamwebhelper" "$@"
+            exec "$loader" --library-path "$directory:$links" "$directory/steamwebhelper" "$@" --no-zygote
         fi
         export LD_LIBRARY_PATH="$directory:$links${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-        exec "$directory/steamwebhelper" "$@"
+        exec "$directory/steamwebhelper" "$@" --no-zygote
         ;;
 esac
 

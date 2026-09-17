@@ -23,6 +23,7 @@
 // without this. Only the ucontext_t/mcontext_t types are wanted here, never those calls.
 #define _XOPEN_SOURCE 1
 #include <mach/arm/thread_status.h>
+#include <mach/thread_act.h>
 #include <ucontext.h>
 #endif
 
@@ -326,6 +327,12 @@ struct LiveThread {
     FEXCore::Context::Context* context {};
     FEXCore::Core::InternalThreadState* thread {};
     uint64_t guest_base {};
+    /// The host thread running it, recorded once that thread is actually running. Needed
+    /// because throwing compiled code away has to stop everything that might be executing
+    /// it: FEXCore takes its invalidation lock to keep anything from *compiling*, but a
+    /// thread running an already-compiled block never takes that lock at all, and a block
+    /// unlinked out from under such a thread is a wild pointer in its link list.
+    uint32_t port {};
 };
 
 std::mutex g_live_threads_mutex;
@@ -598,6 +605,7 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
     std::scoped_lock lock {g_live_threads_mutex};
     const auto& live = g_live_threads;
     // Contexts first: a code buffer's lookup table is shared by every thread using it.
+    const auto self = pthread_mach_thread_np(pthread_self());
     std::set<FEXCore::Context::Context*> contexts;
     for (const auto& entry : live) {
         if (!contexts.insert(entry.context).second) {
@@ -605,12 +613,32 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
         }
         const uint64_t begin = host_begin - entry.guest_base;
         std::unique_lock guard {entry.context->GetCodeInvalidationMutex()};
+
+        // Held exclusively, so nothing is compiling and no lookup cache is being written.
+        // What is left is threads *running* compiled code, and those have to be stopped
+        // too or a block can be unlinked while one of them is standing in it. They are
+        // safe to stop exactly here: nothing they could be holding is needed below.
+        std::vector<uint32_t> stopped;
+        stopped.reserve(live.size());
+        for (const auto& thread : live) {
+            if (thread.context != entry.context || thread.port == 0 || thread.port == self) {
+                continue;
+            }
+            if (thread_suspend(thread.port) == KERN_SUCCESS) {
+                stopped.push_back(thread.port);
+            }
+        }
+
         entry.context->InvalidateCodeBuffersCodeRange(begin, host_end - host_begin);
         for (const auto& thread : live) {
             if (thread.context == entry.context) {
                 entry.context->InvalidateThreadCachedCodeRange(thread.thread, begin,
                                                                host_end - host_begin);
             }
+        }
+
+        for (const auto port : stopped) {
+            thread_resume(port);
         }
     }
 }
@@ -672,6 +700,17 @@ RunResult GuestThread::Run() {
     g_current_syscalls = &impl_->syscalls;
     g_current_guest_thread = this;
     g_current_guest_base = impl_->guest_base;
+    {
+        // This host thread is the one that will be running compiled code for this guest
+        // thread, and only it can say which it is.
+        std::scoped_lock lock {g_live_threads_mutex};
+        for (auto& live : g_live_threads) {
+            if (live.thread == impl_->thread) {
+                live.port = pthread_mach_thread_np(pthread_self());
+                break;
+            }
+        }
+    }
 
     // The guest leaves the JIT one of two ways. A clean HLT returns from ExecuteThread
     // normally; exit_group happens deep inside a syscall with JIT frames still on the

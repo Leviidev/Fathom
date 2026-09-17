@@ -645,6 +645,15 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
     if (host_end <= host_begin) {
         return;
     }
+    // A way to ask what throwing compiled code away is costing. Everything that waits on
+    // FEXCore's invalidation lock waits here, and that lock gives writers priority, so a
+    // single one of these stops every thread that wants to compile. With this set nothing
+    // is thrown away and stale code runs -- which is wrong, and tells us whether the
+    // waiting is what matters.
+    static const bool disabled = getenv("FATHOM_NO_INVALIDATE") != nullptr;
+    if (disabled) {
+        return;
+    }
     // Counted because throwing compiled code away is not free and it is easy to do far
     // more often than intended: every block dropped is recompiled from scratch, and every
     // unaligned access inside it faults again, because the patch that stopped it faulting

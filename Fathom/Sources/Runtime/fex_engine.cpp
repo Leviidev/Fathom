@@ -263,10 +263,28 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     // nonsense: the 32-bit Steam client did exactly that, at a rate of three hundred
     // thousand faults a second, ending in "stack smashing detected".
     const auto faulting = reinterpret_cast<uint64_t>(info->si_addr);
+    bool wild = false;
     if (auto* space = g_arena_space.load(std::memory_order_acquire)) {
         fathom::GuestRange range {};
         bool known = false;
-        if (!space->RangeForNoWait(faulting, &range, &known) && known) {
+        wild = !space->RangeForNoWait(faulting, &range, &known) && known;
+    }
+    if (wild) {
+        // Stepping over the instruction is not a fix -- the guest carries on with a
+        // register it never loaded -- but it is what the program has been surviving on,
+        // and refusing outright ends it here instead. So: allowed, counted, and named,
+        // and once there have been enough of them to say this is a loop rather than a
+        // stumble, allowed no longer. Without the cap this reached a hundred and
+        // twenty-seven million signals in five minutes, which is most of the run.
+        static std::atomic<uint64_t> wild_fixups {0};
+        const auto seen = wild_fixups.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (seen <= 8 || (seen & 0x3FF) == 0) {
+            FATHOM_WARN("guest read %p, which is not mapped, from an instruction this can "
+                        "step over (%llu so far, guest rip %#llx)",
+                        info->si_addr, static_cast<unsigned long long>(seen),
+                        static_cast<unsigned long long>(g_active.thread->CurrentFrame->State.rip));
+        }
+        if (seen > 1024) {
             return false;
         }
     }

@@ -149,33 +149,35 @@ bool MapFreshAnonymous(uint64_t address, uint64_t length) {
 /// reads much later as a thread whose stack pointer and saved registers are all zero.
 bool CommitRange(uint64_t begin, uint64_t end, uint64_t page_size, int host_protection,
                  const std::vector<GuestRange>& committed) {
-    uint64_t run_begin = 0;
-    uint64_t run_end = 0;
-    const auto flush = [&] {
-        if (run_end > run_begin) {
-            MapFreshAnonymous(run_begin, run_end - run_begin);
+    // Zeroed only where nothing lives. Walking the sorted list of what is committed once,
+    // rather than asking it about every host page in turn, is what keeps committing a
+    // 128MB heap from costing a scan of the whole arena per page.
+    uint64_t cursor = begin;
+    const auto fill = [&](uint64_t gap_begin, uint64_t gap_end) {
+        const uint64_t low = (gap_begin + page_size - 1) & ~(page_size - 1);
+        const uint64_t high = gap_end & ~(page_size - 1);
+        if (high > low) {
+            MapFreshAnonymous(low, high - low);
         }
-        run_begin = run_end = 0;
     };
-    for (uint64_t page = begin; page < end; page += page_size) {
-        bool occupied = false;
-        for (const auto& range : committed) {
-            if (range.begin < page + page_size && range.end() > page) {
-                occupied = true;
-                break;
-            }
-        }
-        if (occupied) {
-            flush();
+    for (const auto& range : committed) {
+        if (range.end() <= cursor) {
             continue;
         }
-        if (run_end != page) {
-            flush();
-            run_begin = page;
+        if (range.begin >= end) {
+            break;
         }
-        run_end = page + page_size;
+        if (range.begin > cursor) {
+            fill(cursor, range.begin);
+        }
+        cursor = std::max(cursor, range.end());
+        if (cursor >= end) {
+            break;
+        }
     }
-    flush();
+    if (cursor < end) {
+        fill(cursor, end);
+    }
     return mprotect(reinterpret_cast<void*>(begin), end - begin, host_protection) == 0;
 }
 
@@ -255,10 +257,8 @@ std::vector<std::pair<uint64_t, uint64_t>> GuestAddressSpace::UncommittedIn(uint
                                                                            uint64_t end) const {
     std::vector<std::pair<uint64_t, uint64_t>> gaps;
     uint64_t cursor = begin;
-    for (const auto& range : committed_) {
-        if (range.end() <= cursor) {
-            continue;
-        }
+    for (size_t index = FirstRangeEndingAfter(cursor); index < committed_.size(); ++index) {
+        const auto& range = committed_[index];
         if (range.begin >= end) {
             break;
         }
@@ -285,6 +285,27 @@ std::vector<std::pair<uint64_t, uint64_t>> GuestAddressSpace::UncommittedIn(uint
 /// first, and a fork's snapshot ends up holding the same page four times over, each with
 /// a different idea of when it was mapped. So the newcomer wins, and whatever was there
 /// is clipped around it.
+/// The first committed range that ends after `address`, found by bisection.
+///
+/// Every question this class answers about an address walks this list, and a long-running
+/// guest has tens of thousands of ranges in it -- a loader maps and re-protects every
+/// segment of every library. Walking from the front made a single pointer check cost more
+/// than the syscall it was checking, with the address space's lock held for all of it, so
+/// every other thread stopped too.
+size_t GuestAddressSpace::FirstRangeEndingAfter(uint64_t address) const {
+    size_t low = 0;
+    size_t high = committed_.size();
+    while (low < high) {
+        const size_t middle = low + (high - low) / 2;
+        if (committed_[middle].end() <= address) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    return low;
+}
+
 void GuestAddressSpace::RecordCommitted(uint64_t address, uint64_t size, int protection) {
     const uint64_t end = address + size;
     std::vector<GuestRange> updated;
@@ -315,6 +336,29 @@ void GuestAddressSpace::RecordCommitted(uint64_t address, uint64_t size, int pro
     std::sort(updated.begin(), updated.end(),
               [](const GuestRange& lhs, const GuestRange& rhs) { return lhs.begin < rhs.begin; });
     committed_ = std::move(updated);
+    Coalesce();
+}
+
+/// Joins neighbours that are the same mapping in two pieces.
+///
+/// Protecting part of a range splits it, and a loader protects every segment of every
+/// library it maps, so without this the list only ever grows -- and everything that reads
+/// it slows down together. Two ranges are only joined when they touch and agree on both
+/// their protection and which mapping they came from, so nothing that reads an epoch can
+/// tell the difference.
+void GuestAddressSpace::Coalesce() {
+    size_t out = 0;
+    for (size_t index = 0; index < committed_.size(); ++index) {
+        if (out > 0 && committed_[out - 1].end() == committed_[index].begin &&
+            committed_[out - 1].protection == committed_[index].protection &&
+            committed_[out - 1].epoch == committed_[index].epoch) {
+            committed_[out - 1].size += committed_[index].size;
+            continue;
+        }
+        committed_[out] = committed_[index];
+        ++out;
+    }
+    committed_.resize(out);
 }
 
 uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protection) {
@@ -452,6 +496,7 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
     // this list, and reading it with the range still in it means nothing is ever dropped
     // and the free list ends up holding memory the committed list also holds.
     committed_ = std::move(survivors);
+    Coalesce();
 
     // Only the host pages nothing else is still living in.
     //
@@ -466,45 +511,29 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
     // of those and Darwin stops accepting mprotect at all, with EACCES, which surfaces
     // much later as a program that cannot be loaded. Consecutive pages that are all free
     // go in one call, which is almost always the whole span.
-    uint64_t run_begin = 0;
-    uint64_t run_end = 0;
-    const auto flush = [&] {
-        if (run_end <= run_begin) {
-            return;
+    // Page by page would mean scanning every committed range for every 16KB of a 128MB
+    // heap, with this lock held; the gaps are computed once instead.
+    for (const auto& [gap_begin, gap_end] : UncommittedIn(begin, end)) {
+        // Inward: a host page only half of which is free still holds somebody's memory,
+        // and mapping over it would take theirs away. The guest's pages are 4KB and the
+        // host's 16KB, so this happens constantly.
+        const uint64_t low = AlignUp(gap_begin);
+        const uint64_t high = AlignDown(gap_end);
+        if (high <= low) {
+            continue;
         }
-        const uint64_t length = run_end - run_begin;
         // Mapped fresh rather than protected, which returns the range to exactly the state
         // the arena was reserved in. Protecting is not enough: a guest that mapped a file
         // here left a mapping whose *maximum* protection is the file's, and a read-only
         // file gives a range that can never be made writable again -- so the next program
         // loaded at that address fails to commit, with EACCES, a long way from the mmap
         // that caused it. This also drops the pages, which is what the madvise was for.
-        if (!MapFreshAnonymous(run_begin, length)) {
+        if (!MapFreshAnonymous(low, high - low)) {
             FATHOM_WARN("release at %#llx (%llu KB) failed: %s",
-                        static_cast<unsigned long long>(run_begin),
-                        static_cast<unsigned long long>(length / 1024), std::strerror(errno));
+                        static_cast<unsigned long long>(low),
+                        static_cast<unsigned long long>((high - low) / 1024), std::strerror(errno));
         }
-        run_begin = run_end = 0;
-    };
-    for (uint64_t page = begin; page < end; page += page_size_) {
-        bool occupied = false;
-        for (const auto& range : committed_) {
-            if (range.begin < page + page_size_ && range.end() > page) {
-                occupied = true;
-                break;
-            }
-        }
-        if (occupied) {
-            flush();
-            continue;
-        }
-        if (run_end != page) {
-            flush();
-            run_begin = page;
-        }
-        run_end = page + page_size_;
     }
-    flush();
 
     // And only the parts of it nothing else is still living in. A guest page is 4KB and a
     // host page 16KB, so the rounding above reaches up to three neighbouring guest pages
@@ -581,6 +610,7 @@ bool GuestAddressSpace::ProtectLocked(uint64_t address, uint64_t size, int prote
     std::sort(updated.begin(), updated.end(),
               [](const GuestRange& lhs, const GuestRange& rhs) { return lhs.begin < rhs.begin; });
     committed_ = std::move(updated);
+    Coalesce();
 
     // The host mapping keeps read/write regardless; only the guest's view changes.
     // A guest mprotect that *adds* write access still needs the host to allow it.
@@ -605,9 +635,10 @@ std::vector<GuestRange> GuestAddressSpace::WritableRanges() const {
 std::vector<GuestRange> GuestAddressSpace::WritableRangesIn(uint64_t begin, uint64_t end) const {
     std::scoped_lock lock {mutex_};
     std::vector<GuestRange> writable;
-    for (const auto& range : committed_) {
-        if (range.end() <= begin || range.begin >= end) {
-            continue;
+    for (size_t index = FirstRangeEndingAfter(begin); index < committed_.size(); ++index) {
+        const auto& range = committed_[index];
+        if (range.begin >= end) {
+            break;
         }
         if ((range.protection & kGuestProtWrite) == 0) {
             continue;
@@ -658,10 +689,8 @@ bool GuestAddressSpace::RestoreIfUnchanged(uint64_t address, const void* bytes, 
     std::scoped_lock lock {mutex_};
     uint64_t cursor = address;
     const uint64_t end = address + size;
-    for (const auto& range : committed_) {
-        if (range.end() <= cursor) {
-            continue;
-        }
+    for (size_t index = FirstRangeEndingAfter(cursor); index < committed_.size(); ++index) {
+        const auto& range = committed_[index];
         if (range.begin > cursor) {
             return refuse("nothing is mapped there any more", &range);
         }
@@ -693,10 +722,9 @@ bool GuestAddressSpace::RestoreIfUnchanged(uint64_t address, const void* bytes, 
 
 uint64_t GuestAddressSpace::EpochAt(uint64_t address) const {
     std::scoped_lock lock {mutex_};
-    for (const auto& range : committed_) {
-        if (range.begin <= address && address < range.end()) {
-            return range.epoch;
-        }
+    const size_t index = FirstRangeEndingAfter(address);
+    if (index < committed_.size() && committed_[index].begin <= address) {
+        return committed_[index].epoch;
     }
     return 0;
 }
@@ -716,10 +744,8 @@ bool GuestAddressSpace::Validate(uint64_t address, uint64_t size, int required) 
     std::scoped_lock lock {mutex_};
     uint64_t cursor = address;
     const uint64_t end = address + size;
-    for (const auto& range : committed_) {
-        if (range.end() <= cursor) {
-            continue;
-        }
+    for (size_t index = FirstRangeEndingAfter(cursor); index < committed_.size(); ++index) {
+        const auto& range = committed_[index];
         if (range.begin > cursor) {
             return false; // Hole.
         }

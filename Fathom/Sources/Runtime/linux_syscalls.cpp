@@ -769,20 +769,33 @@ struct FutexQueueState {
     uint64_t generation {};
 };
 
-FutexQueueState& FutexQueue() {
-    static FutexQueueState queue;
-    return queue;
+/// One queue per address, near enough.
+///
+/// A single queue for the whole session is correct -- a futex waiter must re-check its own
+/// word on waking -- and it is also unusable at scale: every wake anywhere wakes every
+/// waiter everywhere, each of them re-checks, finds nothing and waits again. With Steam's
+/// client and its web helper that is forty threads woken for each of thousands of wakes a
+/// second, and none of them makes progress. Bucketing by address means a wake reaches the
+/// handful of threads actually waiting on that word. Two addresses can share a bucket,
+/// which costs a spurious wake and nothing else.
+constexpr size_t kFutexBuckets = 1024;
+
+FutexQueueState& FutexQueue(uint64_t address = 0) {
+    static FutexQueueState queues[kFutexBuckets];
+    // The low two bits are always zero -- a futex word is four bytes and aligned -- and
+    // neighbouring words belong to different locks, so the next bits are what to spread on.
+    return queues[(address >> 2) % kFutexBuckets];
 }
 
 } // namespace
 
 void LinuxSyscalls::WakeFutex(uint64_t host_address) {
-    (void)host_address;  // One queue, so the address only matters to the waiter.
+    auto& queue = FutexQueue(host_address);
     {
-        std::scoped_lock lock {FutexQueue().mutex};
-        ++FutexQueue().generation;
+        std::scoped_lock lock {queue.mutex};
+        ++queue.generation;
     }
-    FutexQueue().changed.notify_all();
+    queue.changed.notify_all();
 }
 
 void LinuxSyscalls::ReleaseThreadId() {
@@ -4768,11 +4781,12 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             }
 
             const auto waiting = EnterBlockingWait();
-            std::unique_lock lock {FutexQueue().mutex};
+            auto& queue = FutexQueue(ToHost(arg1));
+            std::unique_lock lock {queue.mutex};
             if (*value != static_cast<uint32_t>(arg3)) {
                 return FailLinux(11); // EAGAIN: the value moved, which is the common case.
             }
-            const uint64_t seen = FutexQueue().generation;
+            const uint64_t seen = queue.generation;
             for (;;) {
                 if (ShouldStop()) {
                     lock.unlock();
@@ -4781,7 +4795,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                 }
                 // Woken by a FUTEX_WAKE, or by the value changing under us. Either way the
                 // caller re-checks its own condition, which is what the API promises.
-                if (FutexQueue().generation != seen || *value != static_cast<uint32_t>(arg3)) {
+                if (queue.generation != seen || *value != static_cast<uint32_t>(arg3)) {
                     return 0;
                 }
                 // Bounded, so that a stop request is noticed and so that a wake this
@@ -4793,9 +4807,9 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                     if (now >= deadline) {
                         return FailLinux(110); // ETIMEDOUT
                     }
-                    FutexQueue().changed.wait_for(lock, std::min<std::chrono::steady_clock::duration>(slice, deadline - now));
+                    queue.changed.wait_for(lock, std::min<std::chrono::steady_clock::duration>(slice, deadline - now));
                 } else {
-                    FutexQueue().changed.wait_for(lock, slice);
+                    queue.changed.wait_for(lock, slice);
                 }
             }
         }
@@ -4831,7 +4845,8 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                 }
                 // Tell the owner there is somebody here, then wait to be woken.
                 value->compare_exchange_weak(held, held | kFutexWaiters, std::memory_order_acq_rel);
-                std::unique_lock lock {FutexQueue().mutex};
+                auto& queue = FutexQueue(ToHost(arg1));
+                std::unique_lock lock {queue.mutex};
                 if ((value->load(std::memory_order_acquire) & kFutexTidMask) == 0) {
                     continue;
                 }
@@ -4840,7 +4855,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                     exit_status_ = -1;
                     control_.ExitGuest(-1);
                 }
-                FutexQueue().changed.wait_for(lock, std::chrono::milliseconds(20));
+                queue.changed.wait_for(lock, std::chrono::milliseconds(20));
             }
         }
         case kFutexUnlockPi: {

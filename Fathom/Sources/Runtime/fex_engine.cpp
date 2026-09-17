@@ -251,6 +251,20 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     if (info->si_code != BUS_ADRALN) {
         return false; // A real bad-address fault, not an alignment one.
     }
+    // And the address has to be memory the guest actually has. Darwin reports some
+    // bad-address faults with the alignment code, so the code alone does not distinguish
+    // "the guest touched an odd address" from "the guest followed a wild pointer" -- and
+    // the two must not be treated alike. FEXCore's fixup rewrites the guest's registers
+    // and steps over the instruction, which for a wild pointer means carrying on with
+    // nonsense: the 32-bit Steam client did exactly that, at a rate of three hundred
+    // thousand faults a second, ending in "stack smashing detected".
+    const auto faulting = reinterpret_cast<uint64_t>(info->si_addr);
+    if (auto* space = g_arena_space.load(std::memory_order_acquire)) {
+        fathom::GuestRange range {};
+        if (!space->RangeForNoWait(faulting, &range)) {
+            return false;
+        }
+    }
 
     auto* context = static_cast<ucontext_t*>(raw_context);
     auto& state = context->uc_mcontext->__ss;
@@ -286,6 +300,8 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     // and it is the smaller one: a signal here costs about ninety seconds on a device
     // with a debugger attached, which JIT requires, so a faulting site is not slow but
     // fatal.
+    uint32_t before = 0;
+    std::memcpy(&before, reinterpret_cast<const void*>(writable_pc), sizeof(before));
     const auto adjustment = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
         g_active.thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic,
         writable_pc, registers.data());
@@ -308,12 +324,14 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     // sticking, and that is the difference between memory-ordering emulation costing
     // nothing and costing most of the run.
     const auto fixups = g_alignment_fixups.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint32_t after = 0;
+    std::memcpy(&after, reinterpret_cast<const void*>(writable_pc), sizeof(after));
     if ((fixups & 0xFFFFF) == 0) {
         FATHOM_INFO("%llu unaligned accesses emulated so far; the last was guest rip %#llx "
-                    "at address %p",
+                    "at address %p, instruction %08x -> %08x",
                     static_cast<unsigned long long>(fixups),
                     static_cast<unsigned long long>(g_active.thread->CurrentFrame->State.rip),
-                    info->si_addr);
+                    info->si_addr, before, after);
     }
     return true;
 #else

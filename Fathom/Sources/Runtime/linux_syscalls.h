@@ -196,6 +196,10 @@ public:
     /// A fork freezes the rest of the parent's threads while its child borrows the
     /// parent's memory, and a thread must not be frozen in here: it may be holding the
     /// address space's lock or the descriptor table's, and the child needs both to exec.
+    /// The syscall this thread is servicing, or 0. Only used to say which call a thread
+    /// that could not be stopped for a fork was sitting in.
+    uint64_t CurrentSyscall() const { return current_syscall_.load(std::memory_order_relaxed); }
+
     bool InRuntime() const {
         return in_runtime_.load(std::memory_order_acquire) &&
                !in_blocking_wait_.load(std::memory_order_acquire);
@@ -481,6 +485,7 @@ private:
     /// Set for the duration of one i386 time32 syscall. See TimeWidth.
     bool narrow_time_ {};
     std::atomic<bool> in_runtime_ {false};
+    std::atomic<uint64_t> current_syscall_ {0};
     std::atomic<bool> in_blocking_wait_ {false};
 
     /// What prctl(PR_SET_NAME) was told to call this thread.

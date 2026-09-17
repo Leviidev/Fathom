@@ -395,7 +395,7 @@ struct fathom_session final : fathom::ProcessHost {
 
     /// Stops the process's other threads for as long as a child of it is borrowing its
     /// memory, and starts them again afterwards.
-    void FreezeOtherThreads(GuestProcess* process, const fathom::GuestThread* caller);
+    bool FreezeOtherThreads(GuestProcess* process, const fathom::GuestThread* caller);
     void ThawThreads(GuestProcess* process);
 
     /// The same, but leaving the thread that asked -- which is what execve needs.
@@ -513,7 +513,7 @@ fathom::RunResult fathom_session::RunProcess(GuestProcess* process) {
     return result;
 }
 
-void fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::GuestThread* caller) {
+bool fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::GuestThread* caller) {
     // Everything a fork's child does to its parent's memory is only safe to put back if
     // nothing else was writing to it meanwhile. Linux gives the child a private copy and
     // the question does not arise; here the memory really is shared, so the parent's other
@@ -525,13 +525,16 @@ void fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::Gue
     // exec. Suspending and looking is the only way to ask without a race -- the answer can
     // change the instant after it is given -- so a thread caught in there is let go and
     // tried again.
+    bool all_stopped = true;
     const auto freeze = [&](pthread_t host_thread, const fathom::LinuxSyscalls* syscalls, int tid) {
         const auto port = pthread_mach_thread_np(host_thread);
         if (port == MACH_PORT_NULL) {
+            all_stopped = false;
             return;
         }
         for (int attempt = 0; attempt < 200; ++attempt) {
             if (thread_suspend(port) != KERN_SUCCESS) {
+                all_stopped = false;
                 return;
             }
             if (syscalls == nullptr || !syscalls->InRuntime()) {
@@ -541,7 +544,11 @@ void fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::Gue
             thread_resume(port);
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
-        FATHOM_WARN("fork: tid %d would not stop; pid %d's child shares its memory with it", tid,
+        all_stopped = false;
+        FATHOM_WARN("fork: tid %d would not stop (in syscall %llu); pid %d's child shares its "
+                    "memory with it",
+                    tid,
+                    static_cast<unsigned long long>(syscalls == nullptr ? 0 : syscalls->CurrentSyscall()),
                     process->pid);
     };
 
@@ -559,6 +566,7 @@ void fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::Gue
         }
         freeze(thread->host_thread, thread->syscalls.get(), thread->tid);
     }
+    return all_stopped;
 }
 
 void fathom_session::ThawThreads(GuestProcess* process) {
@@ -1099,16 +1107,30 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
                 break;
             }
         }
+        bool stopped = true;
         if (threaded) {
             // Before the copy is taken, not after: a copy taken while the parent's other
             // threads are still running is already out of date when it is made.
-            FreezeOtherThreads(parent, caller);
+            stopped = FreezeOtherThreads(parent, caller);
         }
 
         // The parent's own regions only. The arena is shared, so asking it for every
         // writable range sweeps in whatever sibling processes have mapped -- which on a
         // pipeline's second fork meant copying the first child's entire 128MB heap.
-        std::vector<std::pair<uint64_t, uint64_t>> owned = parent->syscalls->Mappings();
+        // A thread that could not be stopped is a thread still writing here, and a copy
+        // taken now and put back later throws away everything it does meanwhile -- which
+        // is how the client dies a few seconds after forking, reading a pointer some
+        // thread of its own had already replaced. When that happens nothing is held but
+        // the forking thread's own stack, which no other thread touches: the child gets
+        // less protection for its parent than it should, and the parent stays alive.
+        std::vector<std::pair<uint64_t, uint64_t>> owned;
+        if (!stopped) {
+            FATHOM_WARN("fork: pid %d is still running in its own memory, so pid %d borrows "
+                        "only the stack it forked from",
+                        caller_pid, child_pid);
+            owned.emplace_back(stack_low, stack_top - stack_low);
+        } else {
+        owned = parent->syscalls->Mappings();
         // ToGuestAddresses put an image's bounds into the guest's numbering, because that
         // is what the guest is told about them. Copying needs the host's.
         owned.emplace_back(parent->program.image.image_begin + parent->guest_base,
@@ -1141,6 +1163,7 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
         // The stack is held either way: the child returns out of fork through its parent's
         // frames whatever else is true, and it is a few kilobytes.
         owned.emplace_back(stack_low, stack_top - stack_low);
+        }
 
         // Clamped first, then merged. Those lists overlap heavily -- an image appears in
         // Mappings(), in the program image, and again in ImageData() -- and a span named

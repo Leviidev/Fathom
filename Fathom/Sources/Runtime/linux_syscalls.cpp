@@ -794,29 +794,71 @@ struct SharedMapping {
     uint64_t offset {};
 };
 
-std::mutex g_shared_mappings_mutex;
-std::vector<SharedMapping> g_shared_mappings;
+/// Published without a lock, and read without one.
+///
+/// Every futex in the session asks this question, so a mutex here would put the whole
+/// guest through one gate on its hottest call. Entries are only ever added, so a fixed
+/// array of slots filled with release stores is enough: a reader sees a slot or it does
+/// not, and a slot it misses costs one wake sent to the wrong queue, which the waiter's
+/// own re-check picks up anyway.
+constexpr size_t kSharedMappingSlots = 256;
+struct SharedMappingSlot {
+    std::atomic<uint64_t> begin {0};
+    std::atomic<uint64_t> end {0};
+    std::atomic<uint64_t> device {0};
+    std::atomic<uint64_t> inode {0};
+    std::atomic<uint64_t> offset {0};
+};
+SharedMappingSlot g_shared_mappings[kSharedMappingSlots];
+std::atomic<size_t> g_shared_mapping_count {0};
+/// The whole span they cover, so an address outside it answers without looking at any.
+std::atomic<uint64_t> g_shared_low {~0ull};
+std::atomic<uint64_t> g_shared_high {0};
 
 void NoteSharedMapping(uint64_t begin, uint64_t length, int host_fd, uint64_t offset) {
     struct stat info {};
     if (fstat(host_fd, &info) != 0) {
         return;
     }
-    std::scoped_lock lock {g_shared_mappings_mutex};
-    g_shared_mappings.push_back(SharedMapping {begin, begin + length,
-                                               static_cast<uint64_t>(info.st_dev),
-                                               static_cast<uint64_t>(info.st_ino), offset});
+    const size_t index = g_shared_mapping_count.fetch_add(1, std::memory_order_acq_rel);
+    if (index >= kSharedMappingSlots) {
+        return; // More shared mappings than this can hold; the rest fall back to addresses.
+    }
+    auto& slot = g_shared_mappings[index];
+    slot.device.store(static_cast<uint64_t>(info.st_dev), std::memory_order_relaxed);
+    slot.inode.store(static_cast<uint64_t>(info.st_ino), std::memory_order_relaxed);
+    slot.offset.store(offset, std::memory_order_relaxed);
+    slot.begin.store(begin, std::memory_order_relaxed);
+    slot.end.store(begin + length, std::memory_order_release);
+    uint64_t low = g_shared_low.load(std::memory_order_relaxed);
+    while (begin < low && !g_shared_low.compare_exchange_weak(low, begin, std::memory_order_acq_rel)) {
+    }
+    uint64_t high = g_shared_high.load(std::memory_order_relaxed);
+    while (begin + length > high &&
+           !g_shared_high.compare_exchange_weak(high, begin + length, std::memory_order_acq_rel)) {
+    }
 }
 
 /// The name for a futex word: the file and offset when it lives in shared memory, and the
 /// address itself otherwise.
 uint64_t FutexKeyFor(uint64_t host_address) {
-    std::scoped_lock lock {g_shared_mappings_mutex};
-    for (const auto& mapping : g_shared_mappings) {
-        if (host_address >= mapping.begin && host_address < mapping.end) {
-            const uint64_t within = mapping.offset + (host_address - mapping.begin);
-            return mapping.inode * 0x9E3779B97F4A7C15ull + mapping.device + within;
+    if (host_address < g_shared_low.load(std::memory_order_acquire) ||
+        host_address >= g_shared_high.load(std::memory_order_acquire)) {
+        return host_address;
+    }
+    const size_t count =
+        std::min(g_shared_mapping_count.load(std::memory_order_acquire), kSharedMappingSlots);
+    for (size_t index = 0; index < count; ++index) {
+        const auto& slot = g_shared_mappings[index];
+        const uint64_t end = slot.end.load(std::memory_order_acquire);
+        const uint64_t begin = slot.begin.load(std::memory_order_relaxed);
+        if (end == 0 || host_address < begin || host_address >= end) {
+            continue;
         }
+        const uint64_t within =
+            slot.offset.load(std::memory_order_relaxed) + (host_address - begin);
+        return slot.inode.load(std::memory_order_relaxed) * 0x9E3779B97F4A7C15ull +
+               slot.device.load(std::memory_order_relaxed) + within;
     }
     return host_address;
 }

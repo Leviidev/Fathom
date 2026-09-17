@@ -338,6 +338,39 @@ struct LiveThread {
 
 std::mutex g_live_threads_mutex;
 std::vector<LiveThread> g_live_threads;
+
+/// The same threads again, in a form a signal handler can read.
+///
+/// Deciding whether a fault happened in generated code means asking each live thread, and
+/// a handler must not wait for a lock -- the thread it interrupted may be holding it. A
+/// fixed array of slots, published with release stores, can be read at any time; a slot
+/// that is stale only costs one wrong answer about a thread that has just gone.
+constexpr size_t kLiveSlots = 512;
+struct LiveSlot {
+    std::atomic<FEXCore::Context::Context*> context {nullptr};
+    std::atomic<FEXCore::Core::InternalThreadState*> thread {nullptr};
+};
+LiveSlot g_live_slots[kLiveSlots];
+
+void PublishLiveThread(FEXCore::Context::Context* context, FEXCore::Core::InternalThreadState* thread) {
+    for (auto& slot : g_live_slots) {
+        FEXCore::Core::InternalThreadState* empty = nullptr;
+        if (slot.thread.compare_exchange_strong(empty, thread, std::memory_order_acq_rel)) {
+            slot.context.store(context, std::memory_order_release);
+            return;
+        }
+    }
+}
+
+void RetireLiveThread(FEXCore::Core::InternalThreadState* thread) {
+    for (auto& slot : g_live_slots) {
+        if (slot.thread.load(std::memory_order_acquire) == thread) {
+            slot.context.store(nullptr, std::memory_order_release);
+            slot.thread.store(nullptr, std::memory_order_release);
+            return;
+        }
+    }
+}
 /// How many sweeps are using a copy of that list. A thread may not be destroyed while any
 /// of them is, because the sweep reaches into it.
 size_t g_invalidators {0};
@@ -362,16 +395,16 @@ bool EndFaultedGuestThread(int signal, siginfo_t* info, void* raw_context) {
     if (!in_generated_code) {
         // A block compiled into a buffer another thread owns is still generated code, and
         // still this guest's fault -- FEXCore hands a thread whatever buffer had room.
-        // try_lock rather than lock: this runs in a signal handler, and a handler that
-        // waits for a lock the interrupted thread is holding never returns.
-        std::unique_lock guard {g_live_threads_mutex, std::try_to_lock};
-        if (guard.owns_lock()) {
-            for (const auto& live : g_live_threads) {
-                if (live.context == g_active.context &&
-                    g_active.context->IsAddressInCodeBuffer(live.thread, pc)) {
-                    in_generated_code = true;
-                    break;
-                }
+        // Read without a lock: a handler that waits for a lock the thread it interrupted
+        // is holding never returns.
+        for (const auto& slot : g_live_slots) {
+            auto* thread = slot.thread.load(std::memory_order_acquire);
+            if (thread == nullptr || slot.context.load(std::memory_order_acquire) != g_active.context) {
+                continue;
+            }
+            if (g_active.context->IsAddressInCodeBuffer(thread, pc)) {
+                in_generated_code = true;
+                break;
             }
         }
     }
@@ -591,11 +624,13 @@ void RegisterLiveThread(FEXCore::Context::Context* context, FEXCore::Core::Inter
     if (context == nullptr || thread == nullptr) {
         return;
     }
+    PublishLiveThread(context, thread);
     std::scoped_lock lock {g_live_threads_mutex};
     g_live_threads.push_back(LiveThread {context, thread, guest_base});
 }
 
 void ForgetLiveThread(FEXCore::Core::InternalThreadState* thread) {
+    RetireLiveThread(thread);
     std::scoped_lock lock {g_live_threads_mutex};
     std::erase_if(g_live_threads, [thread](const LiveThread& live) { return live.thread == thread; });
 }

@@ -4175,7 +4175,26 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             return 0;
         }
         if (command == kGuestFSetfd) {
-            return HostFdFor(fd) < 0 && !IsConsole(fd) ? FailLinux(9) : 0;
+            if (HostFdFor(fd) >= 0 || IsConsole(fd)) {
+                return 0;
+            }
+            // Said once per process: a descriptor a program believes it has and this
+            // table does not is how a program that was handed a socket ends up talking to
+            // nobody. The list says which ones it does have.
+            if (!reported_missing_fd_) {
+                reported_missing_fd_ = true;
+                std::string open_fds;
+                {
+                    std::scoped_lock lock {shared_->mutex};
+                    for (const auto& [number, file] : shared_->files) {
+                        open_fds += std::to_string(number);
+                        open_fds += ' ';
+                    }
+                }
+                FATHOM_WARN("[pid %d] fd %d is not open here; open: %s", pid_, fd,
+                            open_fds.c_str());
+            }
+            return FailLinux(9);
         }
 
         // F_GETFL and F_SETFL are about the open file description, and they have to be

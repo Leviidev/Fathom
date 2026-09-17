@@ -3590,6 +3590,7 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
                     static_cast<unsigned long long>(arg2), static_cast<unsigned long long>(arg3));
     }
 
+    current_argument_.store(arg1, std::memory_order_relaxed);
     current_syscall_.store(number, std::memory_order_relaxed);
     const auto result = Dispatch(number, arg1, arg2, arg3, arg4, arg5, arg6);
     current_syscall_.store(0, std::memory_order_relaxed);

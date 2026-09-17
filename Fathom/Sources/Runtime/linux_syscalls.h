@@ -199,6 +199,8 @@ public:
     /// The syscall this thread is servicing, or 0. Only used to say which call a thread
     /// that could not be stopped for a fork was sitting in.
     uint64_t CurrentSyscall() const { return current_syscall_.load(std::memory_order_relaxed); }
+    /// Its first argument, which for everything that blocks is the descriptor.
+    uint64_t CurrentArgument() const { return current_argument_.load(std::memory_order_relaxed); }
 
     bool InRuntime() const {
         return in_runtime_.load(std::memory_order_acquire) &&
@@ -486,6 +488,7 @@ private:
     bool narrow_time_ {};
     std::atomic<bool> in_runtime_ {false};
     std::atomic<uint64_t> current_syscall_ {0};
+    std::atomic<uint64_t> current_argument_ {0};
     std::atomic<bool> in_blocking_wait_ {false};
 
     /// What prctl(PR_SET_NAME) was told to call this thread.

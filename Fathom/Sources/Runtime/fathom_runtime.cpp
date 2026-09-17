@@ -1048,20 +1048,26 @@ void fathom_session::StartWatchdog() {
                 const uint64_t rip = process->thread == nullptr ? 0 : process->thread->Rip();
                 const bool moved = previous[pid] != rip;
                 previous[pid] = rip;
-                FATHOM_INFO("watchdog: pid %d (%s) in syscall %llu, rip %#llx%s", pid,
+                FATHOM_INFO("watchdog: pid %d (%s) in syscall %llu(%#llx), rip %#llx%s", pid,
                             process->path.c_str(),
                             static_cast<unsigned long long>(process->syscalls == nullptr
                                                                 ? 0
                                                                 : process->syscalls->CurrentSyscall()),
+                            static_cast<unsigned long long>(process->syscalls == nullptr
+                                                                ? 0
+                                                                : process->syscalls->CurrentArgument()),
                             static_cast<unsigned long long>(rip), moved ? "" : " (unchanged)");
                 for (const auto& thread : process->threads) {
                     if (!thread->started || thread->finished.load(std::memory_order_acquire)) {
                         continue;
                     }
-                    FATHOM_INFO("watchdog:   tid %d in %llu, rip %#llx", thread->tid,
+                    FATHOM_INFO("watchdog:   tid %d in %llu(%#llx), rip %#llx", thread->tid,
                                 static_cast<unsigned long long>(thread->syscalls == nullptr
                                                                     ? 0
                                                                     : thread->syscalls->CurrentSyscall()),
+                                static_cast<unsigned long long>(thread->syscalls == nullptr
+                                                                    ? 0
+                                                                    : thread->syscalls->CurrentArgument()),
                                 static_cast<unsigned long long>(thread->thread == nullptr
                                                                     ? 0
                                                                     : thread->thread->Rip()));

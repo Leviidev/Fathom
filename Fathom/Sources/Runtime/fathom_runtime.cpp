@@ -465,6 +465,7 @@ struct fathom_session final : fathom::ProcessHost {
     /// when FATHOM_WATCHDOG names an interval in seconds.
     std::thread watchdog;
     std::atomic<bool> watchdog_stopping {false};
+    void ReportGuestStack(GuestProcess* process, fathom::GuestThread* thread, int tid);
     void StartWatchdog();
     void StopWatchdog();
 };
@@ -1051,6 +1052,47 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
     return tid;
 }
 
+/// Prints the addresses on a stopped guest thread's stack that could be return addresses.
+///
+/// A thread waiting inside a large program is only useful to know about if you can see
+/// what called it, and there is no unwinder here. Scanning the stack for values that land
+/// inside the guest's own address space finds the return addresses among the locals; they
+/// resolve against the "mapped ... code at" lines in this same log. Crude, and enough to
+/// turn "waiting somewhere in Chromium" into a list of functions.
+void fathom_session::ReportGuestStack(GuestProcess* process, fathom::GuestThread* thread, int tid) {
+    if (getenv("FATHOM_WATCHDOG_STACKS") == nullptr || thread == nullptr || space == nullptr) {
+        return;
+    }
+    const uint64_t rsp = thread->Rsp() + process->guest_base;
+    if (rsp == 0 || !space->Validate(rsp, 8, fathom::kGuestProtRead)) {
+        return;
+    }
+    std::string line;
+    unsigned found = 0;
+    for (uint64_t offset = 0; offset < 1024 && found < 20; offset += 8) {
+        const uint64_t at = rsp + offset;
+        if (!space->Validate(at, 8, fathom::kGuestProtRead)) {
+            break;
+        }
+        uint64_t value = 0;
+        std::memcpy(&value, reinterpret_cast<const void*>(at), sizeof(value));
+        fathom::GuestRange range {};
+        if (value == 0 || !space->RangeFor(value, &range)) {
+            continue;
+        }
+        if ((range.protection & fathom::kGuestProtExec) == 0) {
+            continue;
+        }
+        char text[24];
+        std::snprintf(text, sizeof(text), "%#llx ", static_cast<unsigned long long>(value));
+        line += text;
+        ++found;
+    }
+    if (found != 0) {
+        FATHOM_INFO("watchdog:   tid %d stack: %s", tid, line.c_str());
+    }
+}
+
 void fathom_session::StartWatchdog() {
     const char* setting = getenv("FATHOM_WATCHDOG");
     if (setting == nullptr) {
@@ -1104,6 +1146,7 @@ void fathom_session::StartWatchdog() {
                             ? std::string {}
                             : thread->syscalls->DescribeFd(
                                   static_cast<int>(thread->syscalls->CurrentArgument()));
+                    ReportGuestStack(process.get(), thread->thread.get(), thread->tid);
                     FATHOM_INFO("watchdog:   tid %d in %llu(%#llx %s), rip %#llx", thread->tid,
                                 static_cast<unsigned long long>(thread->syscalls == nullptr
                                                                     ? 0

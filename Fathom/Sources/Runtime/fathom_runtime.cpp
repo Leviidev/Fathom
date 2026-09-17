@@ -715,7 +715,12 @@ void fathom_session::ReleaseParent(GuestProcess* process) {
         // The parent's other threads were stopped for the duration of the borrow, and its
         // memory is now back as they left it, so they can go again.
         if (auto* parent = Find(process->ppid)) {
-            ThawThreads(parent);
+            // Held longer only to answer a question: if a child that has finished with its
+            // parent's memory still cannot load its next program, the two were never
+            // sharing anything by then and concurrency is not what is wrong.
+            if (getenv("FATHOM_FREEZE_UNTIL_EXIT") == nullptr) {
+                ThawThreads(parent);
+            }
         }
         process->released = true;
     }
@@ -1323,6 +1328,13 @@ void* RunChildThread(void* raw) {
     fathom::NoteGuestIdentity(process->pid, process->pid, process->is_32bit,
                               process->path.c_str());
     const auto result = session->RunProcess(process);
+
+    if (getenv("FATHOM_FREEZE_UNTIL_EXIT") != nullptr) {
+        std::scoped_lock lock {session->process_mutex};
+        if (auto* parent = session->Find(process->ppid)) {
+            session->ThawThreads(parent);
+        }
+    }
 
     // Its own threads first: they are still running inside the JIT, and everything they
     // are holding -- this process's syscall state, its descriptor table, its stop flag --

@@ -481,11 +481,26 @@ bool BuildInitialStack(GuestAddressSpace& space, uint64_t guest_base, const Load
                        const std::vector<std::string>& argv, const std::vector<std::string>& envp,
                        const std::string& exec_path, uint64_t interpreter_base, uint64_t stack_size,
                        StackImage* out_stack, std::string& error) {
-    const uint64_t base = space.Allocate(stack_size, 0, kGuestProtRead | kGuestProtWrite);
-    if (base == 0) {
+    // A guard below it, which Linux always has and this did not. The arena hands out
+    // whatever is next, so a stack could sit immediately above a library's data with
+    // nothing in between: a program that runs off the bottom of its stack then writes
+    // into that library instead of faulting, and what follows is the library reading its
+    // own variables as nonsense, a long way from the overflow. Reserved as part of the
+    // same allocation and then released, so nothing can be placed there either.
+    const uint64_t guard = space.HostPageSize();
+    const uint64_t reserved = space.Allocate(stack_size + guard, 0,
+                                             kGuestProtRead | kGuestProtWrite);
+    if (reserved == 0) {
         error = "could not allocate the guest stack";
         return false;
     }
+    const uint64_t base = reserved + guard;
+    // Taken out of the guest's reach in both accountings: the address space is told it
+    // permits nothing, so a syscall handed a pointer into it refuses, and the host mapping
+    // is made unreadable, so guest code that walks into it faults there instead of
+    // quietly writing over whatever the arena placed below.
+    space.Protect(reserved, guard, 0);
+    mprotect(reinterpret_cast<void*>(reserved), guard, PROT_NONE);
 
     const uint64_t top = base + stack_size;
 

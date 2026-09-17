@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -71,7 +72,19 @@ GuestAddressSpace* GuestAddressSpace::Reserve(uint64_t size, std::string& error)
     FATHOM_INFO("reserved guest arena: %llu MB at %p (host page size %llu)",
                 static_cast<unsigned long long>(aligned >> 20), address,
                 static_cast<unsigned long long>(page_size));
-    return new GuestAddressSpace {reinterpret_cast<uint64_t>(address), aligned, page_size};
+    auto* space = new GuestAddressSpace {reinterpret_cast<uint64_t>(address), aligned, page_size};
+    // A way to make a program load where it would load in a busier session. Whether a bug
+    // depends on the addresses a program happens to get is otherwise very hard to ask:
+    // reproducing it means reproducing everything that ran before it.
+    if (const char* skip = getenv("FATHOM_ARENA_SKIP")) {
+        const uint64_t bytes = std::strtoull(skip, nullptr, 0);
+        if (bytes > 0 && bytes < aligned) {
+            space->Allocate(bytes, 0, kGuestProtRead);
+            FATHOM_INFO("arena: the first %llu MB are taken, for testing",
+                        static_cast<unsigned long long>(bytes >> 20));
+        }
+    }
+    return space;
 }
 
 bool GuestAddressSpace::TakeFreeExtent(uint64_t address, uint64_t size) {

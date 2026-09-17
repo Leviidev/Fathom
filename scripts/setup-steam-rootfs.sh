@@ -200,10 +200,7 @@ case "$1" in
         # for a system GL driver, and the only 64-bit one available drags a second C
         # library into the process.
         extra="$extra --use-gl=angle --use-angle=swiftshader"
-        # --in-process-gpu: with the zygote gone, every child Chromium wants is a fork of
-        # a browser that already has a dozen threads. Compositing in the browser process
-        # removes the one child it still insists on.
-        extra="$extra --in-process-gpu"
+
         # Set FATHOM_WEBHELPER_VERBOSE to have Chromium say what it is doing; its log
         # goes wherever Steam pointed --log-file, which is the Steam logs directory.
         if [ -n "${FATHOM_WEBHELPER_VERBOSE:-}" ]; then

@@ -124,6 +124,11 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end);
 void HoldInvalidations();
 void ReleaseInvalidations();
 
+/// Queues a range to be thrown away by a thread of the runtime's own, rather than by the
+/// caller. For callers that are holding something: the process table, or a guest thread
+/// that must not stop here. The range is dropped as soon as nothing is suspended.
+void InvalidateCompiledCodeLater(uint64_t host_begin, uint64_t host_end);
+
 class FexEngine {
 public:
     static std::unique_ptr<FexEngine> Create(GuestAddressSpace& space, const EngineOptions& options,

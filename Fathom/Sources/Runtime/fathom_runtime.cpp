@@ -878,7 +878,7 @@ void fathom_session::ReleaseParent(GuestProcess* process) {
     // back can be thrown away. Blocks compiled while the child was running reflect bytes
     // the child put there, and the parent is about to run in that memory again.
     for (const auto& [begin, end] : stale) {
-        space->NotifyContentsReplaced(begin, end);
+        fathom::InvalidateCompiledCodeLater(begin, end);
     }
 }
 

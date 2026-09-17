@@ -34,6 +34,8 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <thread>
+#include <condition_variable>
 #include <vector>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -772,6 +774,49 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
     }
 }
 
+namespace {
+
+/// The runtime's own invalidator. Everything queued here is thrown away on this thread
+/// and not on the guest's, because the callers that queue are holding something a guest
+/// thread needs -- the process table, most of all -- and waiting for FEXCore's lock with
+/// it held stops the session.
+std::mutex g_queue_mutex;
+std::condition_variable g_queue_signal;
+std::vector<std::pair<uint64_t, uint64_t>> g_queue;
+std::once_flag g_queue_started;
+
+void RunInvalidator() {
+    for (;;) {
+        std::vector<std::pair<uint64_t, uint64_t>> batch;
+        {
+            std::unique_lock lock {g_queue_mutex};
+            g_queue_signal.wait(lock, [] { return !g_queue.empty(); });
+            batch.swap(g_queue);
+        }
+        for (const auto& [begin, end] : batch) {
+            InvalidateCompiledCode(begin, end);
+        }
+    }
+}
+
+void Queue(std::vector<std::pair<uint64_t, uint64_t>> ranges) {
+    if (ranges.empty()) {
+        return;
+    }
+    std::call_once(g_queue_started, [] { std::thread {RunInvalidator}.detach(); });
+    {
+        std::scoped_lock lock {g_queue_mutex};
+        g_queue.insert(g_queue.end(), ranges.begin(), ranges.end());
+    }
+    g_queue_signal.notify_one();
+}
+
+} // namespace
+
+void InvalidateCompiledCodeLater(uint64_t host_begin, uint64_t host_end) {
+    Queue({{host_begin, host_end}});
+}
+
 void HoldInvalidations() {
     g_freezes.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -785,9 +830,9 @@ void ReleaseInvalidations() {
         std::scoped_lock lock {g_deferred_mutex};
         pending.swap(g_deferred);
     }
-    for (const auto& [begin, end] : pending) {
-        InvalidateCompiledCode(begin, end);
-    }
+    // Not here: a thaw happens with the process table held, and this is exactly the wait
+    // that must not happen with it held.
+    Queue(std::move(pending));
 }
 
 // ---------------------------------------------------------------------------

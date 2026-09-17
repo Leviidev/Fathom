@@ -4912,6 +4912,17 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                 result = 0;
             }
         }
+        // Every local socket a process reaches for, said out loud. There are only a few
+        // per process and they are how the parts of a program find each other -- Steam's
+        // client and its web helper among them -- so a connection that never happens is
+        // otherwise invisible.
+        if (host_address.ss_family == AF_UNIX) {
+            const auto* local = reinterpret_cast<const sockaddr_un*>(&host_address);
+            FATHOM_INFO("[pid %d] %s fd %d to %s%s%s", pid_,
+                        number == kSysConnect ? "connect" : "bind", static_cast<int>(arg1),
+                        local->sun_path, result < 0 ? " failed: " : "",
+                        result < 0 ? std::strerror(errno) : "");
+        }
         if (result < 0) {
             char text[64] = "?";
             if (host_address.ss_family == AF_INET) {

@@ -153,6 +153,13 @@ public:
     /// The same question without marking anything.
     bool HasHeldCode(uint64_t begin, uint64_t end) const;
 
+    /// Whether anything has ever been committed near `address`. Lock-free and coarse,
+    /// for a signal handler: a false yes costs nothing, and a no is certain. The arena's
+    /// whole span is reserved and host-readable whether or not the guest has been given
+    /// any of it, so asking the kernel cannot tell a guest pointer from a wild one --
+    /// only this can.
+    bool MaybeCommitted(uint64_t address) const;
+
     /// Says that the bytes in this range are not the bytes that were there before, even
     /// though it was never released. A loader mapping a library's segments over a span it
     /// had already reserved does exactly this.
@@ -218,6 +225,7 @@ private:
     /// stale code. Lock-free because it sits on the mmap path.
 
     std::unique_ptr<std::atomic<uint64_t>[]> code_words_;
+    std::unique_ptr<std::atomic<uint64_t>[]> committed_words_;
     uint64_t code_grain_ {};
     uint64_t code_word_count_ {};
 

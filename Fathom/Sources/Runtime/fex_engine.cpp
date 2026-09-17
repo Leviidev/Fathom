@@ -302,13 +302,16 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     // and steps over the instruction, which for a wild pointer means carrying on with
     // nonsense: the 32-bit Steam client did exactly that, at a rate of three hundred
     // thousand faults a second, ending in "stack smashing detected".
-    // Asked of the kernel, not of the address space. This runs hundreds of thousands of
-    // times a second inside a signal handler, and the address space is guarded by a
-    // shared_mutex whose internals are not safe to touch from one -- a handler that
-    // interrupts its own thread between two of those operations leaves the lock in a
-    // state nothing recovers from. write() to /dev/null answers the same question by
-    // syscall, which a handler may make.
-    const bool wild = !Readable(info->si_addr, 1);
+    // Asked of a lock-free map, not of the address space's range list. This runs inside
+    // a signal handler hundreds of thousands of times a second, and the range list is
+    // guarded by a shared_mutex whose internals are not safe to touch from one. Asking
+    // the kernel instead does not work either: the arena's whole span is reserved and
+    // readable whether or not the guest has been given any of it, so every address looks
+    // valid to a write() probe.
+    bool wild = false;
+    if (auto* space = g_arena_space.load(std::memory_order_acquire)) {
+        wild = !space->MaybeCommitted(reinterpret_cast<uint64_t>(info->si_addr));
+    }
     if (wild) {
         // Stepping over the instruction is not a fix -- the guest carries on with a
         // register it never loaded -- but it is what the program has been surviving on,
@@ -399,10 +402,14 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     const auto fixups = g_alignment_fixups.fetch_add(1, std::memory_order_relaxed) + 1;
     if ((fixups & 0xFFFFF) == 0) {
         FATHOM_INFO("%llu unaligned accesses emulated so far; the last was guest rip %#llx "
-                    "at address %p",
+                    "at address %p, from generated code at %#llx (%u faults there, %s)",
                     static_cast<unsigned long long>(fixups),
                     static_cast<unsigned long long>(g_active.thread->CurrentFrame->State.rip),
-                    info->si_addr);
+                    info->si_addr, static_cast<unsigned long long>(pc),
+                    RepeatedFaultSite(pc),
+                    type == FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic
+                        ? "non-atomic"
+                        : "half-barrier");
     }
     return true;
 #else

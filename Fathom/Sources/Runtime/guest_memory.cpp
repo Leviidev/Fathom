@@ -43,8 +43,10 @@ GuestAddressSpace::GuestAddressSpace(uint64_t base, uint64_t size, uint64_t page
     }
     code_word_count_ = size / code_grain_ / 64 + 1;
     code_words_ = std::make_unique<std::atomic<uint64_t>[]>(code_word_count_);
+    committed_words_ = std::make_unique<std::atomic<uint64_t>[]>(code_word_count_);
     for (uint64_t i = 0; i < code_word_count_; ++i) {
         code_words_[i].store(0, std::memory_order_relaxed);
+        committed_words_[i].store(0, std::memory_order_relaxed);
     }
 }
 
@@ -74,6 +76,18 @@ bool GuestAddressSpace::NoteExecutable(uint64_t begin, uint64_t end) {
         return true;
     }
     return WalkCodeMap(code_words_.get(), code_word_count_, base_, code_grain_, begin, end, true);
+}
+
+bool GuestAddressSpace::MaybeCommitted(uint64_t address) const {
+    if (committed_words_ == nullptr || address < base_ || address >= base_ + size_) {
+        return true;
+    }
+    const uint64_t grain = (address - base_) / code_grain_;
+    const uint64_t word = grain / 64;
+    if (word >= code_word_count_) {
+        return true;
+    }
+    return (committed_words_[word].load(std::memory_order_relaxed) & (1ull << (grain % 64))) != 0;
 }
 
 bool GuestAddressSpace::HasHeldCode(uint64_t begin, uint64_t end) const {
@@ -355,6 +369,17 @@ size_t GuestAddressSpace::FirstRangeEndingAfter(uint64_t address) const {
 }
 
 void GuestAddressSpace::RecordCommitted(uint64_t address, uint64_t size, int protection) {
+    if (committed_words_ != nullptr && size != 0 && address >= base_ &&
+        address + size <= base_ + size_) {
+        // Remembered one way only: a grain that has ever held guest memory stays marked,
+        // so that a signal handler asking "could this address be the guest's?" is never
+        // told no about memory that was simply freed.
+        const uint64_t first = (address - base_) / code_grain_;
+        const uint64_t last = (address + size - 1 - base_) / code_grain_;
+        for (uint64_t grain = first; grain <= last && grain / 64 < code_word_count_; ++grain) {
+            committed_words_[grain / 64].fetch_or(1ull << (grain % 64), std::memory_order_relaxed);
+        }
+    }
     const uint64_t end = address + size;
     std::vector<GuestRange> updated;
     updated.reserve(committed_.size() + 2);

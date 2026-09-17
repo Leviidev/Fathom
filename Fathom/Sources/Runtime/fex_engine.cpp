@@ -196,6 +196,16 @@ private:
     std::array<FEXCore::Core::CPUState::gdt_segment, kGdtEntries> gdt_ {};
 };
 
+/// Serialises every creation and destruction of a FEXCore thread, across every context.
+///
+/// FEXCore's own CreateThread takes no locks, and the JIT core it builds claims a code
+/// buffer from a pool shared by the whole process. Two of them at once leave one thread
+/// holding a half-built dispatcher, and the first thing that thread does is call through
+/// it -- a jump to address zero, on a thread whose only frame is the one that started it.
+/// Fathom reaches this from three directions at once (a program starting, a thread
+/// cloning, a process forking) and only one of those was ever under a lock.
+std::mutex g_thread_lifecycle;
+
 /// The FEXCore thread executing on this host thread, if any.
 ///
 /// The alignment-fault handler needs it, and a signal handler cannot be passed context
@@ -600,6 +610,7 @@ public:
     ~Impl() {
         if (context != nullptr && thread != nullptr) {
             ForgetLiveThread(thread);
+            std::scoped_lock guard {g_thread_lifecycle};
             context->DestroyThread(thread);
             thread = nullptr;
         }
@@ -872,7 +883,10 @@ std::unique_ptr<GuestThread> FexEngine::StartThread(uint64_t rip, uint64_t rsp, 
     }
 
     impl->guest_base = impl_->guest_base;
-    impl->thread = impl_->context->CreateThread(rip, rsp);
+    {
+        std::scoped_lock guard {g_thread_lifecycle};
+        impl->thread = impl_->context->CreateThread(rip, rsp);
+    }
     if (impl->thread == nullptr) {
         error = "FEXCore could not create the guest thread";
         return nullptr;
@@ -943,8 +957,11 @@ std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, Li
     }
 
     impl->guest_base = impl_->guest_base;
-    impl->thread = impl_->context->CreateThread(resume, child_state.gregs[FEXCore::X86State::REG_RSP],
-                                                &child_state);
+    {
+        std::scoped_lock guard {g_thread_lifecycle};
+        impl->thread = impl_->context->CreateThread(resume, child_state.gregs[FEXCore::X86State::REG_RSP],
+                                                    &child_state);
+    }
     if (impl->thread == nullptr) {
         error = "FEXCore could not create the child guest thread";
         return nullptr;

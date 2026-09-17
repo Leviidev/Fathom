@@ -327,7 +327,12 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
                         info->si_addr, static_cast<unsigned long long>(seen),
                         static_cast<unsigned long long>(g_active.thread->CurrentFrame->State.rip));
         }
-        if (seen > 1024) {
+        // Generous, because this is noise rather than a symptom on its own: the arena's
+        // span is reserved and readable whether or not the guest was given it, so a read
+        // just past what the guest asked for finds zeroes rather than a fault on Linux
+        // too. A million of them, though, is a thread that has lost its way and is
+        // running in a loop, and that is worth ending.
+        if (seen > (1u << 20)) {
             return false;
         }
     }

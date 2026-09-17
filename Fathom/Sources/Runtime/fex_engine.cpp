@@ -85,6 +85,9 @@ public:
         FEXCore::Config::Set(FEXCore::Config::CONFIG_DISABLETELEMETRY, "1");
         FEXCore::Config::Set(FEXCore::Config::CONFIG_MULTIBLOCK, options.multiblock ? "1" : "0");
         FEXCore::Config::Set(FEXCore::Config::CONFIG_TSOENABLED, options.tso_enabled ? "1" : "0");
+        // Matches the handler above: unaligned accesses are backpatched to something
+        // that cannot fault again.
+        FEXCore::Config::Set(FEXCore::Config::CONFIG_HALFBARRIERTSOENABLED, "0");
         FEXCore::Config::Set(FEXCore::Config::CONFIG_X87REDUCEDPRECISION,
                              options.reduced_precision_x87 ? "1" : "0");
         FEXCore::Config::Set(FEXCore::Config::CONFIG_X86DISASSEMBLE, options.disassemble ? "1" : "0");
@@ -275,8 +278,16 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     const auto writable_pc =
         reinterpret_cast<uintptr_t>(FEXCore::Allocator::GetWritableAddress(reinterpret_cast<void*>(pc)));
 
+    // Non-atomic, not half-barrier. A half-barrier patch is still an atomic instruction,
+    // and an atomic instruction on an unaligned address faults again -- every time the
+    // site is executed, for the life of the process. Measured on Steam: 127 million
+    // signals in five minutes. The patch has to be to something that cannot fault, which
+    // costs the atomicity of unaligned accesses through that site. That is a real loss,
+    // and it is the smaller one: a signal here costs about ninety seconds on a device
+    // with a debugger attached, which JIT requires, so a faulting site is not slow but
+    // fatal.
     const auto adjustment = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
-        g_active.thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier,
+        g_active.thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic,
         writable_pc, registers.data());
     if (!adjustment.has_value()) {
         return false;

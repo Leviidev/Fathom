@@ -3915,7 +3915,8 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
     current_argument_.store(arg1, std::memory_order_relaxed);
     current_syscall_.store(number, std::memory_order_relaxed);
     const auto result = Dispatch(number, arg1, arg2, arg3, arg4, arg5, arg6);
-    current_syscall_.store(0, std::memory_order_relaxed);
+    last_syscall_.store(number, std::memory_order_relaxed);
+    current_syscall_.store(kNoSyscall, std::memory_order_relaxed);
 
     if (!config_.trace) {
         // Every refusal, without the volume of a full trace. A guest that gives up rather

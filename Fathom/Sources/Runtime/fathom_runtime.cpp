@@ -1127,11 +1127,14 @@ void fathom_session::StartWatchdog() {
                                            ? std::string {}
                                            : process->syscalls->DescribeFd(static_cast<int>(
                                                  process->syscalls->CurrentArgument()));
-                FATHOM_INFO("watchdog: pid %d (%s) in syscall %llu(%#llx %s), rip %#llx%s", pid,
+                FATHOM_INFO("watchdog: pid %d (%s) in %s%llu(%#llx %s), rip %#llx%s", pid,
                             process->path.c_str(),
+                            process->syscalls != nullptr && process->syscalls->InSyscall()
+                                ? "syscall "
+                                : "guest code, last syscall ",
                             static_cast<unsigned long long>(process->syscalls == nullptr
                                                                 ? 0
-                                                                : process->syscalls->CurrentSyscall()),
+                                                                : process->syscalls->SyscallForReport()),
                             static_cast<unsigned long long>(process->syscalls == nullptr
                                                                 ? 0
                                                                 : process->syscalls->CurrentArgument()),
@@ -1147,10 +1150,13 @@ void fathom_session::StartWatchdog() {
                             : thread->syscalls->DescribeFd(
                                   static_cast<int>(thread->syscalls->CurrentArgument()));
                     ReportGuestStack(process.get(), thread->thread.get(), thread->tid);
-                    FATHOM_INFO("watchdog:   tid %d in %llu(%#llx %s), rip %#llx", thread->tid,
+                    FATHOM_INFO("watchdog:   tid %d in %s%llu(%#llx %s), rip %#llx", thread->tid,
+                                thread->syscalls != nullptr && thread->syscalls->InSyscall()
+                                    ? ""
+                                    : "guest code, last ",
                                 static_cast<unsigned long long>(thread->syscalls == nullptr
                                                                     ? 0
-                                                                    : thread->syscalls->CurrentSyscall()),
+                                                                    : thread->syscalls->SyscallForReport()),
                                 static_cast<unsigned long long>(thread->syscalls == nullptr
                                                                     ? 0
                                                                     : thread->syscalls->CurrentArgument()),

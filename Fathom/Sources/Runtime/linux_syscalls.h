@@ -204,6 +204,12 @@ public:
     /// The syscall this thread is servicing, or 0. Only used to say which call a thread
     /// that could not be stopped for a fork was sitting in.
     uint64_t CurrentSyscall() const { return current_syscall_.load(std::memory_order_relaxed); }
+    bool InSyscall() const { return CurrentSyscall() != kNoSyscall; }
+    /// The one being serviced, or the one before if none is.
+    uint64_t SyscallForReport() const {
+        const uint64_t now = CurrentSyscall();
+        return now != kNoSyscall ? now : last_syscall_.load(std::memory_order_relaxed);
+    }
     /// Its first argument, which for everything that blocks is the descriptor.
     uint64_t CurrentArgument() const { return current_argument_.load(std::memory_order_relaxed); }
     /// What a descriptor was opened as, for a report about a process that is waiting on
@@ -514,7 +520,10 @@ private:
     /// Set for the duration of one i386 time32 syscall. See TimeWidth.
     bool narrow_time_ {};
     std::atomic<bool> in_runtime_ {false};
-    std::atomic<uint64_t> current_syscall_ {0};
+    /// The syscall being serviced, or none. Not zero for "none": zero is read.
+    static constexpr uint64_t kNoSyscall = ~0ull;
+    std::atomic<uint64_t> current_syscall_ {kNoSyscall};
+    std::atomic<uint64_t> last_syscall_ {kNoSyscall};
     std::atomic<uint64_t> current_argument_ {0};
     std::atomic<bool> in_blocking_wait_ {false};
 

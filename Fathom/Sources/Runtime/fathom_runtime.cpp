@@ -617,11 +617,14 @@ void fathom_session::RestoreBorrowedMemory(GuestProcess* process) {
             if (space->EpochAt(region.address) != region.epoch ||
                 !space->Validate(region.address, region.bytes.size(),
                                  fathom::kGuestProtWrite)) {
-                FATHOM_WARN("fork: not putting back %#llx..%#llx for pid %d -- it is not the "
-                            "memory the copy was taken from any more",
+                FATHOM_WARN("fork: not putting back %#llx..%#llx for pid %d -- epoch %llu, "
+                            "now %llu, writable %d",
                             static_cast<unsigned long long>(region.address),
                             static_cast<unsigned long long>(region.address + region.bytes.size()),
-                            process->ppid);
+                            process->ppid, static_cast<unsigned long long>(region.epoch),
+                            static_cast<unsigned long long>(space->EpochAt(region.address)),
+                            space->Validate(region.address, region.bytes.size(),
+                                            fathom::kGuestProtWrite) ? 1 : 0);
                 continue;
             }
             // Put the parent's memory back exactly as the fork found it, before anything
@@ -917,7 +920,7 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
         // Nothing is held when the child was given a stack of its own: it never returns
         // through its parent's frames, so there is nothing of the parent's to put back.
         uint64_t held = 0;
-        if (stack != 0) {
+        if (stack != 0 || getenv("FATHOM_FORK_NONE") != nullptr) {
             FATHOM_INFO("fork: pid %d starts pid %d on its own stack %#llx", caller_pid,
                         child_pid, static_cast<unsigned long long>(stack));
         } else {

@@ -125,6 +125,15 @@ public:
     using ReleaseObserver = void (*)(uint64_t host_begin, uint64_t host_end);
     void SetReleaseObserver(ReleaseObserver observer) { release_observer_ = observer; }
 
+    /// Says that the bytes in this range are not the bytes that were there before, even
+    /// though it was never released. A loader mapping a library's segments over a span it
+    /// had already reserved does exactly this.
+    void NotifyContentsReplaced(uint64_t begin, uint64_t end) const {
+        if (release_observer_ != nullptr && end > begin) {
+            release_observer_(begin, end);
+        }
+    }
+
     /// How much of the arena is still free, and the largest single run of it. Only for
     /// reporting: an allocation that fails wants to say whether the arena is full or
     /// merely shredded.

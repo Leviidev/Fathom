@@ -103,17 +103,66 @@ bool GuestAddressSpace::TakeFreeExtent(uint64_t address, uint64_t size) {
 
 namespace {
 
-/// Commits a range of the arena as fresh, zeroed, anonymous memory.
+/// Returns a range of the arena to the state it was reserved in: unreadable, unwritable,
+/// backed by nothing, and able to be made writable again.
 ///
-/// Not mprotect: a guest that mapped a file into the arena left a mapping whose *maximum*
-/// protection is whatever the file allowed, and a read-only file leaves a range that can
-/// never be made writable again. The next program placed there fails to commit with
-/// EACCES, a long way from the mmap that caused it. Mapping over it restores both the
-/// protection ceiling and the guarantee that new guest memory reads as zero.
-bool CommitAnonymous(uint64_t address, uint64_t length, int host_protection) {
-    void* placed = mmap(reinterpret_cast<void*>(address), length, host_protection,
+/// Not mprotect: a guest that mapped a file here left a mapping whose *maximum* protection
+/// is whatever the file allowed, and a read-only file leaves a range that can never be
+/// made writable again -- so the next program placed there fails to commit, with EACCES, a
+/// long way from the mmap that caused it. Only ever used on memory nothing holds any more:
+/// mapping over a range also zeroes it, and the guest's 4KB pages share this device's 16KB
+/// ones, so doing it to a range that is merely being re-protected would wipe up to three
+/// live neighbours -- which reads, much later, as a thread whose stack pointer is zero.
+bool MapFreshAnonymous(uint64_t address, uint64_t length) {
+    void* placed = mmap(reinterpret_cast<void*>(address), length, PROT_NONE,
                         MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return placed != MAP_FAILED && reinterpret_cast<uint64_t>(placed) == address;
+}
+
+
+
+/// Makes [begin, end) usable at `host_protection`, with anything not already spoken for
+/// reading as zero.
+///
+/// Linux hands out zeroed pages, and a dynamic loader depends on that completely. The
+/// arena is reused as processes come and go, so a range handed out again still holds the
+/// last owner's bytes unless something clears it -- and mapping over it is how that is
+/// done, because it also restores the protection ceiling a mapped file left behind.
+///
+/// Only over pages nothing else is living in, though. The guest's pages are 4KB and this
+/// device's are 16KB, so a span rounded outward to host pages can cover up to three
+/// neighbouring guest pages that are still in use; mapping over those wipes them, and it
+/// reads much later as a thread whose stack pointer and saved registers are all zero.
+bool CommitRange(uint64_t begin, uint64_t end, uint64_t page_size, int host_protection,
+                 const std::vector<GuestRange>& committed) {
+    uint64_t run_begin = 0;
+    uint64_t run_end = 0;
+    const auto flush = [&] {
+        if (run_end > run_begin) {
+            MapFreshAnonymous(run_begin, run_end - run_begin);
+        }
+        run_begin = run_end = 0;
+    };
+    for (uint64_t page = begin; page < end; page += page_size) {
+        bool occupied = false;
+        for (const auto& range : committed) {
+            if (range.begin < page + page_size && range.end() > page) {
+                occupied = true;
+                break;
+            }
+        }
+        if (occupied) {
+            flush();
+            continue;
+        }
+        if (run_end != page) {
+            flush();
+            run_begin = page;
+        }
+        run_end = page + page_size;
+    }
+    flush();
+    return mprotect(reinterpret_cast<void*>(begin), end - begin, host_protection) == 0;
 }
 
 } // namespace
@@ -155,7 +204,8 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
         const uint64_t aligned_hint = AlignDown(hint);
         if (aligned_hint >= base_ && aligned_hint + length <= base_ + size_ &&
             TakeFreeExtent(aligned_hint, length)) {
-            if (!CommitAnonymous(aligned_hint, length, ToHostProtection(protection))) {
+            if (!CommitRange(aligned_hint, aligned_hint + length, page_size_,
+                             ToHostProtection(protection), committed_)) {
                 FATHOM_WARN("commit at hint %#llx failed: %s",
                             static_cast<unsigned long long>(aligned_hint), std::strerror(errno));
                 ReturnFreeExtent(aligned_hint, length);
@@ -176,7 +226,8 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
         if (!TakeFreeExtent(address, length)) {
             continue;
         }
-        if (!CommitAnonymous(address, length, ToHostProtection(protection))) {
+        if (!CommitRange(address, address + length, page_size_,
+                         ToHostProtection(protection), committed_)) {
             FATHOM_WARN("commit of %llu bytes at %#llx failed: %s (arena %#llx..%#llx)",
                         static_cast<unsigned long long>(length),
                         static_cast<unsigned long long>(address), std::strerror(errno),
@@ -220,7 +271,7 @@ bool GuestAddressSpace::CommitFixed(uint64_t address, uint64_t size, int protect
         // ELF segments routinely share a host page with the segment before them.
         return ProtectLocked(begin, end - begin, protection);
     }
-    if (!CommitAnonymous(begin, end - begin, ToHostProtection(protection))) {
+    if (!CommitRange(begin, end, page_size_, ToHostProtection(protection), committed_)) {
         FATHOM_ERROR("fixed commit at %#llx (%llu bytes) failed: %s",
                      static_cast<unsigned long long>(begin),
                      static_cast<unsigned long long>(end - begin), std::strerror(errno));
@@ -283,9 +334,7 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
         // file gives a range that can never be made writable again -- so the next program
         // loaded at that address fails to commit, with EACCES, a long way from the mmap
         // that caused it. This also drops the pages, which is what the madvise was for.
-        void* fresh = mmap(reinterpret_cast<void*>(run_begin), length, PROT_NONE,
-                           MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (fresh == MAP_FAILED) {
+        if (!MapFreshAnonymous(run_begin, length)) {
             FATHOM_WARN("release at %#llx (%llu KB) failed: %s",
                         static_cast<unsigned long long>(run_begin),
                         static_cast<unsigned long long>(length / 1024), std::strerror(errno));

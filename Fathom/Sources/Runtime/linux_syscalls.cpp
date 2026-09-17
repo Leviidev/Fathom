@@ -2022,6 +2022,11 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
             return FailLinux(12);
         }
         placed = address;
+        // The contents about to be written here are not what was here before, and this
+        // range was never released -- a loader maps a library's whole span and then maps
+        // each of its segments over the top. Any code compiled from the old bytes has to
+        // go, or the new library runs as the old one.
+        space_.NotifyContentsReplaced(placed, placed + length);
     } else {
         // Writable regardless of what the guest asked for: file-backed contents have to
         // be written in below, and the real protection is applied afterwards.

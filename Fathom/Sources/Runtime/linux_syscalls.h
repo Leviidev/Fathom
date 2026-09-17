@@ -201,6 +201,9 @@ public:
     uint64_t CurrentSyscall() const { return current_syscall_.load(std::memory_order_relaxed); }
     /// Its first argument, which for everything that blocks is the descriptor.
     uint64_t CurrentArgument() const { return current_argument_.load(std::memory_order_relaxed); }
+    /// What a descriptor was opened as, for a report about a process that is waiting on
+    /// it. Empty when the number is not one of this process's.
+    std::string DescribeFd(int fd) const;
 
     bool InRuntime() const {
         return in_runtime_.load(std::memory_order_acquire) &&

@@ -895,6 +895,15 @@ void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
     child.thread_name_ = thread_name_;
 }
 
+std::string LinuxSyscalls::DescribeFd(int fd) const {
+    if (fd == 0) {
+        return "the console";
+    }
+    std::scoped_lock lock {shared_->mutex};
+    const auto found = shared_->files.find(fd);
+    return found == shared_->files.end() ? std::string {} : found->second.guest_path;
+}
+
 uint64_t LinuxSyscalls::HeapBreak() const {
     return shared_->heap_break;
 }

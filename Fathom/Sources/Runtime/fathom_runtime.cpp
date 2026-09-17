@@ -1048,7 +1048,11 @@ void fathom_session::StartWatchdog() {
                 const uint64_t rip = process->thread == nullptr ? 0 : process->thread->Rip();
                 const bool moved = previous[pid] != rip;
                 previous[pid] = rip;
-                FATHOM_INFO("watchdog: pid %d (%s) in syscall %llu(%#llx), rip %#llx%s", pid,
+                const std::string on = process->syscalls == nullptr
+                                           ? std::string {}
+                                           : process->syscalls->DescribeFd(static_cast<int>(
+                                                 process->syscalls->CurrentArgument()));
+                FATHOM_INFO("watchdog: pid %d (%s) in syscall %llu(%#llx %s), rip %#llx%s", pid,
                             process->path.c_str(),
                             static_cast<unsigned long long>(process->syscalls == nullptr
                                                                 ? 0
@@ -1056,6 +1060,7 @@ void fathom_session::StartWatchdog() {
                             static_cast<unsigned long long>(process->syscalls == nullptr
                                                                 ? 0
                                                                 : process->syscalls->CurrentArgument()),
+                            on.c_str(),
                             static_cast<unsigned long long>(rip), moved ? "" : " (unchanged)");
                 for (const auto& thread : process->threads) {
                     if (!thread->started || thread->finished.load(std::memory_order_acquire)) {

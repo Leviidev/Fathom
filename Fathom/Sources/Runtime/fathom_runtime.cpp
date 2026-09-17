@@ -15,7 +15,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <dlfcn.h>
+#include <mach/arm/thread_status.h>
 #include <mach/mach.h>
+#include <mach/thread_act.h>
 #include <pthread.h>
 
 #include <csignal>
@@ -1552,6 +1555,33 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
                     sample = child_raw->thread == nullptr ? 0 : child_raw->thread->Rip();
                     std::this_thread::sleep_for(std::chrono::milliseconds(120));
                 }
+                // And where the *host* thread is. A guest rip that never moves says the
+                // child has not started; it does not say what is stopping it, and the
+                // answer has been somewhere different every time.
+                const auto port = pthread_mach_thread_np(child_raw->host_thread);
+                if (port != MACH_PORT_NULL && thread_suspend(port) == KERN_SUCCESS) {
+                    arm_thread_state64_t state {};
+                    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+                    if (thread_get_state(port, ARM_THREAD_STATE64,
+                                         reinterpret_cast<thread_state_t>(&state),
+                                         &count) == KERN_SUCCESS) {
+                        const auto pc = reinterpret_cast<void*>(
+                            static_cast<uintptr_t>(arm_thread_state64_get_pc(state)));
+                        const auto lr = reinterpret_cast<void*>(
+                            static_cast<uintptr_t>(arm_thread_state64_get_lr(state)));
+                        Dl_info here {};
+                        Dl_info called_from {};
+                        FATHOM_WARN("fork: pid %d's host thread is at %p (%s) called from %p (%s)",
+                                    child_pid, pc,
+                                    dladdr(pc, &here) && here.dli_sname != nullptr ? here.dli_sname
+                                                                                   : "?",
+                                    lr,
+                                    dladdr(lr, &called_from) && called_from.dli_sname != nullptr
+                                        ? called_from.dli_sname
+                                        : "?");
+                    }
+                    thread_resume(port);
+                }
                 FATHOM_WARN("fork: pid %d has held its parent's memory for five seconds "
                             "(syscall %llu, rip %#llx %#llx %#llx %#llx, rsp %#llx); letting "
                             "pid %d's other threads run again and giving up the copy",
@@ -1731,9 +1761,14 @@ void* RunChildThread(void* raw) {
     auto* process = start->process;
 
     FATHOM_INFO("pid %d: running", process->pid);
+    const auto started = std::chrono::steady_clock::now();
     fathom::NoteGuestIdentity(process->pid, process->pid, process->is_32bit,
                               process->path.c_str());
     const auto result = session->RunProcess(process);
+    const auto ran = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - started)
+                         .count();
+    FATHOM_INFO("pid %d: ran for %lld ms", process->pid, static_cast<long long>(ran));
 
     // Its own threads first: they are still running inside the JIT, and everything they
     // are holding -- this process's syscall state, its descriptor table, its stop flag --

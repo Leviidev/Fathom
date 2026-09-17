@@ -938,6 +938,16 @@ RunResult GuestThread::Run() {
     g_current_syscalls = &impl_->syscalls;
     g_current_guest_thread = this;
     g_current_guest_base = impl_->guest_base;
+    // Timed, because a guest thread that takes seconds to reach its first instruction is
+    // invisible from outside -- the process exists, its rip never moves -- and a forked
+    // child that starts late is a child still standing in its parent's memory when the
+    // fork gives up waiting and lets the parent run there again.
+    const auto entered = std::chrono::steady_clock::now();
+    const auto elapsed = [&] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - entered)
+            .count();
+    };
     {
         // This host thread is the one that will be running compiled code for this guest
         // thread, and only it can say which it is.
@@ -954,6 +964,10 @@ RunResult GuestThread::Run() {
     // normally; exit_group happens deep inside a syscall with JIT frames still on the
     // host stack, and the only way out of there is to unwind past them. FEX's own thread
     // exit does exactly this, which is why FEXCore ships the jump buffer used here.
+    if (elapsed() > 200) {
+        FATHOM_WARN("guest thread waited %lld ms to be listed before it could start",
+                    static_cast<long long>(elapsed()));
+    }
     if (FEXCore::UncheckedLongJump::SetJump(impl_->exit_jump) == 0) {
         impl_->exit_jump_armed = true;
         g_active = ActiveExecution {impl_->context, impl_->thread};

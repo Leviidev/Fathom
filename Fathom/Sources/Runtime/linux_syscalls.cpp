@@ -4606,8 +4606,13 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         constexpr int kFutexRequeue = 3;
         constexpr int kFutexCmpRequeue = 4;
         constexpr int kFutexWakeOp = 5;
+        constexpr int kFutexLockPi = 6;
+        constexpr int kFutexUnlockPi = 7;
+        constexpr int kFutexTrylockPi = 8;
         constexpr int kFutexWaitBitset = 9;
         constexpr int kFutexWakeBitset = 10;
+        constexpr uint32_t kFutexTidMask = 0x3FFF'FFFFu;
+        constexpr uint32_t kFutexWaiters = 0x8000'0000u;
         // The PRIVATE and CLOCK_REALTIME bits change nothing here: every guest thread is
         // a thread of this one host process, so private and shared are the same thing.
         const int operation = static_cast<int>(arg2) & 0x7f;
@@ -4742,11 +4747,69 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                 }
             }
         }
+        // Priority-inheritance mutexes. There is no priority to inherit here -- every
+        // guest thread is an ordinary thread of one host process and Darwin schedules them
+        // -- but the *protocol* is what matters: the word holds the owning thread's id,
+        // with the top bit set when somebody is waiting. Steam's client and its web helper
+        // share a mutex of this kind across processes, and answering "not implemented" to
+        // the unlock leaves it locked forever by a thread that has long since let go.
+        case kFutexLockPi:
+        case kFutexTrylockPi: {
+            auto* value = static_cast<std::atomic<uint32_t>*>(
+                GuestPointer(arg1, sizeof(uint32_t), true));
+            if (value == nullptr) {
+                return FailLinux(14);
+            }
+            const uint32_t mine = static_cast<uint32_t>(tid_ == 0 ? pid_ : tid_) & kFutexTidMask;
+            const auto waiting = EnterBlockingWait();
+            for (;;) {
+                uint32_t held = value->load(std::memory_order_acquire);
+                if ((held & kFutexTidMask) == 0) {
+                    uint32_t taken = mine | (held & kFutexWaiters);
+                    if (value->compare_exchange_weak(held, taken, std::memory_order_acq_rel)) {
+                        return 0;
+                    }
+                    continue;
+                }
+                if ((held & kFutexTidMask) == mine) {
+                    return FailLinux(35); // EDEADLK: already ours.
+                }
+                if (operation == kFutexTrylockPi) {
+                    return FailLinux(16); // EBUSY
+                }
+                // Tell the owner there is somebody here, then wait to be woken.
+                value->compare_exchange_weak(held, held | kFutexWaiters, std::memory_order_acq_rel);
+                std::unique_lock lock {FutexQueue().mutex};
+                if ((value->load(std::memory_order_acquire) & kFutexTidMask) == 0) {
+                    continue;
+                }
+                if (ShouldStop()) {
+                    lock.unlock();
+                    exit_status_ = -1;
+                    control_.ExitGuest(-1);
+                }
+                FutexQueue().changed.wait_for(lock, std::chrono::milliseconds(20));
+            }
+        }
+        case kFutexUnlockPi: {
+            auto* value = static_cast<std::atomic<uint32_t>*>(
+                GuestPointer(arg1, sizeof(uint32_t), true));
+            if (value == nullptr) {
+                return FailLinux(14);
+            }
+            const uint32_t mine = static_cast<uint32_t>(tid_ == 0 ? pid_ : tid_) & kFutexTidMask;
+            uint32_t held = value->load(std::memory_order_acquire);
+            if ((held & kFutexTidMask) != mine) {
+                return FailLinux(1); // EPERM: not the owner.
+            }
+            value->store(0, std::memory_order_release);
+            WakeFutex(ToHost(arg1));
+            return 0;
+        }
         default:
-            // Priority-inheritance futexes and the rest. Saying "done" to an operation
-            // that was not performed is how a lock ends up believing it is held by a
-            // thread that never took it; ENOSYS at least makes the guest's own fallback
-            // path run, and says in the log which one is missing.
+            // Saying "done" to an operation that was not performed is how a lock ends up
+            // believing it is held by a thread that never took it; ENOSYS at least makes
+            // the guest's own fallback path run, and says in the log which one is missing.
             ReportUnimplementedFutex(operation);
             return FailLinux(38); // -ENOSYS
         }

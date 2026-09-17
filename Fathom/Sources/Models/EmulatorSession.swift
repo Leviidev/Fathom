@@ -111,8 +111,15 @@ final class EmulatorSession: ObservableObject {
     /// framebuffer to a file there and listens on a socket there, and both are ordinary
     /// host files as far as this process is concerned. So there is nothing to connect
     /// until the server inside the guest has started, and both sides simply keep trying.
+    /// Whether this run has a keyboard behind it. A graphical run does not: what the user
+    /// types goes to the guest's display, not to its standard input, and a program that
+    /// reads standard input -- Steam does, once, at startup -- must be told there is
+    /// nothing there rather than left waiting for a key that cannot come.
+    private var closesConsoleInput = false
+
     func runGraphical(path guestPath: String, arguments: [String] = [],
                       settings: EmulatorSettings) {
+        closesConsoleInput = true
         let root = ProgramLibrary.guestRootDirectory
         display.attach(path: root.appendingPathComponent("tmp/fb/Xvfb_screen0").path)
         startConnectingInput(socketPath: root.appendingPathComponent("tmp/.X11-unix/X0").path)
@@ -198,6 +205,9 @@ final class EmulatorSession: ObservableObject {
         config.envc = envp.count
 
         let created = fathom_session_create(&config, &errorBuffer, errorBuffer.count)
+        if let created, closesConsoleInput {
+            fathom_session_close_input(created)
+        }
 
         guard let created else {
             let message = String(cString: errorBuffer)

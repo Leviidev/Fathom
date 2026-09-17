@@ -95,6 +95,11 @@ public:
     virtual int64_t CreateThread(int caller_pid, uint64_t flags, uint64_t stack,
                                  uint64_t parent_tid_address, uint64_t child_tid_address,
                                  uint64_t tls) = 0;
+
+    /// What a process is, for /proc. Steam's client reads its web helper's entry to decide
+    /// whether the helper is still alive, and with no answer it concludes the helper died
+    /// and starts another one -- forever. Returns false when there is no such process.
+    virtual bool DescribeProcess(int pid, int* ppid, std::string* name) = 0;
 };
 
 struct SyscallConfig {

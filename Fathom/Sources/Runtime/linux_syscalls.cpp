@@ -3158,6 +3158,19 @@ bool LinuxSyscalls::ProcFileContents(const std::string& guest_path, std::string*
         return true;
     }
 
+    // Every process's own numbers, in the one line and the order Linux writes them. Only
+    // the fields anything here reads are real: the name, the state, the parent, and
+    // zeroes for the rest. Steam's client reads this for its web helper on a timer, and a
+    // file that is not there reads as a helper that has died.
+    const auto write_stat = [](std::string* text, int pid, int ppid, const std::string& name) {
+        char buffer[512];
+        std::snprintf(buffer, sizeof(buffer),
+                      "%d (%s) S %d %d %d 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 "
+                      "18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                      pid, name.c_str(), ppid, pid, pid);
+        *text = buffer;
+    };
+
     const std::string self_prefix = "/proc/self/";
     const std::string pid_prefix = "/proc/" + std::to_string(pid_) + "/";
     std::string leaf;
@@ -3165,8 +3178,54 @@ bool LinuxSyscalls::ProcFileContents(const std::string& guest_path, std::string*
         leaf = guest_path.substr(self_prefix.size());
     } else if (guest_path.rfind(pid_prefix, 0) == 0) {
         leaf = guest_path.substr(pid_prefix.size());
+    } else if (guest_path.rfind("/proc/", 0) == 0 && host_ != nullptr) {
+        // Another process. Only the few fields a liveness check reads are answered.
+        const auto rest = guest_path.substr(6);
+        const auto slash = rest.find('/');
+        if (slash == std::string::npos) {
+            return false;
+        }
+        const std::string number = rest.substr(0, slash);
+        if (number.empty() || number.find_first_not_of("0123456789") != std::string::npos) {
+            FATHOM_INFO("[pid %d] no answer for %s", pid_, guest_path.c_str());
+            return false;
+        }
+        const int other = std::atoi(number.c_str());
+        int other_ppid = 0;
+        std::string name;
+        if (!host_->DescribeProcess(other, &other_ppid, &name)) {
+            return false; // Genuinely gone: ENOENT is the right answer.
+        }
+        const std::string other_leaf = rest.substr(slash + 1);
+        if (other_leaf == "stat") {
+            write_stat(out, other, other_ppid, name);
+            return true;
+        }
+        if (other_leaf == "status") {
+            char buffer[512];
+            std::snprintf(buffer, sizeof(buffer),
+                          "Name:\t%s\nState:\tS (sleeping)\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\n"
+                          "TracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\n",
+                          name.c_str(), other, other, other_ppid);
+            *out = buffer;
+            return true;
+        }
+        FATHOM_INFO("[pid %d] no answer for %s", pid_, guest_path.c_str());
+        return false;
     } else {
         return false;
+    }
+
+    if (leaf == "stat") {
+        write_stat(out, pid_, ppid_, thread_name_.empty() ? "fathom" : thread_name_);
+        return true;
+    }
+    // A descriptor's own line. Chromium reads these while it decides which descriptors to
+    // keep across an exec; the position and flags it finds there do not change what it
+    // does, but the file being absent makes it fall back to closing a million of them.
+    if (leaf.rfind("fdinfo/", 0) == 0) {
+        *out = "pos:\t0\nflags:\t02\nmnt_id:\t1\n";
+        return true;
     }
 
     if (leaf == "cmdline") {
@@ -3187,6 +3246,7 @@ bool LinuxSyscalls::ProcFileContents(const std::string& guest_path, std::string*
         *out = buffer;
         return true;
     }
+    FATHOM_INFO("[pid %d] no answer for %s", pid_, guest_path.c_str());
     return false;
 }
 

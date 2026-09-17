@@ -409,6 +409,22 @@ struct fathom_session final : fathom::ProcessHost {
     void RestoreBorrowedMemory(GuestProcess* process);
 
     // ProcessHost
+    bool DescribeProcess(int pid, int* ppid, std::string* name) override {
+        std::scoped_lock lock {process_mutex};
+        auto* process = Find(pid);
+        if (process == nullptr || process->finished) {
+            return false;
+        }
+        if (ppid != nullptr) {
+            *ppid = process->ppid;
+        }
+        if (name != nullptr) {
+            const auto slash = process->path.rfind('/');
+            *name = slash == std::string::npos ? process->path : process->path.substr(slash + 1);
+        }
+        return true;
+    }
+
     int64_t ForkProcess(int caller_pid, uint64_t stack = 0) override;
     int64_t ExecProcess(int caller_pid, const std::string& path, std::vector<std::string> argv,
                         std::vector<std::string> envp) override;

@@ -1005,7 +1005,13 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
         // the child rewrites all of it on its way to exec. Left alone, the parent's next
         // allocation reads a chunk header the child rewrote and glibc aborts with
         // "malloc(): unaligned tcache chunk detected", a long way from the fork.
-        for (const auto& region : parent->syscalls->ImageData()) {
+        // All of it, not just the C library's own: measured, a threaded parent that keeps
+        // only its C library's data lasts twenty seconds, and one that keeps every
+        // writable image region lasts as long as it is left running. What the difference
+        // is made of is the program's own allocator arenas, which a loader places as
+        // anonymous mappings at fixed addresses and which the child rewrites the same way
+        // it rewrites malloc's.
+        for (const auto& region : parent->syscalls->ImageData(false)) {
             owned.push_back(region);
         }
         // The stack is held either way: the child returns out of fork through its parent's

@@ -1118,9 +1118,16 @@ std::vector<std::pair<uint64_t, uint64_t>> LinuxSyscalls::Mappings() const {
     return shared_->mappings;
 }
 
-std::vector<std::pair<uint64_t, uint64_t>> LinuxSyscalls::ImageData() const {
+std::vector<std::pair<uint64_t, uint64_t>> LinuxSyscalls::ImageData(bool c_library_only) const {
     std::scoped_lock lock {shared_->mutex};
-    return shared_->image_data;
+    std::vector<std::pair<uint64_t, uint64_t>> regions;
+    regions.reserve(shared_->image_data.size());
+    for (const auto& region : shared_->image_data) {
+        if (!c_library_only || region.is_c_library) {
+            regions.emplace_back(region.begin, region.size);
+        }
+    }
+    return regions;
 }
 
 int LinuxSyscalls::AllocateFd() {
@@ -2048,7 +2055,28 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
     // it reserved for it. Recorded so that a fork can hold it for the parent.
     if ((guest_protection & kGuestProtWrite) != 0 && (fixed || !anonymous)) {
         std::scoped_lock lock {shared_->mutex};
-        shared_->image_data.emplace_back(placed, length);
+        // Whether this belongs to the C library is worth knowing on its own: it is the
+        // only part a fork's child is guaranteed to rewrite, and the only part small
+        // enough to be worth holding for a parent whose other threads are still running.
+        // An anonymous mapping placed at a fixed address is a library's bss, and it
+        // belongs to whichever library was mapped just below it.
+        bool is_c_library = false;
+        if (!anonymous) {
+            auto* mapped_file = FindFile(fd);
+            if (mapped_file != nullptr) {
+                const auto& path = mapped_file->guest_path;
+                const auto name = path.find_last_of('/');
+                const std::string base = name == std::string::npos ? path : path.substr(name + 1);
+                is_c_library = base.rfind("libc.so", 0) == 0 || base.rfind("libc-", 0) == 0 ||
+                               base.rfind("libpthread", 0) == 0 || base.rfind("ld-", 0) == 0 ||
+                               base.rfind("ld-linux", 0) == 0;
+            }
+        } else if (!shared_->image_data.empty()) {
+            const auto& previous = shared_->image_data.back();
+            is_c_library = previous.is_c_library && previous.begin + previous.size <= placed &&
+                           placed - (previous.begin + previous.size) < 0x10000;
+        }
+        shared_->image_data.push_back({placed, length, is_c_library});
     }
 
     if (anonymous) {

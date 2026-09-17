@@ -608,6 +608,12 @@ bool BuildInitialStack(GuestAddressSpace& space, uint64_t guest_base, const Load
     out_stack->stack_base = base;
     out_stack->stack_size = stack_size;
     out_stack->rsp = rsp - guest_base;
+    FATHOM_INFO("auxv: phdr=%#llx phent=%llu phnum=%llu base=%#llx entry=%#llx",
+                static_cast<unsigned long long>(image.phdr_address),
+                static_cast<unsigned long long>(image.phentsize),
+                static_cast<unsigned long long>(image.phnum),
+                static_cast<unsigned long long>(interpreter_base),
+                static_cast<unsigned long long>(image.entry));
     FATHOM_INFO("guest stack: %#llx..%#llx, rsp=%#llx, %zu argv, %zu envp",
                 static_cast<unsigned long long>(base), static_cast<unsigned long long>(top),
                 static_cast<unsigned long long>(rsp), argv.size(), envp.size());

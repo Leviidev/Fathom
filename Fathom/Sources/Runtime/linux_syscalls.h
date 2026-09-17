@@ -209,7 +209,13 @@ public:
     /// rather than to any one thread: malloc's arenas, the list of live thread stacks, the
     /// locks over both. A fork's child rewrites all of it before it execs, so a fork has
     /// to hold it for the parent the same way it holds the stack.
-    std::vector<std::pair<uint64_t, uint64_t>> ImageData() const;
+    /// `c_library_only` narrows it to the C library's own data, which is the part a
+    /// fork's child rewrites: malloc's arenas, the list of live thread stacks, the locks
+    /// over both. Everything else belongs to the program and its other libraries, and for
+    /// a process with threads still running, holding that is worse than not -- it is
+    /// tens of megabytes, and putting it back throws away whatever those threads wrote
+    /// while the child was alive.
+    std::vector<std::pair<uint64_t, uint64_t>> ImageData(bool c_library_only) const;
 
     /// Closes everything this process had open. Called when it *exits*, not when it is
     /// reaped: a pipe reaches end-of-file only once every copy of its write end is gone,
@@ -300,7 +306,12 @@ private:
         /// placed at a fixed address inside the span it reserved for that library. A
         /// thread's stack is neither -- it is anonymous and wherever the kernel likes --
         /// which is what keeps those out of this list.
-        std::vector<std::pair<uint64_t, uint64_t>> image_data;
+        struct ImageRegion {
+            uint64_t begin {};
+            uint64_t size {};
+            bool is_c_library {};
+        };
+        std::vector<ImageRegion> image_data;
     };
 
     /// Lowest unused guest descriptor, which is the number open() and pipe() must return:

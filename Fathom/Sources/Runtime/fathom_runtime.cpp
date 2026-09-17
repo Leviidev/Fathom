@@ -1567,29 +1567,32 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
                 // child has not started; it does not say what is stopping it, and the
                 // answer has been somewhere different every time.
                 const auto port = pthread_mach_thread_np(child_raw->host_thread);
-                if (port != MACH_PORT_NULL && thread_suspend(port) == KERN_SUCCESS) {
+                uint64_t host_pcs[4] = {};
+                for (auto& host_pc : host_pcs) {
+                    if (port == MACH_PORT_NULL || thread_suspend(port) != KERN_SUCCESS) {
+                        break;
+                    }
                     arm_thread_state64_t state {};
                     mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
                     if (thread_get_state(port, ARM_THREAD_STATE64,
                                          reinterpret_cast<thread_state_t>(&state),
                                          &count) == KERN_SUCCESS) {
-                        const auto pc = reinterpret_cast<void*>(
-                            static_cast<uintptr_t>(arm_thread_state64_get_pc(state)));
-                        const auto lr = reinterpret_cast<void*>(
-                            static_cast<uintptr_t>(arm_thread_state64_get_lr(state)));
-                        Dl_info here {};
-                        Dl_info called_from {};
-                        FATHOM_WARN("fork: pid %d's host thread is at %p (%s) called from %p (%s)",
-                                    child_pid, pc,
-                                    dladdr(pc, &here) && here.dli_sname != nullptr ? here.dli_sname
-                                                                                   : "?",
-                                    lr,
-                                    dladdr(lr, &called_from) && called_from.dli_sname != nullptr
-                                        ? called_from.dli_sname
-                                        : "?");
+                        host_pc = arm_thread_state64_get_pc(state);
                     }
                     thread_resume(port);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
+                Dl_info here {};
+                const auto* name =
+                    dladdr(reinterpret_cast<void*>(host_pcs[0]), &here) && here.dli_sname != nullptr
+                        ? here.dli_sname
+                        : "generated code";
+                FATHOM_WARN("fork: pid %d's host thread is in %s at %#llx %#llx %#llx %#llx",
+                            child_pid, name,
+                            static_cast<unsigned long long>(host_pcs[0]),
+                            static_cast<unsigned long long>(host_pcs[1]),
+                            static_cast<unsigned long long>(host_pcs[2]),
+                            static_cast<unsigned long long>(host_pcs[3]));
                 FATHOM_WARN("fork: pid %d has held its parent's memory too long "
                             "(syscall %llu, rip %#llx %#llx %#llx %#llx, rsp %#llx); letting "
                             "pid %d's other threads run again and giving up the copy",

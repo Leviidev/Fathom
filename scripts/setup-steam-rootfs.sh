@@ -175,6 +175,9 @@ case "$1" in
         if [ -n "${FATHOM_WEBHELPER_VERBOSE:-}" ]; then
             extra="$extra --enable-logging --v=1"
         fi
+        if [ -n "${FATHOM_WEBHELPER_SINGLE_PROCESS:-}" ]; then
+            extra="$extra --single-process"
+        fi
         # --no-zygote: Chromium normally forks a zygote early and forks every renderer
         # from it. A fork here shares its parent's memory rather than copying it, and the
         # zygote is forked out of a browser process that already has a dozen threads, so

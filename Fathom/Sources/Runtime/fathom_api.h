@@ -152,6 +152,10 @@ void fathom_session_set_output_sink(fathom_session* session, fathom_output_sink 
 /// expects to find. Safe to call from any thread while the guest is running.
 void fathom_session_send_input(fathom_session* session, const char* bytes, size_t length);
 
+/// Says no more input will ever arrive. A guest reading standard input gets end-of-file
+/// instead of waiting for a key that is never coming.
+void fathom_session_close_input(fathom_session* session);
+
 /// The guest's display, if it has opened one.
 typedef struct {
     bool active;          ///< False until the guest opens /dev/fb0.

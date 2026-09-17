@@ -46,6 +46,12 @@ public:
 
     bool InputAvailable() const;
 
+    /// Says there will be no more input, ever. A guest reading standard input then gets
+    /// end-of-file rather than waiting: a program run without a terminal -- Steam, started
+    /// from a script -- reads it once at startup, and a read that never returns is a main
+    /// loop that never runs again.
+    void CloseInput();
+
     /// Sleeps until a key arrives or the slice elapses; used by poll.
     void WaitForInput(int milliseconds);
 
@@ -71,6 +77,7 @@ private:
     OutputCallback output_ {};
     void* output_context_ {};
 
+    std::atomic<bool> input_closed_ {false};
     mutable std::mutex input_mutex_;
     std::condition_variable input_ready_;
     std::deque<char> input_;

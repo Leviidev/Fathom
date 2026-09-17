@@ -1973,6 +1973,12 @@ void fathom_session_send_input(fathom_session* session, const char* bytes, size_
     session->syscalls->SendInput(bytes, length);
 }
 
+void fathom_session_close_input(fathom_session* session) {
+    if (session != nullptr) {
+        session->console.CloseInput();
+    }
+}
+
 bool fathom_session_framebuffer(fathom_session* session, fathom_framebuffer* out) {
     if (out == nullptr) {
         return false;

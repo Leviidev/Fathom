@@ -209,6 +209,9 @@ int main(int argc, char** argv) {
         while (g_running.load(std::memory_order_relaxed)) {
             const ssize_t count = ::read(STDIN_FILENO, buffer, sizeof(buffer));
             if (count <= 0) {
+                // No terminal, or the one there was has gone. The guest is told, so that
+                // a program reading standard input sees end-of-file instead of waiting.
+                fathom_session_close_input(g_session);
                 break;
             }
             fathom_session_send_input(g_session, buffer, static_cast<size_t>(count));

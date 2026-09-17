@@ -37,7 +37,8 @@ void GuestConsole::SendInput(const char* bytes, size_t length) {
 int64_t GuestConsole::ReadInput(char* out, size_t max) {
     std::unique_lock lock {input_mutex_};
     while (input_.empty()) {
-        if (stop_requested_.load(std::memory_order_relaxed)) {
+        if (stop_requested_.load(std::memory_order_relaxed) ||
+            input_closed_.load(std::memory_order_relaxed)) {
             return 0;
         }
         if (nonblocking_stdin_.load(std::memory_order_relaxed)) {
@@ -56,8 +57,16 @@ int64_t GuestConsole::ReadInput(char* out, size_t max) {
 }
 
 bool GuestConsole::InputAvailable() const {
+    if (input_closed_.load(std::memory_order_relaxed)) {
+        return true; // Readable, and what the read returns is end-of-file.
+    }
     std::scoped_lock lock {input_mutex_};
     return !input_.empty();
+}
+
+void GuestConsole::CloseInput() {
+    input_closed_.store(true, std::memory_order_relaxed);
+    input_ready_.notify_all();
 }
 
 void GuestConsole::WaitForInput(int milliseconds) {

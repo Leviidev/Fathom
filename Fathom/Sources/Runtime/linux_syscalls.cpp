@@ -5514,8 +5514,14 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             return FailLinux(14);
         }
         std::scoped_lock lock {shared_->mutex};
-        out[0] = static_cast<int32_t>(RegisterFile(pair[0], "socketpair"));
-        out[1] = static_cast<int32_t>(RegisterFile(pair[1], "socketpair"));
+        const int first = RegisterFile(pair[0], "socketpair");
+        const int second = RegisterFile(pair[1], "socketpair");
+        // Each end named after the other, so a report about a thread waiting on one says
+        // which descriptor is supposed to be writing to it.
+        shared_->files[first].guest_path = "socketpair with " + std::to_string(second);
+        shared_->files[second].guest_path = "socketpair with " + std::to_string(first);
+        out[0] = static_cast<int32_t>(first);
+        out[1] = static_cast<int32_t>(second);
         return 0;
     }
 

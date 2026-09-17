@@ -1083,13 +1083,19 @@ void fathom_session::StartWatchdog() {
                     if (!thread->started || thread->finished.load(std::memory_order_acquire)) {
                         continue;
                     }
-                    FATHOM_INFO("watchdog:   tid %d in %llu(%#llx), rip %#llx", thread->tid,
+                    const std::string waiting_on =
+                        thread->syscalls == nullptr
+                            ? std::string {}
+                            : thread->syscalls->DescribeFd(
+                                  static_cast<int>(thread->syscalls->CurrentArgument()));
+                    FATHOM_INFO("watchdog:   tid %d in %llu(%#llx %s), rip %#llx", thread->tid,
                                 static_cast<unsigned long long>(thread->syscalls == nullptr
                                                                     ? 0
                                                                     : thread->syscalls->CurrentSyscall()),
                                 static_cast<unsigned long long>(thread->syscalls == nullptr
                                                                     ? 0
                                                                     : thread->syscalls->CurrentArgument()),
+                                waiting_on.c_str(),
                                 static_cast<unsigned long long>(thread->thread == nullptr
                                                                     ? 0
                                                                     : thread->thread->Rip()));

@@ -232,6 +232,26 @@ std::atomic<uint64_t> g_alignment_fixups {0};
 std::atomic<fathom::GuestAddressSpace*> g_arena_space {nullptr};
 std::atomic<uint64_t> g_arena_begin {0};
 
+/// A descriptor onto /dev/null, opened once so a signal handler never has to.
+std::atomic<int> g_probe_fd {-1};
+
+/// Whether `size` bytes at `address` can be read without faulting.
+///
+/// A crash report wants the bytes at the guest's rip and the words under its stack
+/// pointer, and the interesting crashes are exactly the ones where those addresses are
+/// not mapped. Reading them directly faults a second time inside the signal handler,
+/// with the signal already blocked, and the thread stops there for good -- holding
+/// whatever FEXCore lock it was holding when it faulted, which stops the session. The
+/// kernel is asked instead: write() reports EFAULT for a buffer it cannot read rather
+/// than raising anything.
+bool Readable(const void* address, size_t size) {
+    const int fd = g_probe_fd.load(std::memory_order_acquire);
+    if (fd < 0 || address == nullptr) {
+        return false;
+    }
+    return write(fd, address, size) == static_cast<ssize_t>(size);
+}
+
 /// Fixes up a guest alignment fault and resumes, rather than letting it kill the app.
 ///
 /// x86 lets a program read or write at any address. ARM64 mostly does too -- but not for
@@ -259,13 +279,13 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     // and steps over the instruction, which for a wild pointer means carrying on with
     // nonsense: the 32-bit Steam client did exactly that, at a rate of three hundred
     // thousand faults a second, ending in "stack smashing detected".
-    const auto faulting = reinterpret_cast<uint64_t>(info->si_addr);
-    bool wild = false;
-    fathom::GuestRange neighbour {};
-    if (auto* space = g_arena_space.load(std::memory_order_acquire)) {
-        bool known = false;
-        wild = !space->RangeForNoWait(faulting, &neighbour, &known) && known;
-    }
+    // Asked of the kernel, not of the address space. This runs hundreds of thousands of
+    // times a second inside a signal handler, and the address space is guarded by a
+    // shared_mutex whose internals are not safe to touch from one -- a handler that
+    // interrupts its own thread between two of those operations leaves the lock in a
+    // state nothing recovers from. write() to /dev/null answers the same question by
+    // syscall, which a handler may make.
+    const bool wild = !Readable(info->si_addr, 1);
     if (wild) {
         // Stepping over the instruction is not a fix -- the guest carries on with a
         // register it never loaded -- but it is what the program has been surviving on,
@@ -277,15 +297,9 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
         const auto seen = wild_fixups.fetch_add(1, std::memory_order_relaxed) + 1;
         if (seen <= 8 || (seen & 0x3FF) == 0) {
             FATHOM_WARN("guest read %p, which is not mapped, from an instruction this can "
-                        "step over (%llu so far, guest rip %#llx; nearest mapping "
-                        "%#llx..%#llx, %lld bytes away)",
+                        "step over (%llu so far, guest rip %#llx)",
                         info->si_addr, static_cast<unsigned long long>(seen),
-                        static_cast<unsigned long long>(g_active.thread->CurrentFrame->State.rip),
-                        static_cast<unsigned long long>(neighbour.begin),
-                        static_cast<unsigned long long>(neighbour.end()),
-                        static_cast<long long>(faulting < neighbour.begin
-                                                   ? neighbour.begin - faulting
-                                                   : faulting - neighbour.end()));
+                        static_cast<unsigned long long>(g_active.thread->CurrentFrame->State.rip));
         }
         if (seen > 1024) {
             return false;
@@ -543,25 +557,6 @@ thread_local LinuxSyscalls* g_current_syscalls = nullptr;
 /// this process's.
 thread_local uint64_t g_current_guest_base = 0;
 
-/// A descriptor onto /dev/null, opened once so a signal handler never has to.
-std::atomic<int> g_probe_fd {-1};
-
-/// Whether `size` bytes at `address` can be read without faulting.
-///
-/// A crash report wants the bytes at the guest's rip and the words under its stack
-/// pointer, and the interesting crashes are exactly the ones where those addresses are
-/// not mapped. Reading them directly faults a second time inside the signal handler,
-/// with the signal already blocked, and the thread stops there for good -- holding
-/// whatever FEXCore lock it was holding when it faulted, which stops the session. The
-/// kernel is asked instead: write() reports EFAULT for a buffer it cannot read rather
-/// than raising anything.
-bool Readable(const void* address, size_t size) {
-    const int fd = g_probe_fd.load(std::memory_order_acquire);
-    if (fd < 0 || address == nullptr) {
-        return false;
-    }
-    return write(fd, address, size) == static_cast<ssize_t>(size);
-}
 
 /// Appends text to a fixed buffer, and says where the next append should start.
 ///

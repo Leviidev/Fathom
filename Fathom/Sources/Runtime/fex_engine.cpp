@@ -232,26 +232,6 @@ std::atomic<uint64_t> g_alignment_fixups {0};
 std::atomic<fathom::GuestAddressSpace*> g_arena_space {nullptr};
 std::atomic<uint64_t> g_arena_begin {0};
 
-/// A descriptor onto /dev/null, opened once so a signal handler never has to.
-std::atomic<int> g_probe_fd {-1};
-
-/// Whether `size` bytes at `address` can be read without faulting.
-///
-/// A crash report wants the bytes at the guest's rip and the words under its stack
-/// pointer, and the interesting crashes are exactly the ones where those addresses are
-/// not mapped. Reading them directly faults a second time inside the signal handler,
-/// with the signal already blocked, and the thread stops there for good -- holding
-/// whatever FEXCore lock it was holding when it faulted, which stops the session. The
-/// kernel is asked instead: write() reports EFAULT for a buffer it cannot read rather
-/// than raising anything.
-bool Readable(const void* address, size_t size) {
-    const int fd = g_probe_fd.load(std::memory_order_acquire);
-    if (fd < 0 || address == nullptr) {
-        return false;
-    }
-    return write(fd, address, size) == static_cast<ssize_t>(size);
-}
-
 /// Declared here and defined below: the fault handler wants to name the guest process
 /// it is reporting on, and the definition sits with the rest of the syscall plumbing.
 extern thread_local LinuxSyscalls* g_current_syscalls;
@@ -663,37 +643,14 @@ size_t DescribeGuestState(char* buffer, size_t capacity) {
         out.Text((index % 2 == 1) ? "\n" : "");
     }
 
-    // The bytes the guest believes are its next instructions. Worth having in a crash
-    // report because the two explanations for a program dying in a function that could
-    // not possibly do this look identical from the registers alone: either the data it
-    // was given is wrong, or what is at that address is not the code that belongs there.
-    const uint64_t host_rip = state.rip + g_current_guest_base;
-    const auto* code = reinterpret_cast<const unsigned char*>(host_rip);
-    if (g_active.context != nullptr && Readable(code, 16)) {
-        out.Text("  code");
-        for (int index = 0; index < 16; ++index) {
-            out.Text(" ");
-            out.Hex(code[index], 2);
-        }
-        out.Text("\n");
-    }
-
-    // And what is on the stack. A guest that has jumped somewhere it should not have gives
-    // nothing away in its registers, but the words below its stack pointer are the return
-    // addresses of everything that called it -- which is the shape of the path it took.
-    const uint64_t stack = state.gregs[FEXCore::X86State::REG_RSP] + g_current_guest_base;
-    const auto* words = reinterpret_cast<const uint32_t*>(stack);
-    if (stack != 0 && Readable(words, 64)) {
-        for (int row = 0; row < 4; ++row) {
-            out.Text("  stack+");
-            out.Hex(static_cast<uint64_t>(row * 16), 2);
-            for (int column = 0; column < 4; ++column) {
-                out.Text(" ");
-                out.Hex(words[row * 4 + column], 8);
-            }
-            out.Text("\n");
-        }
-    }
+    // Registers only, deliberately. Reading the bytes at the guest's rip and the words
+    // under its stack pointer is exactly what a crash report wants, and exactly what a
+    // signal handler must not do: the addresses worth printing are the ones that are not
+    // there, and a load that faults here faults with the signal already blocked, leaving
+    // the thread stopped inside FEXCore's decoder holding the code-invalidation lock
+    // shared -- which stops every other guest thread in the session for good. Probing
+    // first does not help either; the probe needs a descriptor, and a descriptor in a
+    // process that hands descriptors to a guest is not a thing a handler can rely on.
     return out.used;
 }
 
@@ -1351,15 +1308,6 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
 
     // From here on, a guest alignment fault is recoverable rather than fatal.
     SetFaultRecovery(RecoverAlignmentFault);
-    if (g_probe_fd.load(std::memory_order_acquire) < 0) {
-        const int fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            int expected = -1;
-            if (!g_probe_fd.compare_exchange_strong(expected, fd)) {
-                close(fd);
-            }
-        }
-    }
     SetGuestFaultEnder(EndFaultedGuestThread);
     SetGuestStateDescriber(DescribeGuestState);
 

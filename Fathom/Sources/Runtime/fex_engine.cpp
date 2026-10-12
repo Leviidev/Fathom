@@ -270,10 +270,41 @@ uint32_t RepeatedFaultSite(uintptr_t pc) {
 /// call it, and resume at the instruction it says to resume at.
 bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
 #if defined(__aarch64__) && defined(__APPLE__)
-    if (signal != SIGBUS || info == nullptr || raw_context == nullptr) {
+    if ((signal != SIGBUS && signal != SIGSEGV) || info == nullptr || raw_context == nullptr) {
         return false;
     }
     if (g_active.context == nullptr || g_active.thread == nullptr) {
+        return false;
+    }
+    // The call/return stack ran off either end. Inside compiled code the host stack
+    // pointer is FEXCore's call/return stack -- a cache of return addresses that a CALL
+    // pushes and a RET pops -- and a program whose calls and returns do not pair up
+    // (steamcmd's download threads, for one) walks it into a guard page. It is only a
+    // cache: a RET that finds the wrong entry falls back to a lookup, so the pointer can
+    // simply be put back in the middle and the push run again. FEX's own front end does
+    // the same.
+    {
+        auto* base = static_cast<uint8_t*>(g_active.thread->CallRetStackBase);
+        const auto* fault = static_cast<const uint8_t*>(info->si_addr);
+        constexpr size_t size = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+        const size_t page = static_cast<size_t>(getpagesize());
+        if (base != nullptr && ((fault >= base - page && fault < base) || (fault >= base + size && fault < base + size + page))) {
+            // x25 is REG_CALLRET_SP in FEXCore's ARM64 emitter; the middle is where FEX's
+            // own front end puts it back.
+            auto* context = static_cast<ucontext_t*>(raw_context);
+            context->uc_mcontext->__ss.__x[25] = reinterpret_cast<uint64_t>(base) + size / 2;
+            static std::atomic<uint64_t> resets {0};
+            const auto seen = resets.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (seen <= 4 || (seen & 0xFF) == 0) {
+                FATHOM_INFO("pid %d tid %d: call/return stack %s, reset (%llu so far)",
+                            g_current_syscalls == nullptr ? -1 : g_current_syscalls->Pid(),
+                            g_current_syscalls == nullptr ? -1 : g_current_syscalls->Tid(),
+                            fault < base ? "overflowed" : "underflowed", static_cast<unsigned long long>(seen));
+            }
+            return true;
+        }
+    }
+    if (signal != SIGBUS) {
         return false;
     }
     if (info->si_code != BUS_ADRALN) {

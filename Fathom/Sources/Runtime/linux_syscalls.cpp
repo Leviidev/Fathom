@@ -816,6 +816,7 @@ struct SharedMappingSlot {
     std::atomic<uint64_t> device {0};
     std::atomic<uint64_t> inode {0};
     std::atomic<uint64_t> offset {0};
+    std::atomic<bool> writable {false};
 };
 SharedMappingSlot g_shared_mappings[kSharedMappingSlots];
 std::atomic<size_t> g_shared_mapping_count {0};
@@ -823,7 +824,7 @@ std::atomic<size_t> g_shared_mapping_count {0};
 std::atomic<uint64_t> g_shared_low {~0ull};
 std::atomic<uint64_t> g_shared_high {0};
 
-void NoteSharedMapping(uint64_t begin, uint64_t length, int host_fd, uint64_t offset) {
+void NoteSharedMapping(uint64_t begin, uint64_t length, int host_fd, uint64_t offset, bool writable) {
     struct stat info {};
     if (fstat(host_fd, &info) != 0) {
         return;
@@ -836,6 +837,7 @@ void NoteSharedMapping(uint64_t begin, uint64_t length, int host_fd, uint64_t of
     slot.device.store(static_cast<uint64_t>(info.st_dev), std::memory_order_relaxed);
     slot.inode.store(static_cast<uint64_t>(info.st_ino), std::memory_order_relaxed);
     slot.offset.store(offset, std::memory_order_relaxed);
+    slot.writable.store(writable, std::memory_order_relaxed);
     slot.begin.store(begin, std::memory_order_relaxed);
     slot.end.store(begin + length, std::memory_order_release);
     uint64_t low = g_shared_low.load(std::memory_order_relaxed);
@@ -845,6 +847,34 @@ void NoteSharedMapping(uint64_t begin, uint64_t length, int host_fd, uint64_t of
     while (begin + length > high &&
            !g_shared_high.compare_exchange_weak(high, begin + length, std::memory_order_acq_rel)) {
     }
+}
+
+/// Whether some process in the session has this file mapped shared and writable: the
+/// wineserver's session memory, which every Wine process reads, is such a file.
+bool FileIsWrittenThroughSharedMapping(int host_fd) {
+    // The wineserver's own files, by name: its session memory and the pages it hands its
+    // clients live under /tmp/.wine-<uid>/server-<dev>-<inode>/. On the Mac the server runs
+    // as a separate host process, so no mapping of its own is on record here.
+    char host_path[PATH_MAX] {};
+    if (fcntl(host_fd, F_GETPATH, host_path) == 0 && std::strstr(host_path, "/.wine-") != nullptr &&
+        std::strstr(host_path, "/server-") != nullptr) {
+        return true;
+    }
+    struct stat info {};
+    if (fstat(host_fd, &info) != 0) {
+        return false;
+    }
+    const size_t count =
+        std::min(g_shared_mapping_count.load(std::memory_order_acquire), kSharedMappingSlots);
+    for (size_t index = 0; index < count; ++index) {
+        const auto& slot = g_shared_mappings[index];
+        if (slot.end.load(std::memory_order_acquire) != 0 && slot.writable.load(std::memory_order_relaxed) &&
+            slot.device.load(std::memory_order_relaxed) == static_cast<uint64_t>(info.st_dev) &&
+            slot.inode.load(std::memory_order_relaxed) == static_cast<uint64_t>(info.st_ino)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// The parts of [begin, end) that are shared with another guest process.
@@ -2712,13 +2742,43 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         // a reader and only wrong for a writer.
         const uint64_t host_page = space_->HostPageSize();
         if (config_.trace) {
-            FATHOM_INFO("[pid %d] %s map of %s at offset %#llx, %#llx bytes, prot %d%s", pid_,
-                        (flags & guest::kMapShared) != 0 ? "shared" : "private", file->guest_path.c_str(),
+            // The host's name for it as well: a descriptor that arrived over a socket has no guest path of its own.
+            char host_name[PATH_MAX] = "?";
+            if (file->host_fd >= 0 && fcntl(file->host_fd, F_GETPATH, host_name) != 0) {
+                std::strcpy(host_name, "?");
+            }
+            FATHOM_INFO("[pid %d] %s map of %s (%s) at %#llx, offset %#llx, %#llx bytes, prot %d%s", pid_,
+                        (flags & guest::kMapShared) != 0 ? "shared" : "private", file->guest_path.c_str(), host_name,
+                        static_cast<unsigned long long>(ToGuest(placed)),
                         static_cast<unsigned long long>(offset), static_cast<unsigned long long>(length), protection,
                         (static_cast<uint64_t>(offset) % host_page) == 0 ? "" : " -- offset not on a host page, so a copy");
         }
-        if ((flags & guest::kMapShared) != 0 && (static_cast<uint64_t>(offset) % host_page) == 0) {
-            uint64_t rounded = (length + host_page - 1) & ~(host_page - 1);
+        const bool wants_shared = (flags & guest::kMapShared) != 0;
+        // A private mapping of a file some other process writes through a shared mapping is
+        // mapped live as well, read-only. On Linux a private mapping keeps showing the file's
+        // current contents until the mapper writes to a page, and Wine builds on that: every
+        // Wine process maps the server's session memory private and reads window state the
+        // server keeps updating. A copy taken at mmap time is out of date at once, and from
+        // then on no window can be created. Read-only, so a write by the mapper -- which Linux
+        // would turn into a private page -- faults here instead of reaching the file; nothing
+        // that maps such a file privately writes to it.
+        const bool live_private = !wants_shared && FileIsWrittenThroughSharedMapping(file->host_fd);
+        // An offset off the host's page: the mapping is placed so that the guest address has the
+        // same phase within a host page as the offset has within the file, which is what mmap
+        // needs. Only when the guest left the address to us.
+        const uint64_t phase = static_cast<uint64_t>(offset) % host_page;
+        if ((wants_shared || live_private) && (phase == 0 || !fixed)) {
+            uint64_t base = placed;
+            if (phase != 0) {
+                space_->Release(placed, length);
+                base = space_->Allocate(length + phase, 0, guest_protection | kGuestProtWrite);
+                if (base == 0) {
+                    return FailLinux(12);
+                }
+                placed = base + phase;
+            }
+            const uint64_t file_offset = static_cast<uint64_t>(offset) - phase;
+            uint64_t rounded = (phase + length + host_page - 1) & ~(host_page - 1);
 
             // Never past the end of the file. The host's pages are four times the guest's,
             // so rounding a small mapping up can reach well beyond what the file actually
@@ -2728,31 +2788,41 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
             struct stat info {};
             if (fstat(file->host_fd, &info) == 0) {
                 const uint64_t size_on_disk = static_cast<uint64_t>(info.st_size);
-                const uint64_t after_offset = size_on_disk > static_cast<uint64_t>(offset)
-                                                  ? size_on_disk - static_cast<uint64_t>(offset)
-                                                  : 0;
+                const uint64_t after_offset = size_on_disk > file_offset ? size_on_disk - file_offset : 0;
                 rounded = std::min(rounded, (after_offset + host_page - 1) & ~(host_page - 1));
             }
 
             int host_protection = PROT_READ;
-            if ((protection & guest::kProtWrite) != 0) {
+            const bool writable = wants_shared && (protection & guest::kProtWrite) != 0;
+            if (writable) {
                 host_protection |= PROT_WRITE;
             }
             void* mapped = rounded == 0
                                ? MAP_FAILED
-                               : mmap(reinterpret_cast<void*>(placed), rounded, host_protection,
+                               : mmap(reinterpret_cast<void*>(base), rounded, host_protection,
                                       MAP_FIXED | MAP_SHARED, file->host_fd,
-                                      static_cast<off_t>(offset));
+                                      static_cast<off_t>(file_offset));
             if (mapped != MAP_FAILED) {
                 // The table's lock is already held by the block this sits in.
                 shared_->mappings.emplace_back(placed, length);
-                NoteSharedMapping(placed, rounded, file->host_fd, static_cast<uint64_t>(offset));
+                NoteSharedMapping(base, rounded, file->host_fd, file_offset, writable);
+                if (live_private && config_.trace) {
+                    FATHOM_INFO("[pid %d] that private mapping is live: the file is written through a shared mapping", pid_);
+                }
                 return ToGuest(placed);
             }
             FATHOM_WARN("shared mapping of %s failed (%s); falling back to a private copy",
                         file->guest_path.c_str(), std::strerror(errno));
+            if (phase != 0) {
+                // The copy below needs the plain placement back.
+                space_->Release(base, length + phase);
+                placed = space_->Allocate(length, 0, guest_protection | kGuestProtWrite);
+                if (placed == 0) {
+                    return FailLinux(12);
+                }
+            }
         }
-        if ((flags & guest::kMapShared) != 0) {
+        if (wants_shared) {
             FATHOM_WARN("MAP_SHARED file mapping is emulated as a private copy (fd %d)", fd);
         }
         uint64_t done = 0;

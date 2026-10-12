@@ -439,6 +439,7 @@ private:
     // Individual syscalls that are long enough to deserve a name.
     uint64_t DoOpenAt(int dirfd, uint64_t path_address, int flags, int mode);
     uint64_t DoRead(int fd, uint64_t buffer, uint64_t count);
+    bool WaitUntilReadable(int host_fd);
     uint64_t DoPoll(uint64_t fds_address, uint64_t count, int timeout_ms);
     uint64_t DoSelect(int count, uint64_t read_address, uint64_t write_address,
                       uint64_t except_address, int64_t timeout_us);

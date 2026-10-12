@@ -763,17 +763,23 @@ void JoinNudging(pthread_t handle, const std::atomic<bool>* finished) {
         action.sa_flags = 0;
         sigaction(SIGURG, &action, nullptr);
     });
+    // Blocking reads already wait in slices and notice the stop on their own, so the
+    // signal is a last resort for a call nothing else can interrupt -- and it is only
+    // sent once the thread has had a good while to stop by itself. On iOS a signal is
+    // ruinously slow while the debugger that grants JIT is attached, so it must stay rare.
     for (int attempt = 0; attempt < 600; ++attempt) {
-        if (finished != nullptr ? finished->load(std::memory_order_acquire) : attempt >= 3) {
+        if (finished != nullptr ? finished->load(std::memory_order_acquire) : attempt >= 30) {
             break;
         }
-        if (pthread_kill(handle, SIGURG) != 0) {
-            break; // Already gone.
+        if (attempt >= 30 && (attempt % 10) == 0) {
+            if (attempt == 30) {
+                FATHOM_WARN("a guest thread has not stopped in a second; prodding it");
+            }
+            if (pthread_kill(handle, SIGURG) != 0) {
+                break; // Already gone.
+            }
         }
-        if (attempt == 100) {
-            FATHOM_WARN("a guest thread is slow to stop; still prodding it");
-        }
-        usleep(attempt < 100 ? 10000 : 100000);
+        usleep(attempt < 30 ? 30000 : 100000);
     }
     pthread_join(handle, nullptr);
 }
@@ -822,19 +828,22 @@ void fathom_session::StopAndJoinThreadsOf(GuestProcess* process) {
 void fathom_session::StopAndJoinThreads() {
     console.RequestStop();
 
+    // Each child process's own host thread joins that process's threads on its way out,
+    // and then destroys their state. So they are not joined from here as well: marking
+    // them joined here made that teardown skip them and free the state of a thread that
+    // was still running -- a crash in a stop check, once blocked reads learned to stop.
+    // Only the processes' host threads are joined here, and after them whatever threads
+    // nobody else will join: the first process's, which runs on the caller's thread.
     std::vector<pthread_t> waiting;
+    std::vector<GuestProcess*> remaining;
     {
         std::scoped_lock lock {process_mutex};
         for (auto& [pid, process] : processes) {
-            for (auto& thread : process->threads) {
-                if (thread->started) {
-                    waiting.push_back(thread->host_thread);
-                    thread->started = false;
-                }
-            }
             if (process->thread_started && !process->finished) {
                 waiting.push_back(process->host_thread);
                 process->thread_started = false;
+            } else {
+                remaining.push_back(process.get());
             }
         }
     }
@@ -842,6 +851,9 @@ void fathom_session::StopAndJoinThreads() {
 
     for (pthread_t thread : waiting) {
         JoinNudging(thread, nullptr);
+    }
+    for (auto* process : remaining) {
+        StopAndJoinThreadsOf(process);
     }
 }
 

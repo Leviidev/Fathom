@@ -1607,8 +1607,41 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
     // other is not an unusual thing to do; Chromium does it during startup, and the whole
     // process would stop dead the first time it did.
     const auto waiting = EnterBlockingWait();
+    if (!WaitUntilReadable(host_fd)) {
+        exit_status_ = -1;
+        control_.ExitGuest(-1);
+    }
     const ssize_t bytes = read(host_fd, data, count);
     return bytes < 0 ? Fail(errno) : static_cast<uint64_t>(bytes);
+}
+
+/// Waits for a descriptor a read would block on, in slices that notice a stop.
+///
+/// A plain blocking read on a pipe or a socket returns only when data arrives, and a
+/// thread parked in one never sees that its process is stopping -- at exit, at exec --
+/// so the process could never finish. Polling in short slices instead costs nothing
+/// while data flows and keeps every such thread answerable. No signals: on iOS each one
+/// is ruinously slow while the debugger that grants JIT is attached. Regular files and
+/// descriptors the guest made non-blocking are left alone; neither can block.
+bool LinuxSyscalls::WaitUntilReadable(int host_fd) {
+    struct stat info {};
+    if (fstat(host_fd, &info) == 0 && S_ISREG(info.st_mode)) {
+        return true;
+    }
+    const int status = fcntl(host_fd, F_GETFL);
+    if (status >= 0 && (status & O_NONBLOCK) != 0) {
+        return true;
+    }
+    for (;;) {
+        if (ShouldStop()) {
+            return false;
+        }
+        struct pollfd entry {host_fd, POLLIN, 0};
+        const int ready = poll(&entry, 1, 50);
+        if (ready > 0 || (ready < 0 && errno != EINTR)) {
+            return true; // Readable, hung up, or in error: the read will say which.
+        }
+    }
 }
 
 namespace {
@@ -2149,8 +2182,12 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
                 continue;
             }
             const auto got = EnterBlockingWait();
-            const ssize_t bytes = read(host_fd, piece.iov_base, piece.iov_len);
             (void)got;
+            if (!WaitUntilReadable(host_fd)) {
+                exit_status_ = -1;
+                control_.ExitGuest(-1);
+            }
+            const ssize_t bytes = read(host_fd, piece.iov_base, piece.iov_len);
             if (bytes < 0) {
                 return filled > 0 ? static_cast<uint64_t>(filled) : Fail(errno);
             }

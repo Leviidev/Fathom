@@ -476,6 +476,17 @@ int ToHostOpenFlags(int guest_flags) {
     return host;
 }
 
+/// A host device number in Linux's layout: twelve bits of major, twenty of minor, with
+/// the low byte of the minor in the low byte. statx hands the guest major and minor
+/// separately and glibc puts them together this way, so stat has to say the same thing
+/// -- Wine names its server directory after st_dev, and a 32-bit Wine (statx) and a
+/// 64-bit one (stat) were looking in two different places for the same server.
+uint64_t LinuxDev(dev_t host_dev) {
+    const uint64_t dev_major = static_cast<uint64_t>(major(host_dev));
+    const uint64_t dev_minor = static_cast<uint64_t>(minor(host_dev));
+    return ((dev_major & 0xfffu) << 8) | (dev_minor & 0xffu) | ((dev_minor & 0xfffff00u) << 12);
+}
+
 // x86-64 Linux's struct stat, written at the exact offsets the guest reads.
 struct LinuxStat {
     uint64_t st_dev;
@@ -501,7 +512,7 @@ static_assert(sizeof(LinuxStat) == 144, "x86-64 Linux struct stat is 144 bytes")
 
 void TranslateStat(const struct stat& host, LinuxStat* out) {
     std::memset(out, 0, sizeof(*out));
-    out->st_dev = static_cast<uint64_t>(host.st_dev);
+    out->st_dev = LinuxDev(host.st_dev);
     out->st_ino = host.st_ino;
     out->st_nlink = host.st_nlink;
     // The mode bits that matter (S_IFMT kinds and the permission bits) share values
@@ -509,7 +520,7 @@ void TranslateStat(const struct stat& host, LinuxStat* out) {
     out->st_mode = host.st_mode;
     out->st_uid = GuestUid(host.st_uid);
     out->st_gid = GuestGid(host.st_gid);
-    out->st_rdev = static_cast<uint64_t>(host.st_rdev);
+    out->st_rdev = LinuxDev(host.st_rdev);
     out->st_size = host.st_size;
     out->st_blksize = host.st_blksize;
     out->st_blocks = host.st_blocks;
@@ -553,14 +564,14 @@ static_assert(sizeof(LinuxStat32) == 96, "i386 Linux struct stat64 is 96 bytes")
 
 void TranslateStat32(const struct stat& host, LinuxStat32* out) {
     std::memset(out, 0, sizeof(*out));
-    out->st_dev = static_cast<uint64_t>(host.st_dev);
+    out->st_dev = LinuxDev(host.st_dev);
     out->st_ino = host.st_ino;
     out->broken_st_ino = static_cast<uint32_t>(host.st_ino);
     out->st_mode = host.st_mode;
     out->st_nlink = host.st_nlink;
     out->st_uid = GuestUid(host.st_uid);
     out->st_gid = GuestGid(host.st_gid);
-    out->st_rdev = static_cast<uint64_t>(host.st_rdev);
+    out->st_rdev = LinuxDev(host.st_rdev);
     out->st_size = host.st_size;
     out->st_blksize = static_cast<uint32_t>(host.st_blksize);
     out->st_blocks = static_cast<uint64_t>(host.st_blocks);
@@ -4840,6 +4851,10 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         const std::string guest_path = NormaliseGuestPath(path);
         struct stat host {};
         if (stat(ResolveGuestPath(guest_path).c_str(), &host) != 0) {
+            if (config_.trace) {
+                FATHOM_INFO("[pid %d] chdir %s (%s) -> %s", pid_, path.c_str(), ResolveGuestPath(guest_path).c_str(),
+                            std::strerror(errno));
+            }
             return Fail(errno);
         }
         if (!S_ISDIR(host.st_mode)) {
@@ -4860,7 +4875,12 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         const std::string host_path = ResolveAt(is_at ? static_cast<int>(arg1) : guest::kAtFdCwd,
                                                 path.c_str(), nullptr);
         const auto mode = static_cast<mode_t>(is_at ? arg3 : arg2);
-        return mkdir(host_path.c_str(), mode) == 0 ? 0 : Fail(errno);
+        const int made = mkdir(host_path.c_str(), mode);
+        if (config_.trace) {
+            FATHOM_INFO("[pid %d] mkdir %s mode %#o -> %s", pid_, path.c_str(), static_cast<unsigned>(mode),
+                        made == 0 ? "ok" : std::strerror(errno));
+        }
+        return made == 0 ? 0 : Fail(errno);
     }
 
     case kSysUnlink:

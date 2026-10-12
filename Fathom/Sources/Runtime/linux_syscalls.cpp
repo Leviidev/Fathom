@@ -2701,6 +2701,12 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         // cannot express; that falls through to the copy below, which is still right for
         // a reader and only wrong for a writer.
         const uint64_t host_page = space_->HostPageSize();
+        if (config_.trace) {
+            FATHOM_INFO("[pid %d] %s map of %s at offset %#llx, %#llx bytes, prot %d%s", pid_,
+                        (flags & guest::kMapShared) != 0 ? "shared" : "private", file->guest_path.c_str(),
+                        static_cast<unsigned long long>(offset), static_cast<unsigned long long>(length), protection,
+                        (static_cast<uint64_t>(offset) % host_page) == 0 ? "" : " -- offset not on a host page, so a copy");
+        }
         if ((flags & guest::kMapShared) != 0 && (static_cast<uint64_t>(offset) % host_page) == 0) {
             uint64_t rounded = (length + host_page - 1) & ~(host_page - 1);
 

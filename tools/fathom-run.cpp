@@ -77,6 +77,7 @@ void Usage() {
                  "  --cwd DIR      guest-absolute starting directory (default \"/\")\n"
                  "  --env K=V      add an environment variable (repeatable)\n"
                  "  --trace        log every guest syscall\n"
+                 "  --quiet        only warnings and errors from the emulator itself\n"
                  "  --tso          emulate x86 memory ordering (every unaligned access then faults)\n"
                  "  --arena MB     guest address space reservation\n"
                  "\n"
@@ -95,6 +96,7 @@ int main(int argc, char** argv) {
     bool tso = false;
     bool multiblock = true;
     int max_inst = 0;
+    bool quiet = false;
     bool avx = true;
     uint64_t arena_mb = 0;
 
@@ -113,6 +115,8 @@ int main(int argc, char** argv) {
             // Changes how FEX stitches guest basic blocks together. If a fault goes away
             // with this off, the problem is in the JIT rather than in the guest.
             multiblock = false;
+        } else if (option == "--quiet") {
+            quiet = true;
         } else if (option == "--single-step") {
             // One guest instruction per block, so a fault's reported RIP is the instruction itself.
             max_inst = 1;
@@ -162,7 +166,7 @@ int main(int argc, char** argv) {
                                   "/fathom-run.crash.log").c_str());
 
     fathom_set_log_sink(&LogLine, nullptr);
-    fathom_set_log_level(trace ? FATHOM_LOG_DEBUG : FATHOM_LOG_INFO);
+    fathom_set_log_level(trace ? FATHOM_LOG_DEBUG : quiet ? FATHOM_LOG_WARN : FATHOM_LOG_INFO);
 
     // A guest-absolute path resolved against the root, the same way the app does it, so
     // "/bin/sh" means the shell inside the root filesystem rather than the Mac's own.

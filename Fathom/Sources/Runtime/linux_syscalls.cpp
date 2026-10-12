@@ -33,6 +33,12 @@
 #include <unistd.h>
 
 namespace fathom {
+// The guest runs as uid/gid 1000 (getuid answers that), so files the host user owns have to be reported as 1000's too.
+// Passed through as the host's numbers (501 on a Mac), every file in the guest root belongs to someone else, and a
+// program that checks ownership -- Wine refuses a prefix it does not own -- stops.
+static uint32_t GuestUid(uint32_t host) { return host == static_cast<uint32_t>(getuid()) ? 1000 : host; }
+static uint32_t GuestGid(uint32_t host) { return host == static_cast<uint32_t>(getgid()) ? 1000 : host; }
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -501,8 +507,8 @@ void TranslateStat(const struct stat& host, LinuxStat* out) {
     // The mode bits that matter (S_IFMT kinds and the permission bits) share values
     // between Darwin and Linux, so this one field genuinely does carry across.
     out->st_mode = host.st_mode;
-    out->st_uid = host.st_uid;
-    out->st_gid = host.st_gid;
+    out->st_uid = GuestUid(host.st_uid);
+    out->st_gid = GuestGid(host.st_gid);
     out->st_rdev = static_cast<uint64_t>(host.st_rdev);
     out->st_size = host.st_size;
     out->st_blksize = host.st_blksize;
@@ -552,8 +558,8 @@ void TranslateStat32(const struct stat& host, LinuxStat32* out) {
     out->broken_st_ino = static_cast<uint32_t>(host.st_ino);
     out->st_mode = host.st_mode;
     out->st_nlink = host.st_nlink;
-    out->st_uid = host.st_uid;
-    out->st_gid = host.st_gid;
+    out->st_uid = GuestUid(host.st_uid);
+    out->st_gid = GuestGid(host.st_gid);
     out->st_rdev = static_cast<uint64_t>(host.st_rdev);
     out->st_size = host.st_size;
     out->st_blksize = static_cast<uint32_t>(host.st_blksize);
@@ -2563,6 +2569,13 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
             space_.NotifyContentsReplaced(placed, placed + length);
         }
     } else {
+        // The heap is reserved up front, well past where its break is, which Linux never does: there the space above the
+        // break is free until brk grows into it. A program that asks for an address in that tail -- 32-bit Wine wants
+        // Windows' shared user data at 0x7ffe0000, just above its loader, and checks it got it -- would otherwise be put
+        // somewhere else. So the heap gives the tail up, from the hint on.
+        if (address != 0) {
+            ShrinkHeapBelow(address);
+        }
         // Writable regardless of what the guest asked for: file-backed contents have to
         // be written in below, and the real protection is applied afterwards.
         placed = space_.Allocate(length, address, guest_protection | kGuestProtWrite);
@@ -2708,6 +2721,25 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         shared_->mappings.emplace_back(placed, length);
     }
     return ToGuest(placed);
+}
+
+void LinuxSyscalls::ShrinkHeapBelow(uint64_t host_address) {
+    if (shared_->heap_base == 0) {
+        return;
+    }
+    const uint64_t page = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+    const uint64_t used_end = (ToHost(shared_->heap_break) + page - 1) & ~(page - 1);
+    const uint64_t limit = ToHost(shared_->heap_limit);
+    if (host_address < used_end || host_address >= limit) {
+        return;
+    }
+    const uint64_t cut = host_address & ~(page - 1);
+    const uint64_t from = std::max(cut, used_end);
+    if (from < limit && space_.Release(from, limit - from)) {
+        shared_->heap_limit = shared_->heap_limit - (limit - from);
+        FATHOM_INFO("[pid %d] heap gives up %#llx..%#llx for a mapping asked for there", pid_,
+                    static_cast<unsigned long long>(from), static_cast<unsigned long long>(limit));
+    }
 }
 
 uint64_t LinuxSyscalls::DoBrk(uint64_t requested) {
@@ -2868,6 +2900,26 @@ uint64_t LinuxSyscalls::DoReadlinkAt(int dirfd, uint64_t path_address, uint64_t 
         const size_t copied = std::min(static_cast<size_t>(size), program_path_.size());
         std::memcpy(out, program_path_.data(), copied);
         return copied;
+    }
+
+    // /proc/self is a link to the process's own number. glibc's realpath walks a path one
+    // component at a time and readlinks each, so realpath("/proc/self/exe") -- how 32-bit
+    // Wine finds its own directory -- fails outright if /proc/self is not answered here.
+    if (path == "/proc/self" || path == "/proc/self/") {
+        const std::string pid = std::to_string(pid_);
+        const size_t copied = std::min(static_cast<size_t>(size), pid.size());
+        std::memcpy(out, pid.data(), copied);
+        return copied;
+    }
+
+    // Everything else under /proc that the guest root does not hold (/proc/<pid> and what is in it) is Fathom's own, and
+    // none of it is a link: say so, as Linux would, rather than that it does not exist -- realpath gives up on the latter.
+    if (path.rfind("/proc/", 0) == 0) {
+        std::string unused;
+        struct stat st {};
+        if (::lstat(ResolveAt(dirfd, path.c_str(), &unused, false).c_str(), &st) != 0) {
+            return FailLinux(22);
+        }
     }
 
     std::string guest_path;
@@ -5561,8 +5613,8 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         put32(0, kStatxBasicStats);                            // stx_mask: what is filled in
         put32(4, static_cast<uint32_t>(host.st_blksize));
         put32(16, static_cast<uint32_t>(host.st_nlink));
-        put32(20, host.st_uid);
-        put32(24, host.st_gid);
+        put32(20, GuestUid(host.st_uid));
+        put32(24, GuestGid(host.st_gid));
         put16(28, static_cast<uint16_t>(host.st_mode));
         put64(32, host.st_ino);
         put64(40, static_cast<uint64_t>(host.st_size));

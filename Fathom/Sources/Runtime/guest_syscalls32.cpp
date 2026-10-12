@@ -47,6 +47,7 @@ int64_t X86_64SyscallForI386(uint64_t i386_number) {
         {114, 61},   // wait4
         {122, 63},   // uname
         {125, 10},   // mprotect
+        {133, 81},   // fchdir
         {140, -2},   // _llseek: a split 64-bit offset and a result pointer, handled at the call site
         {203, 203},  // sched_setaffinity
         {141, 78},   // getdents

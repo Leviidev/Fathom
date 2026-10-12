@@ -450,6 +450,8 @@ private:
     /// True only for the literal /proc/self/exe, never for a path that merely resolves to
     /// the same file.
     bool IsProcSelfExe(const std::string& path) const;
+    /// Gives up the heap's reserved but unused tail from this host address on, for a mapping the guest asked for there.
+    void ShrinkHeapBelow(uint64_t host_address);
     uint64_t DoSetThreadArea(uint64_t descriptor_address);
     uint64_t DoSocketcall(uint64_t call, uint64_t arguments_address);
     uint64_t DoLlseek(int fd, uint32_t offset_high, uint32_t offset_low, uint64_t result_address,

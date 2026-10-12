@@ -259,13 +259,28 @@ void GuestAddressSpace::ReturnFreeExtent(uint64_t address, uint64_t size) {
     if (size == 0) {
         return;
     }
+    // Part of the range may already be free (a heap that gave up its tail, a guest that unmapped a piece of a library):
+    // free the rest of it. Giving up on the whole range instead leaves it reserved for good -- an exec then keeps the old
+    // program's heap, and the new program cannot have those addresses.
     for (const auto& extent : free_) {
         if (extent.begin < address + size && address < extent.end()) {
-            FATHOM_WARN("arena: %#llx..%#llx is being freed while %#llx..%#llx is already free",
-                        static_cast<unsigned long long>(address),
-                        static_cast<unsigned long long>(address + size),
-                        static_cast<unsigned long long>(extent.begin),
-                        static_cast<unsigned long long>(extent.end()));
+            std::vector<std::pair<uint64_t, uint64_t>> pieces;
+            uint64_t cursor = address;
+            for (const auto& other : free_) {
+                if (other.end() <= cursor || other.begin >= address + size) {
+                    continue;
+                }
+                if (other.begin > cursor) {
+                    pieces.emplace_back(cursor, other.begin - cursor);
+                }
+                cursor = std::max(cursor, other.end());
+            }
+            if (cursor < address + size) {
+                pieces.emplace_back(cursor, address + size - cursor);
+            }
+            for (const auto& [begin, length] : pieces) {
+                ReturnFreeExtent(begin, length);
+            }
             return;
         }
     }
@@ -533,6 +548,10 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
                 static_cast<unsigned long long>(total / 1024),
                 static_cast<unsigned long long>(free_.size()),
                 static_cast<unsigned long long>(largest / 1024));
+    for (const auto& extent : free_) {
+        FATHOM_INFO("arena:   free %#llx..%#llx (%llu KB)", static_cast<unsigned long long>(extent.begin),
+                    static_cast<unsigned long long>(extent.end()), static_cast<unsigned long long>(extent.size / 1024));
+    }
     return 0;
 }
 

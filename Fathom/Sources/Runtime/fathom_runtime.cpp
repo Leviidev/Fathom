@@ -742,6 +742,44 @@ void fathom_session::ThawThreads(GuestProcess* process) {
     fathom::ReleaseInvalidations();
 }
 
+namespace {
+
+/// Joins a guest thread's host thread, prodding it until it leaves its run loop.
+///
+/// A thread stopped while it sits in a blocking host call -- read on the wineserver's
+/// pipe, recvmsg on a socket -- never looks at the stop flag, because nothing returns
+/// from the call; the join then waits for ever, and a process that has exited cannot
+/// finish exiting. A signal whose handler does nothing and whose action has no
+/// SA_RESTART makes the call return EINTR; the guest retries the syscall, and the retry
+/// finds the stop. SIGURG, because its default is to be ignored and nothing else here
+/// uses it. `finished` is set by the run loop on its way out; without one the prodding is
+/// bounded instead.
+void JoinNudging(pthread_t handle, const std::atomic<bool>* finished) {
+    static std::once_flag installed;
+    std::call_once(installed, [] {
+        struct sigaction action {};
+        action.sa_handler = [](int) {};
+        sigemptyset(&action.sa_mask);
+        action.sa_flags = 0;
+        sigaction(SIGURG, &action, nullptr);
+    });
+    for (int attempt = 0; attempt < 600; ++attempt) {
+        if (finished != nullptr ? finished->load(std::memory_order_acquire) : attempt >= 3) {
+            break;
+        }
+        if (pthread_kill(handle, SIGURG) != 0) {
+            break; // Already gone.
+        }
+        if (attempt == 100) {
+            FATHOM_WARN("a guest thread is slow to stop; still prodding it");
+        }
+        usleep(attempt < 100 ? 10000 : 100000);
+    }
+    pthread_join(handle, nullptr);
+}
+
+} // namespace
+
 void fathom_session::StopAndJoinOtherThreadsOf(GuestProcess* process) {
     if (process->threads.empty()) {
         return;
@@ -756,7 +794,7 @@ void fathom_session::StopAndJoinOtherThreadsOf(GuestProcess* process) {
     process_changed.notify_all();
     for (auto& thread : process->threads) {
         if (thread->started && !pthread_equal(thread->host_thread, self)) {
-            pthread_join(thread->host_thread, nullptr);
+            JoinNudging(thread->host_thread, &thread->finished);
             thread->started = false;
         }
     }
@@ -774,7 +812,7 @@ void fathom_session::StopAndJoinThreadsOf(GuestProcess* process) {
     process_changed.notify_all();
     for (auto& thread : process->threads) {
         if (thread->started) {
-            pthread_join(thread->host_thread, nullptr);
+            JoinNudging(thread->host_thread, &thread->finished);
             thread->started = false;
         }
     }
@@ -803,7 +841,7 @@ void fathom_session::StopAndJoinThreads() {
     process_changed.notify_all();
 
     for (pthread_t thread : waiting) {
-        pthread_join(thread, nullptr);
+        JoinNudging(thread, nullptr);
     }
 }
 

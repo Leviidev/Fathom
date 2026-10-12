@@ -481,7 +481,7 @@ struct fathom_session final : fathom::ProcessHost {
         return true;
     }
 
-    int64_t ForkProcess(int caller_pid, uint64_t stack = 0) override;
+    int64_t ForkProcess(int caller_pid, uint64_t stack = 0, bool shares_memory = true) override;
     int64_t ExecProcess(int caller_pid, const std::string& path, std::vector<std::string> argv,
                         std::vector<std::string> envp) override;
     int64_t WaitForChild(int caller_pid, int wanted_pid, int* exit_status, int options) override;
@@ -1320,7 +1320,7 @@ void fathom_session::StopWatchdog() {
     }
 }
 
-int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
+int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack, bool shares_memory) {
     GuestProcess* child_raw = nullptr;
     int child_pid = 0;
 
@@ -1407,7 +1407,7 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
         // Nothing is held when the child was given a stack of its own: it never returns
         // through its parent's frames, so there is nothing of the parent's to put back.
         uint64_t held = 0;
-        if (stack != 0) {
+        if (stack != 0 && shares_memory) {
             FATHOM_INFO("fork: pid %d starts pid %d on its own stack %#llx", caller_pid,
                         child_pid, static_cast<unsigned long long>(stack));
         } else {

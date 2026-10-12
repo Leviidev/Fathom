@@ -5574,7 +5574,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                     host_->CreateThread(pid_, flags, stack, parent_tid, child_tid, tls));
             }
             return static_cast<uint64_t>(
-                host_->ForkProcess(pid_, (flags & guest::kCloneVm) != 0 ? stack : 0));
+                host_->ForkProcess(pid_, stack, (flags & guest::kCloneVm) != 0));
         }
 
         // Sharing the address space is not what makes a clone a thread -- CLONE_THREAD is,
@@ -5590,9 +5590,12 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             const uint64_t child_tid = config_.guest_is_32bit ? arg5 : arg4;
             return static_cast<uint64_t>(host_->CreateThread(pid_, arg1, arg2, arg3, child_tid, tls));
         }
-        const uint64_t shared_stack =
-            number == kSysClone && (arg1 & guest::kCloneVm) != 0 ? arg2 : 0;
-        return static_cast<uint64_t>(host_->ForkProcess(pid_, shared_stack));
+        // The stack is honoured with or without CLONE_VM: a fork onto a stack of its own is
+        // what Steam's crash handler does, and its child pops the function to run off that
+        // stack. Started on its parent's instead, it pops garbage and jumps into it.
+        const uint64_t child_stack = number == kSysClone ? arg2 : 0;
+        return static_cast<uint64_t>(
+            host_->ForkProcess(pid_, child_stack, number != kSysClone || (arg1 & guest::kCloneVm) != 0));
     }
 
     case kSysExecve: {

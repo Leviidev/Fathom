@@ -1728,7 +1728,17 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack, bool shares_
                 child_raw->borrowed.clear();
                 child_raw->borrowed.shrink_to_fit();
             }
-            process_changed.wait(lock, [&] { return child_raw->released || console.StopRequested(); });
+            // A child on a stack of its own touches nothing the parent is standing on, and
+            // Linux would have let the parent go the moment it was created. Some children
+            // never exec or exit at all -- Steam's crash handler forks a helper that sits
+            // on a pipe for the life of the program -- and waiting for them is waiting for
+            // ever. A child borrowing the parent's stack still has to be waited for: both
+            // running at once would be two programs in one set of frames.
+            if (stack != 0) {
+                FATHOM_INFO("fork: pid %d runs on its own stack, so pid %d carries on", child_pid, caller_pid);
+            } else {
+                process_changed.wait(lock, [&] { return child_raw->released || console.StopRequested(); });
+            }
         }
     }
 

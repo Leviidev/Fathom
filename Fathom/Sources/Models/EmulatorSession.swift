@@ -96,11 +96,12 @@ final class EmulatorSession: ObservableObject {
     /// argv[0] is the guest-visible path, not the host one, because busybox decides
     /// which of its ~300 applets to be from the name it was invoked under: hand it
     /// "/bin/sh" and it is a shell, hand it a container path and it is nothing.
-    func runInGuest(path guestPath: String, arguments: [String] = [], settings: EmulatorSettings) {
+    func runInGuest(path guestPath: String, arguments: [String] = [], settings: EmulatorSettings,
+                    environment: [String] = [], workDirectory: String = "/") {
         let relative = guestPath.hasPrefix("/") ? String(guestPath.dropFirst()) : guestPath
         let hostPath = ProgramLibrary.guestRootDirectory.appendingPathComponent(relative).path
         launch(hostPath: hostPath, argv: [guestPath] + arguments, name: guestPath,
-               settings: settings) { [weak self] exitCode in
+               settings: settings, environment: environment, workDirectory: workDirectory) { [weak self] exitCode in
             self?.finish(exitCode: exitCode, program: nil, library: nil)
         }
     }
@@ -146,7 +147,10 @@ final class EmulatorSession: ObservableObject {
         }
     }
 
+    /// `environment` is added to the standard guest environment, later entries winning;
+    /// `workDirectory` is the guest's starting directory.
     private func launch(hostPath: String, argv: [String], name: String, settings: EmulatorSettings,
+                        environment extra: [String] = [], workDirectory: String = "/",
                         onFinish: @escaping (Int) -> Void) {
         guard !state.isActive else { return }
 
@@ -166,7 +170,12 @@ final class EmulatorSession: ObservableObject {
 
         let path = hostPath
         let guestRoot = ProgramLibrary.guestRootDirectory.path
-        let environment = settings.guestEnvironment
+        var environment = settings.guestEnvironment
+        for entry in extra {
+            let key = entry.prefix { $0 != "=" }
+            environment.removeAll { $0.hasPrefix(key + "=") }
+            environment.append(entry)
+        }
 
         var config = fathom_session_config()
         fathom_session_config_defaults(&config)
@@ -185,7 +194,7 @@ final class EmulatorSession: ObservableObject {
         // than a deep nest of withCString closures, and there is exactly one exit path.
         let pathString = CString(path)
         let rootString = CString(guestRoot)
-        let workString = CString("/")
+        let workString = CString(workDirectory)
         let argvArray = CStringArray(argv)
         let envp = CStringArray(environment)
         defer {

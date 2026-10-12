@@ -5,6 +5,7 @@ struct SettingsView: View {
     @EnvironmentObject private var library: ProgramLibrary
     @EnvironmentObject private var jit: JITSupport
     @ObservedObject private var steam = SteamAccount.shared
+    @ObservedObject private var steamcmd = SteamCmd.shared
     @AppStorage(Holiday.key) private var holiday = true
 
     var body: some View {
@@ -44,8 +45,23 @@ struct SettingsView: View {
                     }
                 }
             }
+            HStack {
+                Label("Downloader", systemImage: "arrow.down.circle")
+                Spacer()
+                switch steamcmd.phase {
+                case .ready: Text("Ready").foregroundStyle(.secondary)
+                case .installing(let step, _): Text(step).font(.caption).foregroundStyle(.secondary)
+                case .missing: Button("Set Up") { Task { await steamcmd.install() } }
+                case .failed: Button("Retry") { Task { await steamcmd.install() } }
+                }
+            }
+            if steamcmd.phase == .ready {
+                Button("Remove Downloader", role: .destructive) { steamcmd.remove() }
+            }
         } header: {
             Text("Steam")
+        } footer: {
+            Text("Games download through Valve's steamcmd, run inside the emulator, and land in Fathom \u{203A} GuestRoot \u{203A} root \u{203A} games in the Files app.")
         }
     }
 

@@ -102,17 +102,21 @@ struct GameDetailView: View {
     private var play: some View {
         switch source {
         case .steam(let game):
-            let linux = info?.platforms.contains("linux") ?? false
-            if linux && GuestRootfs.hasSteam {
-                NavigationLink { SteamView() } label: { playLabel("Play in Steam", systemImage: "play.fill") }
-                    .buttonStyle(.plain)
-                Text("Opens the Steam client, which installs and starts the Linux version of \(game.name).")
+            let installed = SteamCmd.isGameInstalled(game.appid)
+            NavigationLink { DownloadView(appid: game.appid, name: game.name) } label: {
+                playLabel(installed ? "Installed \u{00B7} Update" : "Download", systemImage: installed ? "checkmark.circle" : "arrow.down.to.line")
+            }
+            .buttonStyle(.plain)
+            if installed {
+                Text("\(formatBytes(SteamCmd.installedSize(game.appid))) in Files \u{203A} Fathom \u{203A} GuestRoot \u{203A} root \u{203A} games \u{203A} \(game.appid). Fathom runs Windows games through Wine; playing them here arrives in an upcoming build.")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
-                playLabel("Windows games are coming", systemImage: "hourglass").opacity(0.55)
-                Text(linux ? "This build of Fathom does not include the Steam client." :
-                        "\(game.name) is Windows-only. Fathom runs Windows games through Wine; that arrives in an upcoming build.")
+                Text("Downloads with your Steam account through steamcmd, into the Files app.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            if info?.platforms.contains("linux") == true && GuestRootfs.hasSteam {
+                NavigationLink { SteamView() } label: { playLabel("Play in Steam", systemImage: "play.fill") }
+                    .buttonStyle(.plain)
             }
         case .imported(let game):
             playLabel("Windows games are coming", systemImage: "hourglass").opacity(0.55)

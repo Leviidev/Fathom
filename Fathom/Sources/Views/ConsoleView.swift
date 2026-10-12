@@ -5,6 +5,9 @@ import SwiftUI
 struct ConsoleView: View {
     @ObservedObject var session: EmulatorSession
     var prefersKeyboard: Bool = false
+    /// Show the terminal and take keys even if the guest never asked for raw mode -- for a
+    /// program that reads lines, such as a password prompt.
+    var alwaysInteractive: Bool = false
 
     var body: some View {
         VStack(spacing: 16) {
@@ -40,7 +43,7 @@ struct ConsoleView: View {
                 }
             }
 
-            if session.isInteractive {
+            if session.isInteractive || alwaysInteractive {
                 TerminalView(terminal: session.terminal, onKey: { key in
                     session.sendKey(key)
                 }, prefersKeyboard: prefersKeyboard)

@@ -874,6 +874,50 @@ std::vector<std::pair<uint64_t, uint64_t>> SharedMappingsIn(uint64_t begin, uint
     return found;
 }
 
+/// Takes [begin, end) out of any shared file mapping it lies in, leaving private memory
+/// with the same bytes.
+///
+/// A shared mapping is the host's own mmap of the file over the arena pages, and its
+/// protection can never exceed the file's: a read-only file gives pages that stay
+/// read-only whatever the arena records. A guest that maps something new over part of it
+/// -- Wine re-reserves an unmapped view by mapping it again with no access -- then has
+/// its pages committed writable for the zeroing, the mprotect is refused, and the memset
+/// faults inside the mmap call. So the host pages go back to anonymous memory first. The
+/// host's pages are larger than the guest's, so the parts of those pages outside the
+/// range keep their bytes; whatever is about to land inside the range overwrites them.
+void ReplaceSharedMappingsIn(uint64_t begin, uint64_t end, uint64_t host_page) {
+    if (end <= begin || begin >= g_shared_high.load(std::memory_order_acquire) ||
+        end <= g_shared_low.load(std::memory_order_acquire)) {
+        return;
+    }
+    const size_t count =
+        std::min(g_shared_mapping_count.load(std::memory_order_acquire), kSharedMappingSlots);
+    for (size_t index = 0; index < count; ++index) {
+        auto& slot = g_shared_mappings[index];
+        const uint64_t slot_end = slot.end.load(std::memory_order_acquire);
+        const uint64_t slot_begin = slot.begin.load(std::memory_order_relaxed);
+        if (slot_end == 0 || slot_end <= begin || slot_begin >= end) {
+            continue;
+        }
+        const uint64_t low = std::max(begin, slot_begin) & ~(host_page - 1);
+        const uint64_t high = std::min((std::min(end, slot_end) + host_page - 1) & ~(host_page - 1), slot_end);
+        std::vector<unsigned char> saved(high - low);
+        mprotect(reinterpret_cast<void*>(low), high - low, PROT_READ); // The guest may have taken all access away.
+        std::memcpy(saved.data(), reinterpret_cast<const void*>(low), saved.size());
+        if (mmap(reinterpret_cast<void*>(low), high - low, PROT_READ | PROT_WRITE,
+                 MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED) {
+            FATHOM_WARN("could not take %#llx..%#llx out of a shared mapping: %s",
+                        static_cast<unsigned long long>(low), static_cast<unsigned long long>(high),
+                        std::strerror(errno));
+            continue;
+        }
+        std::memcpy(reinterpret_cast<void*>(low), saved.data(), saved.size());
+        if (low <= slot_begin && high >= slot_end) {
+            slot.end.store(0, std::memory_order_release); // Nothing of it is shared any more.
+        }
+    }
+}
+
 /// The name for a futex word: the file and offset when it lives in shared memory, and the
 /// address itself otherwise.
 uint64_t FutexKeyFor(uint64_t host_address) {
@@ -943,7 +987,7 @@ void LinuxSyscalls::ReleaseThreadId() {
 
 LinuxSyscalls::LinuxSyscalls(GuestAddressSpace& space, GuestThreadControl& control,
                              GuestConsole& console, SyscallConfig config)
-    : space_ {space}
+    : space_ {&space}
     , control_ {control}
     , console_ {console}
     , config_ {std::move(config)}
@@ -1246,7 +1290,7 @@ void* LinuxSyscalls::GuestPointer(uint64_t address, uint64_t size, bool writable
     // reason the guest can see. Whether the memory exists at all is the thing this can
     // answer accurately, and it is what catches a genuinely wild pointer.
     (void)writable;
-    if (!space_.Validate(address, size, kGuestProtRead)) {
+    if (!space_->Validate(address, size, kGuestProtRead)) {
         return nullptr;
     }
     return reinterpret_cast<void*>(address);
@@ -1293,7 +1337,7 @@ bool LinuxSyscalls::ReadGuestString(uint64_t address, std::string* out, size_t l
     for (size_t offset = 0; offset < limit; ++offset) {
         const uint64_t byte_address = host_address + offset;
         if ((offset == 0) || (byte_address % guest::kPageSize) == 0) {
-            if (!space_.Validate(byte_address, 1, kGuestProtRead)) {
+            if (!space_->Validate(byte_address, 1, kGuestProtRead)) {
                 return false;
             }
         }
@@ -2546,10 +2590,14 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
     if (fixed && address != 0) {
         // The guest insists on this address. Inside the arena that is satisfiable; the
         // range may already be committed, in which case this is a re-protect.
-        if (!space_.Contains(address, length)) {
+        if (!space_->Contains(address, length)) {
             return FailLinux(12); // ENOMEM
         }
-        if (!space_.CommitFixed(address, length, guest_protection)) {
+        // Writable while it is zeroed or a file's contents are copied in, like the case below; the protection asked for
+        // is applied once that is done. Committed read-only first, the memset or the copy faults inside this call --
+        // Wine reserves PE image space at a fixed address with no access, and the process died there.
+        ReplaceSharedMappingsIn(address, address + length, space_->HostPageSize());
+        if (!space_->CommitFixed(address, length, guest_protection | kGuestProtWrite)) {
             return FailLinux(12);
         }
         placed = address;
@@ -2566,7 +2614,7 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         // which any block was ever compiled from. Code arriving at an address always
         // arrives executable, either here or through an mprotect, and both invalidate.
         if ((guest_protection & kGuestProtExec) != 0) {
-            space_.NotifyContentsReplaced(placed, placed + length);
+            space_->NotifyContentsReplaced(placed, placed + length);
         }
     } else {
         // The heap is reserved up front, well past where its break is, which Linux never does: there the space above the
@@ -2578,7 +2626,7 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         }
         // Writable regardless of what the guest asked for: file-backed contents have to
         // be written in below, and the real protection is applied afterwards.
-        placed = space_.Allocate(length, address, guest_protection | kGuestProtWrite);
+        placed = space_->Allocate(length, address, guest_protection | kGuestProtWrite);
         if (placed == 0) {
             return FailLinux(12);
         }
@@ -2629,13 +2677,13 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         std::scoped_lock lock {shared_->mutex};
         auto* file = FindFile(fd);
         if (file == nullptr) {
-            space_.Release(placed, length);
+            space_->Release(placed, length);
             return FailLinux(9);
         }
         if (file->is_framebuffer) {
             // Hand back the framebuffer itself rather than a copy: the whole point is
             // that what the guest writes here is what ends up on screen.
-            space_.Release(placed, length);
+            space_->Release(placed, length);
             const auto display = Display();
             if (display.address == 0) {
                 return FailLinux(19);
@@ -2652,7 +2700,7 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         // The one thing that cannot be honoured is an offset the host's larger pages
         // cannot express; that falls through to the copy below, which is still right for
         // a reader and only wrong for a writer.
-        const uint64_t host_page = space_.HostPageSize();
+        const uint64_t host_page = space_->HostPageSize();
         if ((flags & guest::kMapShared) != 0 && (static_cast<uint64_t>(offset) % host_page) == 0) {
             uint64_t rounded = (length + host_page - 1) & ~(host_page - 1);
 
@@ -2714,7 +2762,7 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         }
     }
     if ((guest_protection & kGuestProtWrite) == 0) {
-        space_.Protect(placed, length, guest_protection);
+        space_->Protect(placed, length, guest_protection);
     }
     {
         std::scoped_lock lock {shared_->mutex};
@@ -2735,7 +2783,7 @@ void LinuxSyscalls::ShrinkHeapBelow(uint64_t host_address) {
     }
     const uint64_t cut = host_address & ~(page - 1);
     const uint64_t from = std::max(cut, used_end);
-    if (from < limit && space_.Release(from, limit - from)) {
+    if (from < limit && space_->Release(from, limit - from)) {
         shared_->heap_limit = shared_->heap_limit - (limit - from);
         FATHOM_INFO("[pid %d] heap gives up %#llx..%#llx for a mapping asked for there", pid_,
                     static_cast<unsigned long long>(from), static_cast<unsigned long long>(limit));
@@ -2775,7 +2823,7 @@ bool LinuxSyscalls::EnsureFramebuffer() {
 
     const uint32_t stride = kDisplayWidth * (kDisplayBpp / 8);
     const uint64_t size = static_cast<uint64_t>(stride) * kDisplayHeight;
-    const uint64_t address = space_.Allocate(size, 0, kGuestProtRead | kGuestProtWrite);
+    const uint64_t address = space_->Allocate(size, 0, kGuestProtRead | kGuestProtWrite);
     if (address == 0) {
         FATHOM_ERROR("could not allocate a %ux%u framebuffer", kDisplayWidth, kDisplayHeight);
         return false;
@@ -3890,7 +3938,7 @@ uint64_t LinuxSyscalls::DoShmget(int32_t key, uint64_t size, int flags) {
     if (size == 0) {
         return FailLinux(22);
     }
-    const uint64_t host = space_.Allocate(size, 0, kGuestProtRead | kGuestProtWrite);
+    const uint64_t host = space_->Allocate(size, 0, kGuestProtRead | kGuestProtWrite);
     if (host == 0) {
         return FailLinux(12); // ENOMEM
     }
@@ -3925,7 +3973,7 @@ uint64_t LinuxSyscalls::DoShmdt(uint64_t address) {
         // marked -- Xlib relies on exactly that, removing a segment the moment it has
         // attached so a crash cannot leak it.
         if (entry->second.removed && entry->second.attachments == 0) {
-            space_.Release(ToHost(entry->second.guest_address), entry->second.size);
+            space_->Release(ToHost(entry->second.guest_address), entry->second.size);
             g_shared_segments.erase(entry);
         }
         return 0;
@@ -3946,7 +3994,7 @@ uint64_t LinuxSyscalls::DoShmctl(int id, int command, uint64_t buffer) {
     case kIpcRmid:
         entry->second.removed = true;
         if (entry->second.attachments == 0) {
-            space_.Release(ToHost(entry->second.guest_address), entry->second.size);
+            space_->Release(ToHost(entry->second.guest_address), entry->second.size);
             g_shared_segments.erase(entry);
         }
         return 0;
@@ -4447,7 +4495,11 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                 return entry.first >= host_address && entry.first + entry.second <= host_address + arg2;
             });
         }
-        return space_.Release(host_address, arg2) ? 0 : FailLinux(22);
+        // Release maps only the host pages nothing else lives in afresh, so a shared view's
+        // pages that a neighbour also uses would stay the file's, read-only, and would go on
+        // naming futexes and being left out of fork snapshots after the file is gone.
+        ReplaceSharedMappingsIn(host_address, host_address + arg2, space_->HostPageSize());
+        return space_->Release(host_address, arg2) ? 0 : FailLinux(22);
     }
 
     case kSysMprotect: {
@@ -4455,7 +4507,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if ((arg3 & guest::kProtRead) != 0) guest_protection |= kGuestProtRead;
         if ((arg3 & guest::kProtWrite) != 0) guest_protection |= kGuestProtWrite;
         if ((arg3 & guest::kProtExec) != 0) guest_protection |= kGuestProtExec;
-        return space_.Protect(ToHost(arg1), arg2, guest_protection) ? 0 : FailLinux(22);
+        return space_->Protect(ToHost(arg1), arg2, guest_protection) ? 0 : FailLinux(22);
     }
 
     case kSysMremap: {
@@ -4476,7 +4528,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             return FailLinux(12); // ENOMEM
         }
 
-        const uint64_t placed = space_.Allocate(new_size, 0, kGuestProtRead | kGuestProtWrite);
+        const uint64_t placed = space_->Allocate(new_size, 0, kGuestProtRead | kGuestProtWrite);
         if (placed == 0) {
             return FailLinux(12);
         }
@@ -4484,7 +4536,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         // The part past the old end is fresh anonymous memory, which Linux guarantees
         // reads as zero.
         std::memset(reinterpret_cast<uint8_t*>(placed) + old_size, 0, new_size - old_size);
-        space_.Release(old_address, old_size);
+        space_->Release(old_address, old_size);
         return ToGuest(placed);
     }
 
@@ -6294,12 +6346,24 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (file == nullptr) {
             return FailLinux(9);
         }
-        if (file->guest_path.empty() || file->guest_path.front() != '/') {
+        std::string where = file->guest_path;
+        // A descriptor that arrived from another process over a socket (Wine's server hands its clients directories this
+        // way) has no path of its own here; the host knows where it points.
+        if ((where.empty() || where.front() != '/') && file->host_fd >= 0 && !config_.guest_root.empty()) {
+            char host_path[PATH_MAX] {};
+            if (fcntl(file->host_fd, F_GETPATH, host_path) == 0) {
+                where = GuestPathForHostPath(config_.guest_root, host_path);
+            }
+        }
+        if (where.empty() || where.front() != '/') {
             return FailLinux(22); // EINVAL
         }
-        shared_->cwd = file->guest_path;
+        shared_->cwd = where;
         return 0;
     }
+
+    case 221: // fadvise64: advice about how a file will be read, which a host page cache does not need
+        return 0;
 
     case kSysChown:
     case kSysLchown:

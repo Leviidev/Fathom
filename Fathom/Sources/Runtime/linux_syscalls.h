@@ -163,6 +163,8 @@ public:
 
     /// An exec can change the process's word size -- a 32-bit program can exec a 64-bit
     /// one -- and with it where its address space sits in the host's.
+    /// The address space an exec moved this process into (a 32-bit program gets 4GB of its own).
+    void AdoptSpace(GuestAddressSpace& space) { space_ = &space; }
     void AdoptWordSize(bool is_32bit, uint64_t base) {
         config_.guest_is_32bit = is_32bit;
         config_.guest_base = base;
@@ -502,7 +504,7 @@ private:
     int RegisterFile(int host_fd, std::string guest_path, bool close_on_exec = false);
     void CloseAll();
 
-    GuestAddressSpace& space_;
+    GuestAddressSpace* space_;
     GuestThreadControl& control_;
     GuestConsole& console_;
     SyscallConfig config_;

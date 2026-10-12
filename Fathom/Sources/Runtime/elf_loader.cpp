@@ -514,7 +514,14 @@ bool BuildInitialStack(GuestAddressSpace& space, uint64_t guest_base, const Load
     // own variables as nonsense, a long way from the overflow. Reserved as part of the
     // same allocation and then released, so nothing can be placed there either.
     const uint64_t guard = space.HostPageSize();
-    const uint64_t reserved = space.Allocate(stack_size + guard, 0,
+    // A 32-bit program's stack goes at the top of its 4GB, where Linux puts it. At the bottom, where the arena would
+    // otherwise hand it out, it sits on 0x400000 -- where nearly every Windows program is linked to load, so Wine
+    // cannot place one.
+    uint64_t hint = 0;
+    if (guest_base != 0) {
+        hint = (guest_base + 0xFFFF0000ull - stack_size - guard) & ~(guard - 1);
+    }
+    const uint64_t reserved = space.Allocate(stack_size + guard, hint,
                                              kGuestProtRead | kGuestProtWrite);
     if (reserved == 0) {
         error = "could not allocate the guest stack";

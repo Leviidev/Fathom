@@ -56,7 +56,7 @@ class GuestAddressSpace {
 public:
     /// Reserves `size` bytes of contiguous address space without committing any of it.
     /// Returns nullptr and fills `error` on failure.
-    static GuestAddressSpace* Reserve(uint64_t size, std::string& error);
+    static GuestAddressSpace* Reserve(uint64_t size, std::string& error, uint64_t alignment = 0);
     ~GuestAddressSpace();
 
     GuestAddressSpace(const GuestAddressSpace&) = delete;

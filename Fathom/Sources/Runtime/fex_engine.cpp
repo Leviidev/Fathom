@@ -854,6 +854,12 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
     const auto self = pthread_mach_thread_np(pthread_self());
     std::set<FEXCore::Context::Context*> contexts;
     for (const auto& entry : live) {
+        // A 32-bit context sees its own 4GB space and nothing else; a change outside it is not its business, and taken
+        // as one of its own addresses it would throw away code that is still good.
+        if (entry.guest_base != 0 &&
+            (host_end <= entry.guest_base || host_begin >= entry.guest_base + (uint64_t {1} << 32))) {
+            continue;
+        }
         if (!contexts.insert(entry.context).second) {
             continue;
         }

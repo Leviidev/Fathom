@@ -129,13 +129,24 @@ bool GuestAddressSpace::AdoptExternalMapping(uint64_t address, uint64_t size, in
     return true;
 }
 
-GuestAddressSpace* GuestAddressSpace::Reserve(uint64_t size, std::string& error) {
+GuestAddressSpace* GuestAddressSpace::Reserve(uint64_t size, std::string& error, uint64_t alignment) {
     const auto page_size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
     const uint64_t aligned = (size + page_size - 1) & ~(page_size - 1);
 
     // PROT_NONE keeps this a pure address-space reservation: nothing is dirtied, so it
     // does not count against the process's memory limit until a range is committed.
-    void* address = mmap(nullptr, aligned, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    //
+    // With an alignment, more is reserved and the ends trimmed off: a 32-bit guest's base has to sit on a 4GB boundary,
+    // because FEXCore relocates its addresses by putting the base's upper half in front of them, not by adding it.
+    const uint64_t over = alignment > page_size ? aligned + alignment : aligned;
+    void* address = mmap(nullptr, over, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (address != MAP_FAILED && over != aligned) {
+        const uint64_t raw = reinterpret_cast<uint64_t>(address);
+        const uint64_t start = (raw + alignment - 1) & ~(alignment - 1);
+        if (start > raw) munmap(address, start - raw);
+        if (raw + over > start + aligned) munmap(reinterpret_cast<void*>(start + aligned), raw + over - start - aligned);
+        address = reinterpret_cast<void*>(start);
+    }
     if (address == MAP_FAILED) {
         error = std::string {"could not reserve a "} + std::to_string(aligned >> 20) +
                 "MB guest address space: " + std::strerror(errno);

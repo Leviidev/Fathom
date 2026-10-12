@@ -43,6 +43,10 @@ public:
     /// storage lives. Set through arch_prctl(ARCH_SET_FS) during libc startup.
     virtual void SetFsBase(uint64_t base) = 0;
     virtual uint64_t GetFsBase() const = 0;
+    /// The same for GS. Linux programs leave it alone; 64-bit Wine keeps each thread's Windows TEB there, the way
+    /// Windows does, and reads gs:[0x30] for it.
+    virtual void SetGsBase(uint64_t base) = 0;
+    virtual uint64_t GetGsBase() const = 0;
 
     /// Installs a thread-local-storage descriptor in the guest's GDT. This is how a
     /// 32-bit guest does what a 64-bit one does with arch_prctl: set_thread_area fills in

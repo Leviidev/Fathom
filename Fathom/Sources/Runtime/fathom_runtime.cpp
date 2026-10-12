@@ -40,6 +40,10 @@
 namespace {
 
 constexpr uint64_t kDefaultAddressSpace = 2ULL * 1024 * 1024 * 1024; // 2 GB
+/// A relocated 64-bit program's space. Enough for 64-bit Wine, which wants the low 4GB and its PE images above it.
+constexpr uint64_t kRelocated64Space = 32ULL * 1024 * 1024 * 1024; // 32 GB
+/// Where it places what names no address: above the low 8GB, which 64-bit Wine reserves for Windows.
+constexpr uint64_t kRelocated64Floor = 8ULL * 1024 * 1024 * 1024;
 
 /// A 32-bit guest can address exactly 4GB and no more, so its arena is capped there --
 /// and the whole of it is reserved, not committed, so it costs address space and nothing
@@ -106,6 +110,18 @@ public:
         return target_ != nullptr ? target_->GetFsBase() : pending_fs_base_;
     }
 
+    void SetGsBase(uint64_t base) override {
+        if (target_ != nullptr) {
+            target_->SetGsBase(base);
+        } else {
+            pending_gs_base_ = base;
+        }
+    }
+
+    uint64_t GetGsBase() const override {
+        return target_ != nullptr ? target_->GetGsBase() : pending_gs_base_;
+    }
+
     uint64_t GuestRip() const override { return target_ == nullptr ? 0 : target_->GuestRip(); }
 
     void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit,
@@ -136,6 +152,7 @@ public:
 private:
     fathom::GuestThreadControl* target_ {};
     uint64_t pending_fs_base_ {};
+    uint64_t pending_gs_base_ {};
 };
 
 extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr, size_t usersize);
@@ -199,7 +216,7 @@ bool LoadProgram(fathom::GuestAddressSpace& space, uint64_t guest_base,
         out->dynamic = true;
     }
 
-    if (!fathom::BuildInitialStack(space, guest_base, out->image, argv, envp, host_path,
+    if (!fathom::BuildInitialStack(space, guest_base, inspection.is_32bit, out->image, argv, envp, host_path,
                                    out->dynamic ? out->interpreter.load_base : 0, stack_size,
                                    &out->stack, error)) {
         return false;
@@ -386,7 +403,11 @@ struct fathom_session final : fathom::ProcessHost {
     std::vector<std::unique_ptr<Arena32>> arenas32;
     std::mutex arenas_mutex;
     /// A new 4GB space and JIT context for a 32-bit program.
-    fathom::GuestAddressSpace* NewArena32(std::string& error);
+    fathom::GuestAddressSpace* NewArena(bool is_32bit, std::string& error);
+    /// 64-bit programs get a relocated space of their own too, the way 32-bit ones do. 64-bit Wine needs this: it puts
+    /// Windows' shared user data at 0x7ffe0000 and its PE images just above 4GB, and nothing in a Darwin process can
+    /// live below 4GB. FATHOM_RELOCATE64=1 turns it on.
+    bool relocate64 {getenv("FATHOM_RELOCATE64") != nullptr && *getenv("FATHOM_RELOCATE64") != '0'};
     /// The JIT context that runs code in `space`.
     fathom::FexEngine* EngineIn(fathom::GuestAddressSpace* space, bool is_32bit, std::string& error);
 
@@ -522,7 +543,7 @@ fathom::FexEngine* fathom_session::EngineFor(bool is_32bit, std::string& error) 
         // A 32-bit guest's pointers cannot reach where the arena actually lives, so its
         // addresses are offset into it. A 64-bit guest needs no such trick -- the arena's
         // addresses fit in its pointers -- so it runs one to one.
-        options.guest_memory_base = is_32bit ? guest_base : 0;
+        options.guest_memory_base = is_32bit || relocate64 ? guest_base : 0;
         slot = fathom::FexEngine::Create(*space, options, error);
         if (slot == nullptr) {
             FATHOM_ERROR("could not start a %d-bit JIT context: %s", is_32bit ? 32 : 64,
@@ -534,23 +555,28 @@ fathom::FexEngine* fathom_session::EngineFor(bool is_32bit, std::string& error) 
     return slot.get();
 }
 
-fathom::GuestAddressSpace* fathom_session::NewArena32(std::string& error) {
+fathom::GuestAddressSpace* fathom_session::NewArena(bool is_32bit, std::string& error) {
     auto arena = std::make_unique<Arena32>();
-    arena->space.reset(fathom::GuestAddressSpace::Reserve(uint64_t {1} << 32, error, uint64_t {1} << 32));
+    arena->space.reset(fathom::GuestAddressSpace::Reserve(is_32bit ? uint64_t {1} << 32 : kRelocated64Space, error,
+                                                          uint64_t {1} << 32));
     if (arena->space == nullptr) {
         return nullptr;
     }
     arena->space->SetReleaseObserver(&fathom::InvalidateCompiledCode);
     arena->space->SetGuestBase(arena->space->Base());
+    if (!is_32bit) {
+        arena->space->SetAllocationFloor(arena->space->Base() + kRelocated64Floor);
+    }
     fathom::EngineOptions options = engine_options;
-    options.guest_is_32bit = true;
+    options.guest_is_32bit = is_32bit;
     options.guest_memory_base = arena->space->Base();
     arena->engine = fathom::FexEngine::Create(*arena->space, options, error);
     if (arena->engine == nullptr) {
-        FATHOM_ERROR("could not start a 32-bit JIT context for a new space: %s", error.c_str());
+        FATHOM_ERROR("could not start a %d-bit JIT context for a new space: %s", is_32bit ? 32 : 64, error.c_str());
         return nullptr;
     }
-    FATHOM_INFO("a 32-bit program gets its own 4GB space at %#llx",
+    FATHOM_INFO("a %d-bit program gets its own %llu GB space at %#llx", is_32bit ? 32 : 64,
+                static_cast<unsigned long long>(arena->space->Size() >> 30),
                 static_cast<unsigned long long>(arena->space->Base()));
     auto* space_ptr = arena->space.get();
     std::scoped_lock lock {arenas_mutex};
@@ -1409,6 +1435,24 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack) {
         if (stack_low == 0) {
             stack_low = rsp;
         }
+        // A program can run on a stack of its own making: 64-bit Wine allocates one for every
+        // thread, its first included, and switches to it, so the forking frames are nowhere
+        // near the stack it was started on. Holding that one leaves the frames the child
+        // actually rewrites unheld, and the parent comes back out of fork to a smashed stack.
+        // The live part is then from the stack pointer up, within the mapping holding it, and
+        // only so far: such a stack sits among the program's other allocations, and those must
+        // not be rolled back under threads that may still be running. The child only returns
+        // through the few frames above the stack pointer on its way to exec.
+        if (rsp < stack_low || rsp >= stack_top) {
+            constexpr uint64_t kForkFrames = 256 * 1024;
+            for (const auto& [mapped, length] : parent->syscalls->Mappings()) {
+                if (rsp >= mapped && rsp < mapped + length) {
+                    stack_low = rsp;
+                    stack_top = std::min(mapped + length, rsp + kForkFrames);
+                    break;
+                }
+            }
+        }
         const uint64_t heap_low =
             parent->program.heap == 0 ? 0 : parent->program.heap + parent->guest_base;
         const uint64_t heap_used = parent->syscalls->HeapBreak() == 0
@@ -1796,14 +1840,16 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& requested
     // space collide as soon as both want the same address, which a fixed-address one (32-bit Wine's loader, at
     // 0x7d000000) always does when it starts another copy of itself. A 64-bit one runs one to one in the session's.
     fathom::GuestAddressSpace* new_space = space.get();
-    if (inspection.is_32bit) {
-        new_space = NewArena32(reason);
+    const bool own_space = inspection.is_32bit || relocate64;
+    if (own_space) {
+        new_space = NewArena(inspection.is_32bit, reason);
         if (new_space == nullptr) {
-            FATHOM_WARN("execve %s: no address space for a 32-bit program: %s", path.c_str(), reason.c_str());
+            FATHOM_WARN("execve %s: no address space for a %d-bit program: %s", path.c_str(),
+                        inspection.is_32bit ? 32 : 64, reason.c_str());
             return -12; // -ENOMEM
         }
     }
-    const uint64_t new_base = inspection.is_32bit ? new_space->Base() : 0;
+    const uint64_t new_base = own_space ? new_space->Base() : 0;
     if (EngineIn(new_space, inspection.is_32bit, reason) == nullptr) {
         FATHOM_WARN("execve %s: no %d-bit JIT context: %s", path.c_str(),
                     inspection.is_32bit ? 32 : 64, reason.c_str());
@@ -2129,10 +2175,12 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
         return fail(first_look.error);
     }
     const bool guest_is_32bit = first_look.is_32bit;
+    const bool relocated = guest_is_32bit || session->relocate64;
     const uint64_t arena_size =
         guest_is_32bit ? k32BitAddressSpace
+        : session->relocate64 ? kRelocated64Space
                        : (config->address_space_size != 0 ? config->address_space_size : kDefaultAddressSpace);
-    session->space.reset(fathom::GuestAddressSpace::Reserve(arena_size, reason));
+    session->space.reset(fathom::GuestAddressSpace::Reserve(arena_size, reason, relocated ? uint64_t {1} << 32 : 0));
     if (session->space != nullptr) {
         // Compiled code is cached by guest address, and guest addresses are handed out
         // again the moment a program's image is released. Without this the next program
@@ -2142,13 +2190,17 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     if (session->space == nullptr) {
         return fail(reason);
     }
-    if (guest_is_32bit) {
+    if (relocated) {
         // The guest sees its address space starting at zero; it really starts here.
         // Recorded on the session as well, because a 64-bit process started later by this
         // 32-bit one runs one to one and must not use it.
         session->guest_base = session->space->Base();
         session->space->SetGuestBase(session->space->Base());
-        FATHOM_INFO("i386 guest: 4GB arena at %#llx, which the guest sees as 0",
+        if (!guest_is_32bit) {
+            session->space->SetAllocationFloor(session->space->Base() + kRelocated64Floor);
+        }
+        FATHOM_INFO("%s guest: %llu GB arena at %#llx, which the guest sees as 0", guest_is_32bit ? "i386" : "x86-64",
+                    static_cast<unsigned long long>(arena_size >> 30),
                     static_cast<unsigned long long>(session->space->Base()));
     }
 
@@ -2200,7 +2252,7 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     syscall_config.work_dir = config->work_dir == nullptr ? "/" : config->work_dir;
     syscall_config.trace = config->trace_syscalls;
     syscall_config.guest_is_32bit = guest_is_32bit;
-    syscall_config.guest_base = guest_is_32bit ? session->guest_base : 0;
+    syscall_config.guest_base = relocated ? session->guest_base : 0;
     session->guest_is_32bit = guest_is_32bit;
     process->is_32bit = guest_is_32bit;
     process->guest_base = syscall_config.guest_base;

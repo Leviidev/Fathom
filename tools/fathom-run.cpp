@@ -94,6 +94,7 @@ int main(int argc, char** argv) {
     bool trace = false;
     bool tso = false;
     bool multiblock = true;
+    int max_inst = 0;
     bool avx = true;
     uint64_t arena_mb = 0;
 
@@ -111,6 +112,10 @@ int main(int argc, char** argv) {
         } else if (option == "--no-multiblock") {
             // Changes how FEX stitches guest basic blocks together. If a fault goes away
             // with this off, the problem is in the JIT rather than in the guest.
+            multiblock = false;
+        } else if (option == "--single-step") {
+            // One guest instruction per block, so a fault's reported RIP is the instruction itself.
+            max_inst = 1;
             multiblock = false;
         } else if (option == "--no-avx") {
             avx = false;
@@ -187,6 +192,7 @@ int main(int argc, char** argv) {
     config.trace_syscalls = trace;
     config.tso_enabled = tso;
     config.multiblock = multiblock;
+    config.max_inst_per_block = max_inst;
     config.disable_avx = !avx;
     if (arena_mb != 0) {
         config.address_space_size = arena_mb * 1024 * 1024;

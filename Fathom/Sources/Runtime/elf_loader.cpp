@@ -503,7 +503,7 @@ bool LoadElf(const std::string& path, GuestAddressSpace& space, uint64_t preferr
     return true;
 }
 
-bool BuildInitialStack(GuestAddressSpace& space, uint64_t guest_base, const LoadedImage& image,
+bool BuildInitialStack(GuestAddressSpace& space, uint64_t guest_base, bool is_32bit, const LoadedImage& image,
                        const std::vector<std::string>& argv, const std::vector<std::string>& envp,
                        const std::string& exec_path, uint64_t interpreter_base, uint64_t stack_size,
                        StackImage* out_stack, std::string& error) {
@@ -519,7 +519,9 @@ bool BuildInitialStack(GuestAddressSpace& space, uint64_t guest_base, const Load
     // cannot place one.
     uint64_t hint = 0;
     if (guest_base != 0) {
-        hint = (guest_base + 0xFFFF0000ull - stack_size - guard) & ~(guard - 1);
+        // At the top of what the guest can see: 4GB for a 32-bit guest, the arena for a relocated 64-bit one.
+        const uint64_t top = is_32bit ? 0xFFFF0000ull : space.Size();
+        hint = (guest_base + top - stack_size - guard) & ~(guard - 1);
     }
     const uint64_t reserved = space.Allocate(stack_size + guard, hint,
                                              kGuestProtRead | kGuestProtWrite);
@@ -556,7 +558,7 @@ bool BuildInitialStack(GuestAddressSpace& space, uint64_t guest_base, const Load
     const uint64_t random_address = push_bytes(random_bytes, sizeof(random_bytes));
 
     // The guest's own name for the machine it thinks it is on.
-    const uint64_t platform_address = push_string(guest_base != 0 ? "i686" : "x86_64");
+    const uint64_t platform_address = push_string(is_32bit ? "i686" : "x86_64");
     const uint64_t execfn_address = push_string(exec_path);
 
     std::vector<uint64_t> env_addresses;
@@ -603,7 +605,7 @@ bool BuildInitialStack(GuestAddressSpace& space, uint64_t guest_base, const Load
     // layout is otherwise the same -- argc, then argv, then envp, then the auxiliary
     // vector -- but writing 64-bit words into it puts every entry at twice its offset and
     // the guest reads its own arguments as garbage.
-    const bool narrow = guest_base != 0;
+    const bool narrow = is_32bit;
     const size_t word_size = narrow ? 4 : 8;
 
     const size_t word_count = 1                        // argc

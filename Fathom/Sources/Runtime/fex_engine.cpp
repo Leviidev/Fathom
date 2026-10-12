@@ -430,6 +430,8 @@ struct LiveThread {
     FEXCore::Context::Context* context {};
     FEXCore::Core::InternalThreadState* thread {};
     uint64_t guest_base {};
+    /// How far the guest's space reaches above guest_base: 4GB for a 32-bit guest, the arena for a relocated 64-bit one.
+    uint64_t guest_span {};
     /// The host thread running it, recorded once that thread is actually running. Needed
     /// because throwing compiled code away has to stop everything that might be executing
     /// it: FEXCore takes its invalidation lock to keep anything from *compiling*, but a
@@ -740,6 +742,7 @@ public:
         : space {space} {}
 
     uint64_t guest_base {};
+    uint64_t guest_span {};
 
     ~Impl() {
         context.reset();
@@ -773,13 +776,13 @@ public:
 /// stale cache from the outside. It looks like a program jumping to a nonsense address
 /// with a nonsense stack pointer, deterministically, in a place that makes no sense.
 void RegisterLiveThread(FEXCore::Context::Context* context, FEXCore::Core::InternalThreadState* thread,
-                        uint64_t guest_base) {
+                        uint64_t guest_base, uint64_t guest_span) {
     if (context == nullptr || thread == nullptr) {
         return;
     }
     PublishLiveThread(context, thread);
     std::scoped_lock lock {g_live_threads_mutex};
-    g_live_threads.push_back(LiveThread {context, thread, guest_base});
+    g_live_threads.push_back(LiveThread {context, thread, guest_base, guest_span});
 }
 
 void ForgetLiveThread(FEXCore::Core::InternalThreadState* thread) {
@@ -857,7 +860,7 @@ void InvalidateCompiledCode(uint64_t host_begin, uint64_t host_end) {
         // A 32-bit context sees its own 4GB space and nothing else; a change outside it is not its business, and taken
         // as one of its own addresses it would throw away code that is still good.
         if (entry.guest_base != 0 &&
-            (host_end <= entry.guest_base || host_begin >= entry.guest_base + (uint64_t {1} << 32))) {
+            (host_end <= entry.guest_base || host_begin >= entry.guest_base + entry.guest_span)) {
             continue;
         }
         if (!contexts.insert(entry.context).second) {
@@ -1024,6 +1027,7 @@ public:
     LinuxSyscalls& syscalls;
     bool guest_is_32bit {};
     uint64_t guest_base {};
+    uint64_t guest_span {};
 
     // Per thread, all of it. The call/return stack and the segment table are pointed at
     // from the register file, so a forked child needs its own rather than the copies it
@@ -1174,6 +1178,16 @@ void GuestThread::SetFsBase(uint64_t base) {
     }
 }
 
+void GuestThread::SetGsBase(uint64_t base) {
+    if (impl_->thread != nullptr) {
+        impl_->thread->CurrentFrame->State.gs_cached = base;
+    }
+}
+
+uint64_t GuestThread::GetGsBase() const {
+    return impl_->thread == nullptr ? 0 : impl_->thread->CurrentFrame->State.gs_cached;
+}
+
 uint64_t GuestThread::GetFsBase() const {
     return impl_->thread == nullptr ? 0 : impl_->thread->CurrentFrame->State.fs_cached;
 }
@@ -1290,10 +1304,11 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
     g_arena_begin.store(space.Base(), std::memory_order_release);
     g_arena_end.store(space.Base() + space.Size(), std::memory_order_release);
     impl->guest_base = options.guest_memory_base;
+    impl->guest_span = options.guest_is_32bit ? uint64_t {1} << 32 : space.Size();
     impl->context->SetGuestMemoryBase(options.guest_memory_base);
     if (options.guest_memory_base != 0) {
-        FATHOM_INFO("32-bit guest: its address space is placed at %#llx in this process",
-                    static_cast<unsigned long long>(options.guest_memory_base));
+        FATHOM_INFO("%d-bit guest: its address space is placed at %#llx in this process",
+                    options.guest_is_32bit ? 32 : 64, static_cast<unsigned long long>(options.guest_memory_base));
     }
 
     impl->signals = std::make_unique<FathomSignalDelegator>();
@@ -1335,6 +1350,7 @@ std::unique_ptr<GuestThread> FexEngine::StartThread(uint64_t rip, uint64_t rsp, 
     }
 
     impl->guest_base = impl_->guest_base;
+    impl->guest_span = impl_->guest_span;
     {
         std::scoped_lock guard {g_thread_lifecycle};
         impl->thread = impl_->context->CreateThread(rip, rsp);
@@ -1343,7 +1359,7 @@ std::unique_ptr<GuestThread> FexEngine::StartThread(uint64_t rip, uint64_t rsp, 
         error = "FEXCore could not create the guest thread";
         return nullptr;
     }
-    RegisterLiveThread(impl->context, impl->thread, impl->guest_base);
+    RegisterLiveThread(impl->context, impl->thread, impl->guest_base, impl->guest_span);
 
     auto& state = impl->thread->CurrentFrame->State;
     impl->segments.Initialise(state, impl->guest_is_32bit);
@@ -1409,6 +1425,7 @@ std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, Li
     }
 
     impl->guest_base = impl_->guest_base;
+    impl->guest_span = impl_->guest_span;
     {
         std::scoped_lock guard {g_thread_lifecycle};
         impl->thread = impl_->context->CreateThread(resume, child_state.gregs[FEXCore::X86State::REG_RSP],
@@ -1418,7 +1435,7 @@ std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, Li
         error = "FEXCore could not create the child guest thread";
         return nullptr;
     }
-    RegisterLiveThread(impl->context, impl->thread, impl->guest_base);
+    RegisterLiveThread(impl->context, impl->thread, impl->guest_base, impl->guest_span);
 
     // The call/return stack and the segment table are reached through the register file,
     // and the child must not share its parent's -- but the descriptors in it carry over,

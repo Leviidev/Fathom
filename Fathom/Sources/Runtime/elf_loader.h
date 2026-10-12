@@ -80,7 +80,7 @@ struct StackImage {
 /// The auxv is not optional decoration -- a C runtime reads AT_RANDOM to seed its stack
 /// guard and AT_PHDR/AT_PHNUM to find its own program headers, and crashes very early
 /// and very confusingly without them.
-bool BuildInitialStack(GuestAddressSpace& space, uint64_t guest_base, const LoadedImage& image,
+bool BuildInitialStack(GuestAddressSpace& space, uint64_t guest_base, bool is_32bit, const LoadedImage& image,
                        const std::vector<std::string>& argv, const std::vector<std::string>& envp,
                        const std::string& exec_path, uint64_t interpreter_base, uint64_t stack_size,
                        StackImage* out_stack, std::string& error);

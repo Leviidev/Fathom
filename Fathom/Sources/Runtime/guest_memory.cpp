@@ -519,12 +519,15 @@ uint64_t GuestAddressSpace::Allocate(uint64_t size, uint64_t hint, int protectio
     }
 
     // First fit. The arena is large and guest allocation patterns are not adversarial,
-    // so the extra bookkeeping of best fit is not worth it here.
+    // so the extra bookkeeping of best fit is not worth it here. Above the floor if there
+    // is room there, anywhere otherwise.
+    for (int pass = floor_ != 0 ? 0 : 1; pass < 2; ++pass)
     for (const auto& extent : free_) {
-        if (extent.size < length) {
+        const uint64_t from = pass == 0 ? std::max(extent.begin, AlignUp(floor_)) : extent.begin;
+        if (from >= extent.end() || extent.end() - from < length) {
             continue;
         }
-        const uint64_t address = extent.begin;
+        const uint64_t address = from;
         if (!TakeFreeExtent(address, length)) {
             continue;
         }
@@ -619,8 +622,14 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
     }
 
     std::unique_lock lock {mutex_};
-    const uint64_t begin = AlignDown(address);
-    const uint64_t end = AlignUp(address + size);
+    // In the guest's pages, not the host's. Committed ranges are recorded in host pages, so
+    // a 4KB mapping owns the 16KB it was committed in, and an unmap that starts in the
+    // middle of that host page -- 64-bit Wine commits its heap's first page at 0x10000 and
+    // then unmaps from 0x11000 up -- must leave the part below it alone. Rounded out to the
+    // host's pages it took the heap with it.
+    constexpr uint64_t kGuestPage = 0x1000;
+    const uint64_t begin = address & ~(kGuestPage - 1);
+    const uint64_t end = (address + size + kGuestPage - 1) & ~(kGuestPage - 1);
     if (begin < base_ || end > base_ + size_) {
         return false;
     }
@@ -667,8 +676,9 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
     // much later as a program that cannot be loaded. Consecutive pages that are all free
     // go in one call, which is almost always the whole span.
     // Page by page would mean scanning every committed range for every 16KB of a 128MB
-    // heap, with this lock held; the gaps are computed once instead.
-    for (const auto& [gap_begin, gap_end] : UncommittedIn(begin, end)) {
+    // heap, with this lock held; the gaps are computed once instead. Over the host pages the
+    // range touches, so a host page whose other guest pages were already free goes too.
+    for (const auto& [gap_begin, gap_end] : UncommittedIn(AlignDown(begin), AlignUp(end))) {
         // Inward: a host page only half of which is free still holds somebody's memory,
         // and mapping over it would take theirs away. The guest's pages are 4KB and the
         // host's 16KB, so this happens constantly.
@@ -694,8 +704,15 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
     // host page 16KB, so the rounding above reaches up to three neighbouring guest pages
     // that are still in use; handing those back as free lets the arena allocate them to
     // somebody else while their owner is still running there.
-    for (const auto& [free_begin, free_end] : UncommittedIn(begin, end)) {
-        ReturnFreeExtent(free_begin, free_end - free_begin);
+    // Whole host pages only: the arena hands memory out in host pages, and a piece of one
+    // whose other part is still committed cannot be handed out on its own. It goes back
+    // when the rest of its host page does.
+    for (const auto& [free_begin, free_end] : UncommittedIn(AlignDown(begin), AlignUp(end))) {
+        const uint64_t low = AlignUp(free_begin);
+        const uint64_t high = AlignDown(free_end);
+        if (high > low) {
+            ReturnFreeExtent(low, high - low);
+        }
     }
 
     // Outside the lock: the observer goes into FEXCore, which asks this address space

@@ -75,6 +75,10 @@ public:
     /// boundary -- a pointer handed to a syscall, an address written into the auxiliary
     /// vector -- has to be converted.
     void SetGuestBase(uint64_t base) { guest_base_ = base; }
+    /// Where an allocation that names no address starts looking. Below it is left for programs that ask for an
+    /// address: 64-bit Wine reserves the low gigabytes for Windows' fixed addresses with MAP_FIXED, and anything
+    /// placed there by default -- Wine's own executable, its libraries -- would be mapped over.
+    void SetAllocationFloor(uint64_t address) { floor_ = address; }
     uint64_t GuestBase() const { return guest_base_; }
 
     uint64_t ToHost(uint64_t guest_address) const { return guest_address + guest_base_; }
@@ -243,6 +247,7 @@ private:
     uint64_t page_size_ {};
     std::vector<Extent> free_;        ///< Sorted, coalesced, never overlapping.
     uint64_t guest_base_ {};            ///< 0 for a 1:1 (64-bit) guest.
+    uint64_t floor_ {};                 ///< See SetAllocationFloor; 0 means anywhere.
     std::vector<GuestRange> committed_; ///< Sorted by begin.
     std::vector<Extent> external_;    ///< Mappings outside the arena, unmapped on destruction.
 };

@@ -4956,10 +4956,16 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             return 0;
         }
         case guest::kArchSetGs:
-        case guest::kArchGetGs:
-            // GS is not wired through; nothing in a normal Linux userspace program uses
-            // it, and silently accepting a write would be worse than refusing it.
-            return FailLinux(22);
+            control_.SetGsBase(arg2);
+            return 0;
+        case guest::kArchGetGs: {
+            auto* out = static_cast<uint64_t*>(GuestPointer(arg2, sizeof(uint64_t), true));
+            if (out == nullptr) {
+                return FailLinux(14);
+            }
+            *out = control_.GetGsBase();
+            return 0;
+        }
         default:
             return FailLinux(22);
         }

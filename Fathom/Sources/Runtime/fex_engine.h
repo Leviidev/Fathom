@@ -88,6 +88,8 @@ public:
     // GuestThreadControl
     void SetFsBase(uint64_t base) override;
     uint64_t GetFsBase() const override;
+    void SetGsBase(uint64_t base) override;
+    uint64_t GetGsBase() const override;
     void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit,
                           bool point_gs_at_it = false) override;
     uint64_t GuestRip() const override { return Rip(); }

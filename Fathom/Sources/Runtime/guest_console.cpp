@@ -29,9 +29,45 @@ void GuestConsole::SendInput(const char* bytes, size_t length) {
     }
     {
         std::scoped_lock lock {input_mutex_};
-        input_.insert(input_.end(), bytes, bytes + length);
+        if (raw_mode_.load(std::memory_order_relaxed)) {
+            input_.insert(input_.end(), bytes, bytes + length);
+        } else {
+            // The line discipline a terminal provides while a program reads whole lines:
+            // Return arrives as a carriage return from a raw host terminal (and from the
+            // on-screen keyboard) and is delivered as the newline the program is waiting
+            // for; backspace edits the line before it goes. Without this, steamcmd's
+            // password prompt never saw the end of its line.
+            for (size_t index = 0; index < length; ++index) {
+                const char key = bytes[index];
+                if (key == '\r' || key == '\n') {
+                    line_.push_back('\n');
+                    input_.insert(input_.end(), line_.begin(), line_.end());
+                    line_.clear();
+                } else if (key == 0x7f || key == 0x08) {
+                    if (!line_.empty()) {
+                        line_.pop_back();
+                    }
+                } else if (key == 0x04) { // Ctrl-D: whatever is typed goes as it is
+                    input_.insert(input_.end(), line_.begin(), line_.end());
+                    line_.clear();
+                } else {
+                    line_.push_back(key);
+                }
+            }
+        }
     }
     input_ready_.notify_all();
+}
+
+void GuestConsole::SetRawMode(bool raw) {
+    std::scoped_lock lock {input_mutex_};
+    raw_mode_.store(raw, std::memory_order_relaxed);
+    // A program that switches to reading keys gets what was typed so far, as keys.
+    if (raw && !line_.empty()) {
+        input_.insert(input_.end(), line_.begin(), line_.end());
+        line_.clear();
+        input_ready_.notify_all();
+    }
 }
 
 int64_t GuestConsole::ReadInput(char* out, size_t max) {

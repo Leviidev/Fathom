@@ -55,7 +55,7 @@ public:
     /// Sleeps until a key arrives or the slice elapses; used by poll.
     void WaitForInput(int milliseconds);
 
-    void SetRawMode(bool raw) { raw_mode_.store(raw, std::memory_order_relaxed); }
+    void SetRawMode(bool raw);
     bool WantsKeys() const { return raw_mode_.load(std::memory_order_relaxed); }
     void SetNonblockingStdin(bool value) { nonblocking_stdin_.store(value, std::memory_order_relaxed); }
 
@@ -81,6 +81,8 @@ private:
     mutable std::mutex input_mutex_;
     std::condition_variable input_ready_;
     std::deque<char> input_;
+    /// Keys typed since the last Return, while the guest reads whole lines.
+    std::string line_;
     std::atomic<bool> raw_mode_ {false};
     std::atomic<bool> nonblocking_stdin_ {false};
 

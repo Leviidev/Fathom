@@ -2344,6 +2344,16 @@ void LinuxSyscalls::CloseFd(int fd) {
         }
         rmdir(directory.c_str());
     }
+    // Out of every epoll set it was registered with, as Linux does when the descriptor
+    // goes. Left in, the number comes back for the next socket the program opens, that
+    // socket's EPOLL_CTL_ADD fails with EEXIST, and the program never hears from it:
+    // Steam's client gave up on its own main loop as "stalled" and restarted, for ever.
+    for (auto& [other_fd, other] : shared_->files) {
+        if (other.epoll != nullptr && other_fd != fd) {
+            std::scoped_lock set_lock {other.epoll->mutex};
+            other.epoll->interests.erase(fd);
+        }
+    }
     shared_->files.erase(entry);
 }
 

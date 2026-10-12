@@ -114,6 +114,17 @@ final class SteamCmd: ObservableObject {
         if !manager.fileExists(atPath: bundle.path), manager.fileExists(atPath: alpine.path) {
             try manager.copyItem(at: alpine, to: bundle)
         }
+        // A user for the id the emulator reports (1000). Steam's client looks itself up by
+        // uid and quits without a word when there is no such user; Alpine ships only root.
+        for (file, entry) in [("etc/passwd", "fathom:x:1000:1000:Fathom:/root:/bin/sh"), ("etc/group", "fathom:x:1000:")] {
+            let url = root.appendingPathComponent(file)
+            var text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            if !text.contains(":1000:") {
+                if !text.isEmpty, !text.hasSuffix("\n") { text += "\n" }
+                text += entry + "\n"
+                try text.write(to: url, atomically: true, encoding: .utf8)
+            }
+        }
     }
 
     private static func fetch(_ artifact: Artifact) async throws -> Data {

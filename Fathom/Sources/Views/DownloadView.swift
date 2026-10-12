@@ -12,6 +12,7 @@ struct DownloadView: View {
     @ObservedObject private var steam = SteamAccount.shared
     @StateObject private var session = EmulatorSession()
     @Environment(\.dismiss) private var dismiss
+    @State private var restarts = 0
 
     private var progress: (fraction: Double, done: UInt64, total: UInt64)? {
         // " Update state (0x61) downloading, progress: 12.34 (123 / 456)"
@@ -61,6 +62,22 @@ struct DownloadView: View {
             }
         }
         .onDisappear { if session.state.isActive { session.stop() } }
+        // steamcmd updates itself on its first run and exits with 42 to ask for a relaunch,
+        // which its shell script would do; here the screen does it.
+        .onChange(of: session.state) { _, state in
+            if case .finished(let code) = state, code == 42, restarts < 3 {
+                restarts += 1
+                session.reset()
+                start()
+            }
+        }
+    }
+
+    private func start() {
+        session.runInGuest(path: SteamCmd.guestProgram,
+                           arguments: SteamCmd.arguments(appid: appid, account: steam.accountName),
+                           settings: settings, environment: SteamCmd.environment,
+                           workDirectory: SteamCmd.workDirectory)
     }
 
     private var installCard: some View {
@@ -112,10 +129,8 @@ struct DownloadView: View {
 
                 if session.state == .idle {
                     Button {
-                        session.runInGuest(path: SteamCmd.guestProgram,
-                                           arguments: SteamCmd.arguments(appid: appid, account: steam.accountName),
-                                           settings: settings, environment: SteamCmd.environment,
-                                           workDirectory: SteamCmd.workDirectory)
+                        restarts = 0
+                        start()
                     } label: {
                         Label(SteamCmd.isGameInstalled(appid) ? "Verify and Update" : "Download", systemImage: "arrow.down.to.line")
                             .frame(maxWidth: .infinity)

@@ -4229,6 +4229,12 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
         // structures are, and it has to be remembered before the number is lost.
         narrow_time_ = IsI386NarrowTime(number);
 
+        // waitpid: wait4 without the resource usage, which has no x86-64 number of its own.
+        if (number == 7) {
+            number = 114;
+            arg4 = 0;
+        }
+
         const int64_t translated = X86_64SyscallForI386(number);
         if (translated < 0) {
             FATHOM_WARN("unimplemented i386 syscall %llu (%#llx, %#llx, %#llx, %#llx, %#llx)",

@@ -963,7 +963,7 @@ void OpDispatchBuilder::JUMPFARIndirectOp(OpcodeArgs) {
   // This uses ModRM to determine its location
   // No way to use this effectively in multiblock
   Ref Src = MakeSegmentAddress(Op, Op->Dest);
-  AddressMode SrcCS = {.Base = Src, .Offset = 4, .AddrSize = OpSize::i64Bit};
+  AddressMode SrcCS = {.Base = Src, .Offset = 4, .AddrSize = OpSize::i64Bit, .Host = true};
   auto RIPOffset = _LoadMemGPRAutoTSO(OpSize::i32Bit, Src, OpSize::i8Bit);
   auto NewSegmentCS = _LoadMemGPRAutoTSO(OpSize::i16Bit, SrcCS, OpSize::i8Bit);
 
@@ -984,7 +984,7 @@ void OpDispatchBuilder::CALLFARIndirectOp(OpcodeArgs) {
   BlockSetRIP = true;
 
   Ref Src = MakeSegmentAddress(Op, Op->Dest);
-  AddressMode SrcCS = {.Base = Src, .Offset = 4, .AddrSize = OpSize::i64Bit};
+  AddressMode SrcCS = {.Base = Src, .Offset = 4, .AddrSize = OpSize::i64Bit, .Host = true};
   auto RIPOffset = _LoadMemGPRAutoTSO(OpSize::i32Bit, Src, OpSize::i8Bit);
   auto NewSegmentCS = _LoadMemGPRAutoTSO(OpSize::i16Bit, SrcCS, OpSize::i8Bit);
   auto CurrentCS = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, cs_idx));
@@ -1315,8 +1315,11 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX);
       } else {
-        LogMan::Msg::EFmt("We don't support modifying GS selector in 64bit mode!");
-        DecodeFailure = true;
+        // In 64-bit mode the base lives in the MSR, set through arch_prctl or WRGSBASE, and a program that loads
+        // the selector does it to save and restore it, not to point the segment anywhere: 64-bit Wine does this on
+        // every trip between its Unix and Windows sides, and sets the base itself afterwards. So the selector is
+        // recorded and the base left as it is -- which is also what loading a null selector does on x86-64.
+        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
       }
       break;
     case FEXCore::X86State::REG_RSP: // FS
@@ -1325,8 +1328,11 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX);
       } else {
-        LogMan::Msg::EFmt("We don't support modifying FS selector in 64bit mode!");
-        DecodeFailure = true;
+        // In 64-bit mode the base lives in the MSR, set through arch_prctl or WRFSBASE, and a program that loads
+        // the selector does it to save and restore it, not to point the segment anywhere: 64-bit Wine does this on
+        // every trip between its Unix and Windows sides, and sets the base itself afterwards. So the selector is
+        // recorded and the base left as it is -- which is also what loading a null selector does on x86-64.
+        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
       }
       break;
     default: UnimplementedOp(Op); return;
@@ -2516,7 +2522,7 @@ void OpDispatchBuilder::BTOp(OpcodeArgs, uint32_t SrcIndex, BTAction Action) {
 
     // Get the address offset by shifting out the size of the op (To shift out the bit selection)
     // Then use that to index in to the memory location by size of op
-    AddressMode Address = {.Base = Dest, .Index = Src.Ref(), .AddrSize = OpSize::i64Bit};
+    AddressMode Address = {.Base = Dest, .Index = Src.Ref(), .AddrSize = OpSize::i64Bit, .Host = true};
 
     switch (Action) {
     case BTAction::BTNone: {
@@ -2977,7 +2983,7 @@ void OpDispatchBuilder::XLATOp(OpcodeArgs) {
   Ref Src = MakeSegmentAddress(X86State::REG_RBX, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
   Ref Offset = LoadGPRRegister(X86State::REG_RAX, OpSize::i8Bit);
 
-  AddressMode A = {.Base = Src, .Index = Offset, .AddrSize = OpSize::i64Bit};
+  AddressMode A = {.Base = Src, .Index = Offset, .AddrSize = OpSize::i64Bit, .Host = true};
   auto Res = _LoadMemGPRAutoTSO(OpSize::i8Bit, A, OpSize::i8Bit);
 
   StoreGPRRegister(X86State::REG_RAX, Res, OpSize::i8Bit);
@@ -3032,7 +3038,7 @@ void OpDispatchBuilder::EnterOp(OpcodeArgs) {
     for (uint8_t i = 1; i < Level; ++i) {
       auto MemLoc = Sub(GPRSize, OldBP, i * IR::OpSizeToSize(OperandSize));
       if (GuestMemoryBase != 0) {
-        MemLoc = _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, MemLoc), _Constant(GuestMemoryBase));
+        MemLoc = GuestToHost(MemLoc);
       }
       auto Mem = _LoadMemGPR(OperandSize, MemLoc, OperandSize);
       NewSP = PushValue(OperandSize, Mem);
@@ -3275,7 +3281,9 @@ void OpDispatchBuilder::STOSOp(OpcodeArgs) {
     if (GuestMemoryBase != 0) {
       Ref Base = _Constant(GuestMemoryBase);
       Segment = Segment ? Add(IR::OpSize::i64Bit, Segment, Base) : Base;
-      Dest = _Bfe(IR::OpSize::i64Bit, 32, 0, Dest);
+      if (!Is64BitMode) {
+        Dest = _Bfe(IR::OpSize::i64Bit, 32, 0, Dest);
+      }
     }
 
     auto Result = _MemSet(CTX->IsAtomicTSOEnabled(), Size, Segment ?: InvalidNode, Dest, Src, Counter, LoadDir(1));
@@ -3311,9 +3319,8 @@ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
     }
 
     if (GuestMemoryBase != 0) {
-      Ref Base = _Constant(GuestMemoryBase);
-      DstAddr = Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, DstAddr), Base);
-      SrcAddr = Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, SrcAddr), Base);
+      DstAddr = GuestToHost(DstAddr);
+      SrcAddr = GuestToHost(SrcAddr);
     }
 
     Ref Result_Src = _AllocateGPR(false);
@@ -3351,8 +3358,11 @@ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
       _StoreMem(RegClass::GPR, Size, Src, RDI, Invalid(), OpSize::i8Bit, MemOffsetType::SXTX, 1);
     }
 
-    RSI = OffsetByDir(RSI, IR::OpSizeToSize(Size));
-    RDI = OffsetByDir(RDI, IR::OpSizeToSize(Size));
+    // Stepped from the registers, not from the addresses above: those carry the segment
+    // and, for a relocated guest, the arena's base. A 32-bit guest's write truncated the
+    // base away; a 64-bit one keeps it, and RSI and RDI come back as host addresses.
+    RSI = OffsetByDir(LoadGPRRegister(X86State::REG_RSI), IR::OpSizeToSize(Size));
+    RDI = OffsetByDir(LoadGPRRegister(X86State::REG_RDI), IR::OpSizeToSize(Size));
 
     StoreGPRRegister(X86State::REG_RSI, RSI);
     StoreGPRRegister(X86State::REG_RDI, RDI);
@@ -4160,7 +4170,7 @@ Ref OpDispatchBuilder::AppendSegmentOffset(Ref Value, uint32_t Flags, uint32_t D
   // passing through LoadEffectiveAddress, so a relocated guest has to be accounted for in
   // both places or ESI and EDI are dereferenced as host addresses.
   if (GuestMemoryBase != 0) {
-    Value = _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, Value), _Constant(GuestMemoryBase));
+    Value = GuestToHost(Value);
   }
 
   return Value;

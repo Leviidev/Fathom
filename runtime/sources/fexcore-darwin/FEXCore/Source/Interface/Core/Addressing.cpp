@@ -66,8 +66,11 @@ Ref LoadEffectiveAddress(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPR
   // without touching memory, so relocating its result would put a host pointer into a
   // guest register -- and the guest would then use it as a plain number. The symptom is
   // wonderfully specific: a syscall number arriving as base + 4.
-  if (IREmit->GuestMemoryBase != 0 && GPRSize == OpSize::i32Bit && AddSegmentBase) {
-    Ref GuestAddress = Tmp ? IREmit->_Bfe(OpSize::i64Bit, 32, 0, Tmp) : IREmit->Constant(0);
+  //
+  // A relocated 64-bit guest takes the same path without the zero-extend: its addresses
+  // are full 64-bit values, and the base just moves them up into the arena.
+  if (IREmit->GuestMemoryBase != 0 && AddSegmentBase && !A.Host) {
+    Ref GuestAddress = !Tmp ? IREmit->Constant(0) : GPRSize == OpSize::i32Bit ? IREmit->_Bfe(OpSize::i64Bit, 32, 0, Tmp) : Tmp;
     return IREmit->Add(OpSize::i64Bit, GuestAddress, IREmit->Constant(IREmit->GuestMemoryBase));
   }
 
@@ -142,6 +145,12 @@ AddressMode SelectAddressMode(IREmitter* IREmit, const AddressMode& A, IR::OpSiz
     } else if (B.Segment) {
       B.Index = B.Segment;
       B.IndexScale = 1;
+    }
+    // The one path that never goes through LoadEffectiveAddress. A relocated 64-bit guest
+    // keeps the fused [base + index] form; the base register just carries the arena's
+    // base along with it.
+    if (IREmit->GuestMemoryBase != 0 && !A.Host) {
+      B.Base = IREmit->Add(OpSize::i64Bit, B.Base, IREmit->Constant(IREmit->GuestMemoryBase));
     }
 
     return B;

@@ -2566,6 +2566,17 @@ private:
     return _StoreMemPairAutoTSO(RegClass::FPR, Size, A, Value1, Value2, Align);
   }
 
+  /// A guest address as the host address holding those bytes. A 32-bit guest's value is
+  /// only defined in its low 32 bits, so it is zero-extended first; a 64-bit guest's is
+  /// a full address already and only needs the base.
+  [[nodiscard]]
+  Ref GuestToHost(Ref GuestAddress) {
+    if (!Is64BitMode) {
+      GuestAddress = _Bfe(IR::OpSize::i64Bit, 32, 0, GuestAddress);
+    }
+    return _Add(IR::OpSize::i64Bit, GuestAddress, _Constant(GuestMemoryBase));
+  }
+
   /// Turns a guest address into the host address holding those bytes.
   ///
   /// Most memory operands reach the JIT through LoadEffectiveAddress or
@@ -2578,7 +2589,7 @@ private:
     if (GuestMemoryBase == 0) {
       return GuestAddress;
     }
-    return _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, GuestAddress), _Constant(GuestMemoryBase));
+    return GuestToHost(GuestAddress);
   }
 
   /// Builds the read-modify-write stack handle the two-argument Pop works on.
@@ -2590,7 +2601,7 @@ private:
   /// without truncating the base away.
   Ref StackHandle(Ref GuestAddress) {
     if (GuestMemoryBase != 0) {
-      GuestAddress = _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, GuestAddress), _Constant(GuestMemoryBase));
+      GuestAddress = GuestToHost(GuestAddress);
     }
     return _RMWHandle(GuestAddress);
   }
@@ -2617,7 +2628,7 @@ private:
     // The mirror of Push above, and for the same reason.
     if (GuestMemoryBase != 0) {
       Ref OldSP = LoadGPRRegister(X86State::REG_RSP);
-      Ref HostAddress = _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, OldSP), _Constant(GuestMemoryBase));
+      Ref HostAddress = GuestToHost(OldSP);
       Ref Value = _LoadMem(RegClass::GPR, Size, HostAddress, Invalid(), IR::OpSize::i8Bit, MemOffsetType::SXTX, 1);
       StoreGPRRegister(X86State::REG_RSP, _Add(GetGPROpSize(), OldSP, _Constant(IR::OpSizeToSize(Size))));
       return Value;
@@ -2649,7 +2660,7 @@ private:
     // instead -- the stack pointer stays a guest value, and only the store is relocated.
     if (GuestMemoryBase != 0) {
       Ref NewSP = _Sub(GetGPROpSize(), OldSP, _Constant(IR::OpSizeToSize(Size)));
-      Ref HostAddress = _Add(IR::OpSize::i64Bit, _Bfe(IR::OpSize::i64Bit, 32, 0, NewSP), _Constant(GuestMemoryBase));
+      Ref HostAddress = GuestToHost(NewSP);
       _StoreMem(RegClass::GPR, Size, Value, HostAddress, Invalid(), IR::OpSize::i8Bit, MemOffsetType::SXTX, 1);
       StoreGPRRegister(X86State::REG_RSP, NewSP);
       FlushRegisterCache();

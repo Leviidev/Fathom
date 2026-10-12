@@ -19,6 +19,11 @@ struct AddressMode {
   // Size in bytes for the address calculation. 8 for an arm64 hardware mode.
   IR::OpSize AddrSize;
   bool NonTSO;
+  // Base already holds a host address -- it came out of MakeSegmentAddress, which relocates
+  // -- so the guest memory base must not be added a second time. A 32-bit guest got away
+  // without this: its addresses are cut to 32 bits before the base goes on, which strips a
+  // base added twice. A 64-bit guest's are not.
+  bool Host = false;
 };
 
 Ref LoadEffectiveAddress(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPRSize, bool AddSegmentBase, bool AllowUpperGarbage = false);

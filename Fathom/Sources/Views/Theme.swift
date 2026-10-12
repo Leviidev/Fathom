@@ -1,13 +1,32 @@
 import SwiftUI
 
 /// Fathom's visual vocabulary, in one place so every screen agrees.
+///
+/// Purple, on solid surfaces: no gradient washes and no glass. The surfaces are the
+/// system's grouped backgrounds pushed a little toward violet, so the app reads as one
+/// colour family without fighting the content -- game art carries the colour.
 enum Theme {
-    /// A deep teal, chosen to read as "depth" and to stay legible on both schemes.
-    static let accent = Color(red: 0.11, green: 0.60, blue: 0.62)
-    static let accentSoft = Color(red: 0.11, green: 0.60, blue: 0.62).opacity(0.14)
+    static let accent = Color(light: (0.45, 0.27, 0.86), dark: (0.66, 0.52, 1.00))
+    static let accentSoft = accent.opacity(0.14)
+    /// The screen behind everything.
+    static let background = Color(light: (0.96, 0.95, 0.99), dark: (0.06, 0.05, 0.10))
+    /// Cards, rows and tiles that sit on the background.
+    static let surface = Color(light: (1.00, 1.00, 1.00), dark: (0.12, 0.10, 0.18))
+    static let surfaceRaised = Color(light: (0.92, 0.90, 0.98), dark: (0.17, 0.14, 0.25))
 
     static let cardCorner: CGFloat = 14
+    static let tileCorner: CGFloat = 12
     static let rowSpacing: CGFloat = 12
+}
+
+extension Color {
+    /// A colour with its own light and dark values, resolved by the system as the scheme changes.
+    init(light: (Double, Double, Double), dark: (Double, Double, Double)) {
+        self.init(uiColor: UIColor { traits in
+            let c = traits.userInterfaceStyle == .dark ? dark : light
+            return UIColor(red: c.0, green: c.1, blue: c.2, alpha: 1)
+        })
+    }
 }
 
 /// Values that are technical rather than prose -- addresses, sizes, counts -- are set in
@@ -27,7 +46,7 @@ struct Card<Content: View>: View {
         content
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: Theme.cardCorner))
+            .background(Theme.surface, in: RoundedRectangle(cornerRadius: Theme.cardCorner))
     }
 }
 

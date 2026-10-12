@@ -42,6 +42,7 @@ struct RootView: View {
     @EnvironmentObject private var jit: JITSupport
     @State private var selection: Tab = .library
     @State private var hasRequestedJIT = false
+    @AppStorage(Holiday.key) private var holiday = true
 
     enum Tab: Hashable {
         case library, settings
@@ -56,6 +57,9 @@ struct RootView: View {
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape") }
                 .tag(Tab.settings)
+        }
+        .overlay {
+            if holiday { Snowfall().ignoresSafeArea() }
         }
         .task {
             // Asking once, automatically, on the first launch where JIT is missing: the

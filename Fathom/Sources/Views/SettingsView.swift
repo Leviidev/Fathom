@@ -4,18 +4,60 @@ struct SettingsView: View {
     @EnvironmentObject private var settings: EmulatorSettings
     @EnvironmentObject private var library: ProgramLibrary
     @EnvironmentObject private var jit: JITSupport
+    @ObservedObject private var steam = SteamAccount.shared
+    @AppStorage(Holiday.key) private var holiday = true
 
     var body: some View {
         NavigationStack {
             Form {
+                steamSection
                 jitSection
                 emulationSection
                 memorySection
                 diagnosticsSection
                 storageSection
+                appearanceSection
                 aboutSection
             }
+            .scrollContentBackground(.hidden)
+            .background(Theme.background)
             .navigationTitle("Settings")
+        }
+    }
+
+    // MARK: - Steam
+
+    private var steamSection: some View {
+        Section {
+            NavigationLink {
+                SteamSignInView()
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: steam.phase == .signedIn ? "person.crop.circle.fill" : "person.crop.circle.badge.plus")
+                        .font(.title2)
+                        .foregroundStyle(Theme.accent)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(steam.phase == .signedIn ? (steam.accountName ?? "Steam") : "Sign in to Steam")
+                        Text(steam.phase == .signedIn ? "\(steam.games.count) games" : "Load your library into Fathom")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        } header: {
+            Text("Steam")
+        }
+    }
+
+    // MARK: - Appearance
+
+    private var appearanceSection: some View {
+        Section {
+            Toggle("Holiday decorations", isOn: $holiday)
+        } header: {
+            Text("Appearance")
+        } footer: {
+            Text("Falling snow, snow on the library, and a tree by the title.")
         }
     }
 

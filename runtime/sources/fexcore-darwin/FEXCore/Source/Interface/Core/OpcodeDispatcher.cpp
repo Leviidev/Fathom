@@ -963,7 +963,7 @@ void OpDispatchBuilder::JUMPFARIndirectOp(OpcodeArgs) {
   // This uses ModRM to determine its location
   // No way to use this effectively in multiblock
   Ref Src = MakeSegmentAddress(Op, Op->Dest);
-  AddressMode SrcCS = {.Base = Src, .Offset = 4, .AddrSize = OpSize::i64Bit, .Host = true};
+  AddressMode SrcCS = {.Base = Src, .Offset = 4, .AddrSize = OpSize::i64Bit, .Host = Is64BitMode};
   auto RIPOffset = _LoadMemGPRAutoTSO(OpSize::i32Bit, Src, OpSize::i8Bit);
   auto NewSegmentCS = _LoadMemGPRAutoTSO(OpSize::i16Bit, SrcCS, OpSize::i8Bit);
 
@@ -984,7 +984,7 @@ void OpDispatchBuilder::CALLFARIndirectOp(OpcodeArgs) {
   BlockSetRIP = true;
 
   Ref Src = MakeSegmentAddress(Op, Op->Dest);
-  AddressMode SrcCS = {.Base = Src, .Offset = 4, .AddrSize = OpSize::i64Bit, .Host = true};
+  AddressMode SrcCS = {.Base = Src, .Offset = 4, .AddrSize = OpSize::i64Bit, .Host = Is64BitMode};
   auto RIPOffset = _LoadMemGPRAutoTSO(OpSize::i32Bit, Src, OpSize::i8Bit);
   auto NewSegmentCS = _LoadMemGPRAutoTSO(OpSize::i16Bit, SrcCS, OpSize::i8Bit);
   auto CurrentCS = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, cs_idx));
@@ -2522,7 +2522,7 @@ void OpDispatchBuilder::BTOp(OpcodeArgs, uint32_t SrcIndex, BTAction Action) {
 
     // Get the address offset by shifting out the size of the op (To shift out the bit selection)
     // Then use that to index in to the memory location by size of op
-    AddressMode Address = {.Base = Dest, .Index = Src.Ref(), .AddrSize = OpSize::i64Bit, .Host = true};
+    AddressMode Address = {.Base = Dest, .Index = Src.Ref(), .AddrSize = OpSize::i64Bit, .Host = Is64BitMode};
 
     switch (Action) {
     case BTAction::BTNone: {
@@ -2983,7 +2983,7 @@ void OpDispatchBuilder::XLATOp(OpcodeArgs) {
   Ref Src = MakeSegmentAddress(X86State::REG_RBX, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
   Ref Offset = LoadGPRRegister(X86State::REG_RAX, OpSize::i8Bit);
 
-  AddressMode A = {.Base = Src, .Index = Offset, .AddrSize = OpSize::i64Bit, .Host = true};
+  AddressMode A = {.Base = Src, .Index = Offset, .AddrSize = OpSize::i64Bit, .Host = Is64BitMode};
   auto Res = _LoadMemGPRAutoTSO(OpSize::i8Bit, A, OpSize::i8Bit);
 
   StoreGPRRegister(X86State::REG_RAX, Res, OpSize::i8Bit);

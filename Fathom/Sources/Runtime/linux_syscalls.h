@@ -376,6 +376,9 @@ private:
         /// What the guest last asked for, because timerfd_gettime has to answer with it.
         int64_t timer_interval_ns {};
         int64_t timer_value_ns {};
+        /// shutdown(SHUT_WR) has been called on this socket. Together with the far end
+        /// having closed, that is the one case Linux reports as POLLHUP.
+        bool shutdown_write {};
     };
 
     /// What the threads of one process share, and what a fork duplicates instead.

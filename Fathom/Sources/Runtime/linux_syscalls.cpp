@@ -43,6 +43,42 @@ static uint32_t GuestGid(uint32_t host) { return host == static_cast<uint32_t>(g
 
 namespace {
 
+/// FATHOM_TRACE_NET=1: every send and receive on a socket, with its size and first bytes,
+/// in every process -- cheap enough to leave on for a whole session when the question
+/// is what went over the wire, where a full syscall trace changes the timing it is
+/// trying to observe.
+bool TraceNet() {
+    static const bool enabled = getenv("FATHOM_TRACE_NET") != nullptr;
+    return enabled;
+}
+
+void TraceNetBytes(int pid, const char* what, int fd, const void* data, size_t length, ssize_t result) {
+    char hex[64] = "";
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    const size_t shown = result > 0 ? std::min<size_t>(static_cast<size_t>(result), 16) : 0;
+    for (size_t index = 0; index < shown && bytes != nullptr; ++index) {
+        std::snprintf(hex + index * 3, sizeof(hex) - index * 3, "%02x ", bytes[index]);
+    }
+    if (result < 0) {
+        FATHOM_INFO("[pid %d] net %s fd %d (%zu) -> %s", pid, what, fd, length, std::strerror(errno));
+    } else {
+        FATHOM_INFO("[pid %d] net %s fd %d (%zu) -> %zd: %s", pid, what, fd, length, result, hex);
+    }
+    // FATHOM_TRACE_NET_DUMP=<dir>: the bytes themselves, one file per descriptor and
+    // direction, so a stream can be taken apart afterwards.
+    static const char* dump_dir = getenv("FATHOM_TRACE_NET_DUMP");
+    if (dump_dir != nullptr && result > 0 && bytes != nullptr) {
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/%d-%d-%s.bin", dump_dir, pid, fd,
+                      (what[0] == 's') ? "out" : "in");
+        if (FILE* file = fopen(path, "ab")) {
+            fwrite(bytes, 1, static_cast<size_t>(result), file);
+            fclose(file);
+        }
+    }
+}
+
+
 // ---------------------------------------------------------------------------
 // The guest's ABI constants. These are x86-64 Linux's values, which are not the
 // host's -- O_CREAT alone is 0x40 on Linux and 0x200 on Darwin, so passing a guest
@@ -1464,6 +1500,9 @@ uint64_t LinuxSyscalls::DoOpenAt(int dirfd, uint64_t path_address, int flags, in
 
     std::string guest_path;
     const std::string host_path = ResolveAt(dirfd, path.c_str(), &guest_path);
+    if (config_.trace) {
+        FATHOM_INFO("[pid %d/%d]   openat %s", pid_, Tid(), guest_path.c_str());
+    }
 
     // The display is a device, not a file: it is answered here rather than looked for in
     // the guest root, and its fd is backed by no host file at all.
@@ -1674,10 +1713,52 @@ struct LinuxPollfd {
 static_assert(sizeof(LinuxPollfd) == 8, "guest pollfd must be 8 bytes");
 
 constexpr int16_t kPollIn = 0x001;
+constexpr int16_t kPollPri = 0x002;
 constexpr int16_t kPollOut = 0x004;
 constexpr int16_t kPollErr = 0x008;
 constexpr int16_t kPollHup = 0x010;
 constexpr int16_t kPollNval = 0x020;
+constexpr int16_t kPollRdNorm = 0x040;
+constexpr int16_t kPollRdBand = 0x080;
+constexpr int16_t kPollWrNorm = 0x100;
+constexpr int16_t kPollRdHup = 0x2000;
+
+/// The guest's interest mask in the host's terms. The low bits mean the same on both
+/// sides; Linux's POLLWRNORM is Darwin's POLLOUT, and the rest (POLLRDHUP among them)
+/// have no Darwin meaning and are not handed over.
+short HostPollEvents(int16_t guest) {
+    short host = static_cast<short>(guest & (kPollIn | kPollPri | kPollOut | kPollRdNorm | kPollRdBand));
+    if ((guest & kPollWrNorm) != 0) {
+        host |= POLLOUT;
+    }
+    return host;
+}
+
+bool IsHostSocket(int host_fd) {
+    int type = 0;
+    socklen_t size = sizeof(type);
+    return getsockopt(host_fd, SOL_SOCKET, SO_TYPE, &type, &size) == 0;
+}
+
+/// What Darwin's poll answered, in the words Linux would have used. Darwin says POLLHUP
+/// the moment the far end of a socket has closed, where Linux keeps reporting a
+/// half-closed socket as readable (POLLIN, and POLLRDHUP if that was asked for) and
+/// keeps POLLHUP for a connection finished in both directions. Darwin also answers
+/// POLLPRI on such a socket if asked, which means nothing. Wine reads these the Linux
+/// way: a POLLHUP is a hangup and an exception, and the reply still queued behind it is
+/// abandoned -- which is how Steam gave up on a server that closed after answering.
+int16_t LinuxPollRevents(int16_t asked, short host, int host_fd, bool local_write_shutdown) {
+    auto out = static_cast<int16_t>(host);
+    if ((host & POLLHUP) != 0 && IsHostSocket(host_fd)) {
+        out = static_cast<int16_t>(out & ~kPollPri);
+        if (!local_write_shutdown) {
+            out = static_cast<int16_t>(out & ~kPollHup);
+            if ((asked & kPollIn) != 0) out |= kPollIn;
+            if ((asked & kPollRdHup) != 0) out |= kPollRdHup;
+        }
+    }
+    return out;
+}
 
 } // namespace
 
@@ -1824,6 +1905,7 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
     constexpr int kSliceMilliseconds = 50;
     std::vector<struct pollfd> host_fds;
     std::vector<LinuxPollfd*> host_owners;
+    std::vector<bool> host_write_shutdown;
 
     for (;;) {
         if (ShouldStop()) {
@@ -1833,6 +1915,7 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
 
         host_fds.clear();
         host_owners.clear();
+        host_write_shutdown.clear();
         bool watches_console = false;
 
         uint64_t ready = 0;
@@ -1855,18 +1938,21 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
                 }
             } else {
                 int host_fd = -1;
+                bool write_shutdown = false;
                 {
                     std::scoped_lock lock {shared_->mutex};
                     auto* file = FindFile(entry.fd);
                     if (file != nullptr) {
                         host_fd = file->host_fd;
+                        write_shutdown = file->shutdown_write;
                     }
                 }
                 if (host_fd < 0) {
                     entry.revents |= kPollNval;
                 } else {
-                    host_fds.push_back({host_fd, static_cast<short>(entry.events), 0});
+                    host_fds.push_back({host_fd, HostPollEvents(entry.events), 0});
                     host_owners.push_back(&entry);
+                    host_write_shutdown.push_back(write_shutdown);
                 }
             }
 
@@ -1894,8 +1980,17 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
             const int answered = poll(host_fds.data(), static_cast<nfds_t>(host_fds.size()), slice);
             if (answered > 0) {
                 for (size_t index = 0; index < host_fds.size(); ++index) {
+                    if (config_.trace) {
+                        FATHOM_INFO("[pid %d]   poll: host fd %d asked %#x got %#x", pid_, host_fds[index].fd,
+                                    host_fds[index].events, host_fds[index].revents);
+                    }
                     if (host_fds[index].revents != 0) {
-                        host_owners[index]->revents = static_cast<int16_t>(host_fds[index].revents);
+                        const int16_t revents = LinuxPollRevents(host_owners[index]->events, host_fds[index].revents,
+                                                                 host_fds[index].fd, host_write_shutdown[index]);
+                        if (revents == 0) {
+                            continue;
+                        }
+                        host_owners[index]->revents = revents;
                         ++ready;
                     }
                 }
@@ -2309,15 +2404,8 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
             host_header.msg_controllen = static_cast<socklen_t>(host_control.size());
         }
         const ssize_t sent = sendmsg(host_fd, &host_header, HostMessageFlags(flags));
-        if (config_.trace && !vectors.empty() && vectors[0].iov_len != 0) {
-            char hex[64] = "";
-            const auto* bytes = static_cast<const unsigned char*>(vectors[0].iov_base);
-            size_t shown = std::min<size_t>(vectors[0].iov_len, 16);
-            for (size_t index = 0; index < shown; ++index) {
-                std::snprintf(hex + index * 3, sizeof(hex) - index * 3, "%02x ", bytes[index]);
-            }
-            FATHOM_INFO("[pid %d]   sendmsg fd %d: %zu iovecs, first %zu bytes: %s-> %zd", pid_, fd,
-                        vectors.size(), vectors[0].iov_len, hex, sent);
+        if ((config_.trace || TraceNet()) && !vectors.empty()) {
+            TraceNetBytes(pid_, "sendmsg", fd, vectors[0].iov_base, vectors[0].iov_len, sent);
         }
         return sent < 0 ? Fail(errno) : static_cast<uint64_t>(sent);
     }
@@ -2334,7 +2422,20 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
         host_header.msg_control = received_control.data();
         host_header.msg_controllen = static_cast<socklen_t>(received_control.size());
     }
+    // Experiment: FATHOM_RECV_CAP=<bytes> hands a stream socket's data over in pieces no
+    // larger than this, the way a native client sees it arrive segment by segment.
+    static const long recv_cap = getenv("FATHOM_RECV_CAP") ? std::atol(getenv("FATHOM_RECV_CAP")) : 0;
+    if (recv_cap > 0 && !vectors.empty()) {
+        size_t budget = static_cast<size_t>(recv_cap);
+        for (auto& piece : vectors) {
+            if (piece.iov_len > budget) piece.iov_len = budget;
+            budget -= piece.iov_len;
+        }
+    }
     const ssize_t received = recvmsg(host_fd, &host_header, HostMessageFlags(flags));
+    if ((config_.trace || TraceNet()) && !vectors.empty()) {
+        TraceNetBytes(pid_, "recvmsg", fd, vectors[0].iov_base, vectors[0].iov_len, received);
+    }
     if (received < 0) {
         return Fail(errno);
     }
@@ -3655,6 +3756,7 @@ uint64_t LinuxSyscalls::DoEpollWait(int epoll_fd, uint64_t events_address, int m
 
         std::vector<struct pollfd> host_fds;
         std::vector<const EpollInterest*> owners;
+        std::vector<bool> write_shutdown;
         host_fds.reserve(watched.size());
         owners.reserve(watched.size());
         {
@@ -3666,10 +3768,10 @@ uint64_t LinuxSyscalls::DoEpollWait(int epoll_fd, uint64_t events_address, int m
                 }
                 struct pollfd entry {};
                 entry.fd = file->host_fd;
-                if ((interest.events & kPollIn) != 0) entry.events |= POLLIN;
-                if ((interest.events & kPollOut) != 0) entry.events |= POLLOUT;
+                entry.events = HostPollEvents(static_cast<int16_t>(interest.events));
                 host_fds.push_back(entry);
                 owners.push_back(&interest);
+                write_shutdown.push_back(file->shutdown_write);
             }
         }
 
@@ -3695,11 +3797,19 @@ uint64_t LinuxSyscalls::DoEpollWait(int epoll_fd, uint64_t events_address, int m
         }
         uint64_t reported = 0;
         for (size_t index = 0; index < host_fds.size() && reported < static_cast<uint64_t>(max_events); ++index) {
+            if (host_fds[index].revents == 0) {
+                continue;
+            }
+            const int16_t revents = LinuxPollRevents(static_cast<int16_t>(owners[index]->events),
+                                                     host_fds[index].revents, host_fds[index].fd,
+                                                     write_shutdown[index]);
             uint32_t events = 0;
-            if ((host_fds[index].revents & POLLIN) != 0) events |= kPollIn;
-            if ((host_fds[index].revents & POLLOUT) != 0) events |= kPollOut;
-            if ((host_fds[index].revents & POLLERR) != 0) events |= kPollErr;
-            if ((host_fds[index].revents & POLLHUP) != 0) events |= kPollHup;
+            if ((revents & kPollIn) != 0) events |= kPollIn;
+            if ((revents & kPollPri) != 0) events |= kPollPri;
+            if ((revents & kPollOut) != 0) events |= kPollOut;
+            if ((revents & kPollErr) != 0) events |= kPollErr;
+            if ((revents & kPollHup) != 0) events |= kPollHup;
+            if ((revents & kPollRdHup) != 0) events |= kPollRdHup;
             if (events == 0) {
                 continue;
             }
@@ -4414,7 +4524,7 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
         // The pid matters more than anything else on this line once there is more than
         // one process: the same syscall from a shell and from its child mean opposite
         // things, and without it a pipeline's trace is unreadable.
-        FATHOM_INFO("[pid %d] %#llx syscall %llu %s(%#llx, %#llx, %#llx)", pid_,
+        FATHOM_INFO("[pid %d/%d] %#llx syscall %llu %s(%#llx, %#llx, %#llx)", pid_, Tid(),
                     static_cast<unsigned long long>(control_.GuestRip()),
                     static_cast<unsigned long long>(number), SyscallName(number),
                     static_cast<unsigned long long>(arg1),
@@ -4453,9 +4563,9 @@ uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, ui
         // the answer is logged too.
         const auto signed_result = static_cast<int64_t>(result);
         if (signed_result < 0 && signed_result > -4096) {
-            FATHOM_INFO("[pid %d]   -> error %lld", pid_, static_cast<long long>(-signed_result));
+            FATHOM_INFO("[pid %d/%d]   -> error %lld", pid_, Tid(), static_cast<long long>(-signed_result));
         } else {
-            FATHOM_INFO("[pid %d]   -> %#llx", pid_, static_cast<unsigned long long>(result));
+            FATHOM_INFO("[pid %d/%d]   -> %#llx", pid_, Tid(), static_cast<unsigned long long>(result));
         }
     }
     return result;
@@ -5924,16 +6034,12 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         // spinning on nothing, which is a web helper that starts and then never replies.
         int timeout_ms = -1;
         if (arg3 != 0) {
-            struct GuestTimespec {
-                int64_t seconds;
-                int64_t nanoseconds;
-            } wanted {};
-            const void* raw = GuestPointer(arg3, sizeof(wanted), false);
-            if (raw == nullptr) {
+            int64_t seconds = 0;
+            int64_t nanoseconds = 0;
+            if (!ReadGuestTimespec(arg3, &seconds, &nanoseconds)) {
                 return FailLinux(14);
             }
-            std::memcpy(&wanted, raw, sizeof(wanted));
-            const int64_t milliseconds = wanted.seconds * 1000 + wanted.nanoseconds / 1000000;
+            const int64_t milliseconds = seconds * 1000 + nanoseconds / 1000000;
             timeout_ms = milliseconds > INT32_MAX ? INT32_MAX : static_cast<int>(milliseconds);
             if (timeout_ms < 0) {
                 timeout_ms = 0;
@@ -6090,7 +6196,16 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         if (host_fd < 0) {
             return FailLinux(9);
         }
-        return shutdown(host_fd, static_cast<int>(arg2)) < 0 ? Fail(errno) : 0;
+        if (shutdown(host_fd, static_cast<int>(arg2)) < 0) {
+            return Fail(errno);
+        }
+        if (static_cast<int>(arg2) != SHUT_RD) {
+            std::scoped_lock lock {shared_->mutex};
+            if (auto* file = FindFile(static_cast<int>(arg1))) {
+                file->shutdown_write = true;
+            }
+        }
+        return 0;
     }
 
     case kSysSendto: {
@@ -6178,6 +6293,9 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         const ssize_t sent = sendto(host_fd, buffer, arg3, HostMessageFlags(static_cast<int>(arg4)),
                                     length != 0 ? reinterpret_cast<sockaddr*>(&host_address) : nullptr,
                                     length);
+        if (config_.trace || TraceNet()) {
+            TraceNetBytes(pid_, "sendto", static_cast<int>(arg1), buffer, arg3, sent);
+        }
         return sent < 0 ? Fail(errno) : static_cast<uint64_t>(sent);
     }
 
@@ -6234,6 +6352,9 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         socklen_t from_length = sizeof(from);
         const ssize_t received = recvfrom(host_fd, buffer, arg3, HostMessageFlags(static_cast<int>(arg4)),
                                           reinterpret_cast<sockaddr*>(&from), &from_length);
+        if (config_.trace || TraceNet()) {
+            TraceNetBytes(pid_, "recvfrom", static_cast<int>(arg1), buffer, arg3, received);
+        }
         if (received < 0) {
             return Fail(errno);
         }
@@ -6434,18 +6555,21 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
 
     case kSysSelect:
     case kSysPselect6: {
+        // The timeout is two words of the guest's time width: an i386 program's timeval
+        // and timespec are eight bytes, not sixteen. Read at the wrong width the
+        // microseconds land in the high half of the seconds, and Wine's Sleep(250) --
+        // which is this call with no descriptors -- becomes a sleep of forty years. The
+        // thread that Steam's updater waits on was asleep like that.
         int64_t timeout_us = -1;
         if (arg5 != 0) {
-            if (number == kSysSelect) {
-                const auto* tv = static_cast<const int64_t*>(GuestPointer(arg5, 16, false));
-                if (tv != nullptr) {
-                    timeout_us = tv[0] * 1000000 + tv[1];
-                }
-            } else {
-                const auto* ts = static_cast<const int64_t*>(GuestPointer(arg5, 16, false));
-                if (ts != nullptr) {
-                    timeout_us = ts[0] * 1000000 + ts[1] / 1000;
-                }
+            int64_t seconds = 0;
+            int64_t fraction = 0;
+            if (!ReadGuestTimespec(arg5, &seconds, &fraction)) {
+                return FailLinux(14);
+            }
+            timeout_us = seconds * 1000000 + (number == kSysSelect ? fraction : fraction / 1000);
+            if (timeout_us < 0) {
+                timeout_us = 0;
             }
         }
         return DoSelect(static_cast<int>(arg1), arg2, arg3, arg4, timeout_us);

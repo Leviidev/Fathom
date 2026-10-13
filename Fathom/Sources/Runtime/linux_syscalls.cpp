@@ -2309,6 +2309,16 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
             host_header.msg_controllen = static_cast<socklen_t>(host_control.size());
         }
         const ssize_t sent = sendmsg(host_fd, &host_header, HostMessageFlags(flags));
+        if (config_.trace && !vectors.empty() && vectors[0].iov_len != 0) {
+            char hex[64] = "";
+            const auto* bytes = static_cast<const unsigned char*>(vectors[0].iov_base);
+            size_t shown = std::min<size_t>(vectors[0].iov_len, 16);
+            for (size_t index = 0; index < shown; ++index) {
+                std::snprintf(hex + index * 3, sizeof(hex) - index * 3, "%02x ", bytes[index]);
+            }
+            FATHOM_INFO("[pid %d]   sendmsg fd %d: %zu iovecs, first %zu bytes: %s-> %zd", pid_, fd,
+                        vectors.size(), vectors[0].iov_len, hex, sent);
+        }
         return sent < 0 ? Fail(errno) : static_cast<uint64_t>(sent);
     }
 

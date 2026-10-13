@@ -12,6 +12,8 @@
 #include <malloc.h>
 #endif
 #include <sys/mman.h>
+#include <string.h>
+#include <unistd.h>
 #ifdef __APPLE__
 #include <pthread.h>
 #include <TargetConditionals.h>
@@ -280,7 +282,29 @@ inline void VirtualFree(void* Ptr, size_t Size) {
   FEXCore::Allocator::munmap(Ptr, Size);
 }
 inline void VirtualDontNeed(void* Ptr, size_t Size, bool Recommit = true) {
+#if defined(__APPLE__)
+  // FEX relies on Linux's MADV_DONTNEED zero-fill: it clears the lookup caches and the
+  // call-return stack this way, and a stale entry left behind is a jump into code that was
+  // invalidated or freed. Darwin's MADV_DONTNEED keeps the contents (measured: every byte of
+  // a written 1 MB region survives it). Mapping fresh anonymous pages over the range does
+  // zero it, atomically per page; host pages are 16 KB, so the partial pages at either end
+  // are cleared by hand. Every caller passes ordinary read-write anonymous memory.
+  const uintptr_t Page = static_cast<uintptr_t>(getpagesize());
+  const uintptr_t Begin = reinterpret_cast<uintptr_t>(Ptr);
+  const uintptr_t End = Begin + Size;
+  const uintptr_t InnerBegin = (Begin + Page - 1) & ~(Page - 1);
+  const uintptr_t InnerEnd = End & ~(Page - 1);
+  if (InnerEnd > InnerBegin &&
+      ::mmap(reinterpret_cast<void*>(InnerBegin), InnerEnd - InnerBegin, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0) !=
+        MAP_FAILED) {
+    memset(reinterpret_cast<void*>(Begin), 0, InnerBegin - Begin);
+    memset(reinterpret_cast<void*>(InnerEnd), 0, End - InnerEnd);
+  } else {
+    memset(Ptr, 0, Size);
+  }
+#else
   ::madvise(reinterpret_cast<void*>(Ptr), Size, MADV_DONTNEED);
+#endif
 }
 inline bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options) {
   int prot {PROT_NONE};

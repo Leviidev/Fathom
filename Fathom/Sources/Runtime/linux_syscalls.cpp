@@ -2666,6 +2666,9 @@ uint64_t LinuxSyscalls::DoStatAt(int dirfd, uint64_t path_address, uint64_t stat
     if (!ReadGuestString(path_address, &path)) {
         return FailLinux(14);
     }
+    if (config_.trace) {
+        FATHOM_INFO("[pid %d/%d]   stat %s", pid_, Tid(), path.c_str());
+    }
 
     struct stat host {};
     int result = 0;

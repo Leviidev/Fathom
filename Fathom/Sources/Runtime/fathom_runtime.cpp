@@ -41,7 +41,11 @@ namespace {
 
 constexpr uint64_t kDefaultAddressSpace = 2ULL * 1024 * 1024 * 1024; // 2 GB
 /// A relocated 64-bit program's space. Enough for 64-bit Wine, which wants the low 4GB and its PE images above it.
-constexpr uint64_t kRelocated64Space = 32ULL * 1024 * 1024 * 1024; // 32 GB
+// Address space, not memory: Chromium's V8 reserves a terabyte for its sandbox and
+// PartitionAlloc tens of gigabytes per pool, all PROT_NONE until used, and Steam's web
+// helper is Chromium. macOS lets a process reserve sixteen of these; the arena's
+// bookkeeping is extent lists, so the size costs nothing until it is touched.
+constexpr uint64_t kRelocated64Space = 2048ULL * 1024 * 1024 * 1024; // 2 TB
 /// Where it places what names no address: above the low 8GB, which 64-bit Wine reserves for Windows.
 constexpr uint64_t kRelocated64Floor = 8ULL * 1024 * 1024 * 1024;
 

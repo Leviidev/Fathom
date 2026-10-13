@@ -1948,7 +1948,14 @@ int64_t fathom_session::ExecProcess(int caller_pid, const std::string& requested
     process->syscalls->AdoptImage(loaded.heap, kHeapReservation, path);
     process->syscalls->SetCommandLine(argv);
 
-    FATHOM_INFO("execve: pid %d is now %s (entry %#llx)", caller_pid, path.c_str(),
+    // The arguments say what a Wine loader is actually running, which is the only thing
+    // that tells one of its dozen processes from another.
+    std::string shown;
+    for (size_t index = 1; index < argv.size() && shown.size() < 200; ++index) {
+        shown += ' ';
+        shown += argv[index];
+    }
+    FATHOM_INFO("execve: pid %d is now %s%s (entry %#llx)", caller_pid, path.c_str(), shown.c_str(),
                 static_cast<unsigned long long>(loaded.entry));
 
     // Deliberately not released here. The parent may only resume once the child is

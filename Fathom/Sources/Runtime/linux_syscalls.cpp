@@ -5501,6 +5501,31 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         // better than refusing the call and sending its libc down an error path.
         return 0;
 
+    case 100: { // times: process and child CPU times in clock ticks (100 a second)
+        struct rusage self {};
+        struct rusage children {};
+        getrusage(RUSAGE_SELF, &self);
+        getrusage(RUSAGE_CHILDREN, &children);
+        const auto ticks = [](const struct timeval& tv) -> uint64_t {
+            return static_cast<uint64_t>(tv.tv_sec) * 100 + static_cast<uint64_t>(tv.tv_usec) / 10000;
+        };
+        if (arg1 != 0) {
+            const size_t width = config_.guest_is_32bit ? 4 : 8;
+            auto* out = static_cast<unsigned char*>(GuestPointer(arg1, width * 4, true));
+            if (out == nullptr) {
+                return FailLinux(14);
+            }
+            const uint64_t values[4] = {ticks(self.ru_utime), ticks(self.ru_stime), ticks(children.ru_utime),
+                                        ticks(children.ru_stime)};
+            for (size_t index = 0; index < 4; ++index) {
+                std::memcpy(out + index * width, &values[index], width);
+            }
+        }
+        struct timespec now {};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        return (static_cast<uint64_t>(now.tv_sec) * 100 + static_cast<uint64_t>(now.tv_nsec) / 10000000) & 0xffffffff;
+    }
+
     case kSysGetrusage: {
         // Two timevals and fourteen longs, every one of them half the width on i386: 72
         // bytes there, 144 here. Wine asks for RUSAGE_THREAD on every thread-time query,

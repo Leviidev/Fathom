@@ -2870,11 +2870,18 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
     const bool fixed = (flags & guest::kMapFixed) != 0;
 
     uint64_t placed = 0;
+    // What an anonymous mapping lands on that was already in use. Those bytes are the old
+    // contents and have to be zeroed; everything else comes back from the kernel as fresh
+    // zero pages, and must not be touched -- see below.
+    std::vector<std::pair<uint64_t, uint64_t>> stale;
     if (fixed && address != 0) {
         // The guest insists on this address. Inside the arena that is satisfiable; the
         // range may already be committed, in which case this is a re-protect.
         if (!space_->Contains(address, length)) {
             return FailLinux(12); // ENOMEM
+        }
+        if (anonymous) {
+            stale = space_->CommittedIn(address, address + length);
         }
         // Writable while it is zeroed or a file's contents are copied in, like the case below; the protection asked for
         // is applied once that is done. Committed read-only first, the memset or the copy faults inside this call --
@@ -2951,9 +2958,40 @@ uint64_t LinuxSyscalls::DoMmap(uint64_t address, uint64_t length, int protection
         // lie underneath, so a pointer that should be NULL holds whatever was there --
         // which is how a library crashes on an address out of its own file offsets.
         //
-        // Freshly reserved arena pages are already zero, but the arena is reused as
-        // processes come and go, so the zeroing has to be unconditional.
-        std::memset(reinterpret_cast<void*>(placed), 0, length);
+        // Not by writing zeros over the whole range, though. The free parts were mapped
+        // fresh from the kernel while being committed, and a fresh page reads as zero
+        // without existing until something touches it. Writing to it is that touch: a
+        // browser reserves tens of gigabytes it will never use, and zeroing those
+        // reservations by hand is what took the whole machine's memory. So only what was
+        // committed before this call is zeroed, plus the ends: the guest's pages are 4KB
+        // and the host's 16KB, so a host page shared with a live neighbour is not
+        // remapped and keeps whatever a previous owner left in this part of it.
+        const uint64_t host_page = space_->HostPageSize();
+        const auto zero = [&](uint64_t low, uint64_t high) {
+            low = std::max(low, placed);
+            high = std::min(high, placed + length);
+            if (high > low) {
+                std::memset(reinterpret_cast<void*>(low), 0, high - low);
+            }
+        };
+        for (const auto& [stale_begin, stale_end] : stale) {
+            // Whole host pages are given back rather than written: Wine's preloader maps
+            // two gigabytes and then maps one gigabyte over the top of it, and neither
+            // was ever touched. Only the host pages this piece shares with something
+            // else -- a neighbour, or the free part next to it that was not remapped
+            // because it starts or stops inside the same page -- are zeroed by hand.
+            const uint64_t low = (stale_begin + host_page - 1) & ~(host_page - 1);
+            const uint64_t high = stale_end & ~(host_page - 1);
+            if (high > low) {
+                space_->DropPages(low, high - low);
+            }
+            zero(stale_begin & ~(host_page - 1), std::min(low, stale_end));
+            zero(std::max(high, stale_begin), (stale_end + host_page - 1) & ~(host_page - 1));
+        }
+        const uint64_t head_end = std::min((placed + host_page - 1) & ~(host_page - 1), placed + length);
+        const uint64_t tail_begin = std::max((placed + length) & ~(host_page - 1), head_end);
+        zero(placed, head_end);
+        zero(tail_begin, placed + length);
     }
 
     if (!anonymous) {

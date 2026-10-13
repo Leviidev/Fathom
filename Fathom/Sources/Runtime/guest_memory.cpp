@@ -8,10 +8,15 @@
 #include <cstdio>
 #include <cstring>
 #include <shared_mutex>
+#include <mach/vm_statistics.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 namespace fathom {
+
+/// Every mapping that backs guest memory carries this tag, so a listing of the host's
+/// regions (the memory watchdog's, or vmmap's) tells guest pages from the JIT's own.
+constexpr int kArenaTag = VM_MAKE_TAG(242);
 namespace {
 
 int ToHostProtection(int guest_protection) {
@@ -119,7 +124,7 @@ GuestAddressSpace::~GuestAddressSpace() {
     }
 }
 
-bool GuestAddressSpace::AdoptCopiedMapping(uint64_t address, uint64_t size, int protection) {
+bool GuestAddressSpace::AdoptCopiedMapping(uint64_t address, uint64_t size, int protection, bool written) {
     if (size == 0 || address < base_ || address + size > base_ + size_) {
         return false;
     }
@@ -128,6 +133,13 @@ bool GuestAddressSpace::AdoptCopiedMapping(uint64_t address, uint64_t size, int 
         return false;
     }
     RecordCommitted(address, size, protection);
+    if (!written) {
+        for (auto& range : committed_) {
+            if (range.begin == address && range.size == size) {
+                range.written = false;
+            }
+        }
+    }
     return true;
 }
 
@@ -151,7 +163,7 @@ GuestAddressSpace* GuestAddressSpace::Reserve(uint64_t size, std::string& error,
     // With an alignment, more is reserved and the ends trimmed off: a 32-bit guest's base has to sit on a 4GB boundary,
     // because FEXCore relocates its addresses by putting the base's upper half in front of them, not by adding it.
     const uint64_t over = alignment > page_size ? aligned + alignment : aligned;
-    void* address = mmap(nullptr, over, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void* address = mmap(nullptr, over, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, kArenaTag, 0);
     if (address != MAP_FAILED && over != aligned) {
         const uint64_t raw = reinterpret_cast<uint64_t>(address);
         const uint64_t start = (raw + alignment - 1) & ~(alignment - 1);
@@ -224,7 +236,7 @@ namespace {
 /// live neighbours -- which reads, much later, as a thread whose stack pointer is zero.
 bool MapFreshAnonymous(uint64_t address, uint64_t length) {
     void* placed = mmap(reinterpret_cast<void*>(address), length, PROT_NONE,
-                        MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                        MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, kArenaTag, 0);
     return placed != MAP_FAILED && reinterpret_cast<uint64_t>(placed) == address;
 }
 
@@ -363,6 +375,34 @@ void GuestAddressSpace::TakeFreeSpan(uint64_t begin, uint64_t end) {
 }
 
 /// The parts of [begin, end) nothing is committed over, host page by host page.
+std::vector<std::pair<uint64_t, uint64_t>> GuestAddressSpace::CommittedIn(uint64_t begin,
+                                                                         uint64_t end) const {
+    std::vector<std::pair<uint64_t, uint64_t>> pieces;
+    std::shared_lock lock {mutex_};
+    for (size_t index = FirstRangeEndingAfter(begin); index < committed_.size(); ++index) {
+        const auto& range = committed_[index];
+        if (range.begin >= end) {
+            break;
+        }
+        pieces.emplace_back(std::max(range.begin, begin), std::min(range.end(), end));
+    }
+    return pieces;
+}
+
+void GuestAddressSpace::DropPages(uint64_t address, uint64_t size) {
+    const uint64_t low = (address + page_size_ - 1) & ~(page_size_ - 1);
+    const uint64_t high = (address + size) & ~(page_size_ - 1);
+    if (high <= low || low < base_ || high > base_ + size_) {
+        return;
+    }
+    std::unique_lock lock {mutex_};
+    if (!MapFreshAnonymous(low, high - low) ||
+        mprotect(reinterpret_cast<void*>(low), high - low, PROT_READ | PROT_WRITE) != 0) {
+        FATHOM_WARN("dropping pages at %#llx (%llu KB) failed: %s", static_cast<unsigned long long>(low),
+                    static_cast<unsigned long long>((high - low) / 1024), std::strerror(errno));
+    }
+}
+
 std::vector<std::pair<uint64_t, uint64_t>> GuestAddressSpace::UncommittedIn(uint64_t begin,
                                                                            uint64_t end) const {
     std::vector<std::pair<uint64_t, uint64_t>> gaps;
@@ -447,13 +487,13 @@ void GuestAddressSpace::RecordCommitted(uint64_t address, uint64_t size, int pro
                     static_cast<unsigned long long>(range.epoch), range.protection);
         if (range.begin < address) {
             updated.push_back(GuestRange {range.begin, address - range.begin, range.protection,
-                                          range.epoch});
+                                          range.epoch, range.written});
         }
         if (range.end() > end) {
-            updated.push_back(GuestRange {end, range.end() - end, range.protection, range.epoch});
+            updated.push_back(GuestRange {end, range.end() - end, range.protection, range.epoch, range.written});
         }
     }
-    updated.push_back(GuestRange {address, size, protection, next_epoch_++});
+    updated.push_back(GuestRange {address, size, protection, next_epoch_++, (protection & kGuestProtWrite) != 0});
     std::sort(updated.begin(), updated.end(),
               [](const GuestRange& lhs, const GuestRange& rhs) { return lhs.begin < rhs.begin; });
     committed_ = std::move(updated);
@@ -472,6 +512,7 @@ void GuestAddressSpace::Coalesce() {
     for (size_t index = 0; index < committed_.size(); ++index) {
         if (out > 0 && committed_[out - 1].end() == committed_[index].begin &&
             committed_[out - 1].protection == committed_[index].protection &&
+            committed_[out - 1].written == committed_[index].written &&
             committed_[out - 1].epoch == committed_[index].epoch) {
             committed_[out - 1].size += committed_[index].size;
             continue;
@@ -661,10 +702,10 @@ bool GuestAddressSpace::Release(uint64_t address, uint64_t size) {
         }
         had_code = true;
         if (range.begin < begin) {
-            survivors.push_back(GuestRange {range.begin, begin - range.begin, range.protection, range.epoch});
+            survivors.push_back(GuestRange {range.begin, begin - range.begin, range.protection, range.epoch, range.written});
         }
         if (range.end() > end) {
-            survivors.push_back(GuestRange {end, range.end() - end, range.protection, range.epoch});
+            survivors.push_back(GuestRange {end, range.end() - end, range.protection, range.epoch, range.written});
         }
     }
     // Installed before anything below asks what is still committed -- both the sweep for
@@ -789,15 +830,15 @@ bool GuestAddressSpace::ProtectLocked(uint64_t address, uint64_t size, int prote
         }
         touched = true;
         if (range.begin < begin) {
-            updated.push_back(GuestRange {range.begin, begin - range.begin, range.protection, range.epoch});
+            updated.push_back(GuestRange {range.begin, begin - range.begin, range.protection, range.epoch, range.written});
         }
         const uint64_t overlap_begin = std::max(range.begin, begin);
         const uint64_t overlap_end = std::min(range.end(), end);
         updated.push_back(GuestRange {overlap_begin, overlap_end - overlap_begin,
                                       protection_for(overlap_begin, overlap_end, range.protection),
-                                      range.epoch});
+                                      range.epoch, range.written || (protection & kGuestProtWrite) != 0});
         if (range.end() > end) {
-            updated.push_back(GuestRange {end, range.end() - end, range.protection, range.epoch});
+            updated.push_back(GuestRange {end, range.end() - end, range.protection, range.epoch, range.written});
         }
     }
     if (!touched) {
@@ -844,7 +885,7 @@ std::vector<GuestRange> GuestAddressSpace::WritableRangesIn(uint64_t begin, uint
         const uint64_t low = std::max(range.begin, begin);
         const uint64_t high = std::min(range.end(), end);
         if (high > low) {
-            writable.push_back(GuestRange {low, high - low, range.protection, range.epoch});
+            writable.push_back(GuestRange {low, high - low, range.protection, range.epoch, range.written});
         }
     }
     return writable;

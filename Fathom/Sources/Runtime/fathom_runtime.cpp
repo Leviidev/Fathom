@@ -18,7 +18,8 @@
 #include <dlfcn.h>
 #include <mach/arm/thread_status.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+#include <mach/task_info.h>
+#include <mach/vm_map.h>
 #include <mach/thread_act.h>
 #include <pthread.h>
 
@@ -32,6 +33,11 @@
 #include <mutex>
 #include <string>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>
+#endif
 #include <sys/resource.h>
 #include <pthread.h>
 #include <fcntl.h>
@@ -471,7 +477,7 @@ struct fathom_session final : fathom::ProcessHost {
 
     /// Stops the process's other threads for as long as a child of it is borrowing its
     /// memory, and starts them again afterwards.
-    bool FreezeOtherThreads(GuestProcess* process, const fathom::GuestThread* caller);
+    bool FreezeOtherThreads(GuestProcess* process, const fathom::GuestThread* caller, bool force = false);
     void ThawThreads(GuestProcess* process);
 
     /// The same, but leaving the thread that asked -- which is what execve needs.
@@ -591,6 +597,7 @@ struct fathom_session final : fathom::ProcessHost {
     /// usually a process waiting for another one that is waiting for it. Started only
     /// when FATHOM_WATCHDOG names an interval in seconds.
     std::thread watchdog;
+    std::thread memory_watchdog;
     std::atomic<bool> watchdog_stopping {false};
     void ReportGuestStack(GuestProcess* process, fathom::GuestThread* thread, int tid);
     void StartWatchdog();
@@ -622,16 +629,25 @@ uint64_t CopyAddressSpace(fathom::GuestAddressSpace& from, fathom::GuestAddressS
     std::sort(shared.begin(), shared.end());
     uint64_t covered = 0;
     size_t pieces = 0;
-    const auto remap = [&](uint64_t begin, uint64_t end, int protection, bool copy) {
+    const auto remap = [&](uint64_t begin, uint64_t end, int protection, bool copy, bool written) {
         begin &= ~(page - 1);
         end = (end + page - 1) & ~(page - 1);
         if (end <= begin) {
             return;
         }
-        mach_vm_address_t target = static_cast<mach_vm_address_t>(static_cast<int64_t>(begin) + delta);
+        vm_address_t target = static_cast<vm_address_t>(static_cast<int64_t>(begin) + delta);
+        if (!written) {
+            // Never writable, so never anything but zeros: a reservation. Reserving the
+            // same span in the child costs nothing, where a copy-on-write copy of it would
+            // materialise every page -- Chromium's terabyte of reserved sandbox included.
+            mprotect(reinterpret_cast<void*>(target), end - begin, (protection & fathom::kGuestProtRead) != 0 ? PROT_READ : PROT_NONE);
+            to.AdoptCopiedMapping(static_cast<uint64_t>(target), end - begin, protection, false);
+            ++pieces;
+            return;
+        }
         vm_prot_t current = 0;
         vm_prot_t maximum = 0;
-        const auto result = mach_vm_remap(mach_task_self(), &target, end - begin, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+        const auto result = vm_remap(mach_task_self(), &target, end - begin, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
                                           mach_task_self(), begin, copy ? TRUE : FALSE, &current, &maximum,
                                           VM_INHERIT_NONE);
         if (result != KERN_SUCCESS) {
@@ -654,11 +670,11 @@ uint64_t CopyAddressSpace(fathom::GuestAddressSpace& from, fathom::GuestAddressS
             if (shared_end <= cursor || shared_begin >= finish) {
                 continue;
             }
-            remap(cursor, std::min(shared_begin, finish), range.protection, true);
-            remap(std::max(cursor, shared_begin), std::min(shared_end, finish), range.protection, false);
+            remap(cursor, std::min(shared_begin, finish), range.protection, true, range.written);
+            remap(std::max(cursor, shared_begin), std::min(shared_end, finish), range.protection, false, true);
             cursor = std::max(cursor, shared_end);
         }
-        remap(cursor, finish, range.protection, true);
+        remap(cursor, finish, range.protection, true, range.written);
     }
     if (pieces_out != nullptr) {
         *pieces_out = pieces;
@@ -823,7 +839,7 @@ fathom::RunResult fathom_session::RunProcess(GuestProcess* process) {
     return result;
 }
 
-bool fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::GuestThread* caller) {
+bool fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::GuestThread* caller, bool force) {
     // Everything a fork's child does to its parent's memory is only safe to put back if
     // nothing else was writing to it meanwhile. Linux gives the child a private copy and
     // the question does not arise; here the memory really is shared, so the parent's other
@@ -849,7 +865,7 @@ bool fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::Gue
     // thread's own stack instead, which is the same degraded mode a thread that refuses
     // to stop already produces.
     static const bool freeze_wanted = getenv("FATHOM_FREEZE_FORK") != nullptr;
-    if (!freeze_wanted) {
+    if (!freeze_wanted && !force) {
         return false;
     }
     std::string reason;
@@ -1469,6 +1485,166 @@ void fathom_session::ReportGuestStack(GuestProcess* process, fathom::GuestThread
 }
 
 void fathom_session::StartWatchdog() {
+    // Always on: a guest that allocates without end takes the whole machine down with
+    // it, and a machine that has gone down tells nobody what happened. Above the limit
+    // the live processes are listed with how much each has mapped, and this process
+    // ends on the spot.
+    {
+        // Three quarters of the machine by default: a Steam session is several gigabytes
+        // of real use (each web helper reads a 200 MB library into private memory, as it
+        // does under Wine anywhere), and the limit is there to catch a runaway, not to
+        // stop a program that is merely large. On the phone the ceiling the system
+        // enforces is lower than physical memory, and that one is used instead.
+        uint64_t default_limit_mb = 4096;
+        {
+            uint64_t physical = 0;
+            size_t physical_size = sizeof(physical);
+            if (sysctlbyname("hw.memsize", &physical, &physical_size, nullptr, 0) == 0 && physical != 0) {
+                default_limit_mb = (physical / 4 * 3) >> 20;
+            }
+#if TARGET_OS_IPHONE
+            const size_t available = os_proc_available_memory();
+            if (available != 0) {
+                default_limit_mb = std::min<uint64_t>(default_limit_mb, (static_cast<uint64_t>(available) * 9 / 10) >> 20);
+            }
+#endif
+        }
+        const char* limit_setting = getenv("FATHOM_MEMORY_LIMIT_MB");
+        const uint64_t limit_mb = limit_setting != nullptr ? std::strtoull(limit_setting, nullptr, 10) : default_limit_mb;
+        if (limit_mb > 0) {
+            memory_watchdog = std::thread {[this, limit_mb] {
+                uint64_t peak = 0;
+                while (!watchdog_stopping.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    task_vm_info_data_t info {};
+                    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+                    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+                        continue;
+                    }
+                    const uint64_t footprint_mb = info.phys_footprint >> 20;
+                    if (footprint_mb > peak + 512) {
+                        peak = footprint_mb;
+                        FATHOM_INFO("memory: footprint %llu MB", static_cast<unsigned long long>(footprint_mb));
+                    }
+                    if (footprint_mb <= limit_mb) {
+                        continue;
+                    }
+                    FATHOM_ERROR("memory: footprint %llu MB is over the %llu MB limit; ending the session", 
+                                 static_cast<unsigned long long>(footprint_mb), static_cast<unsigned long long>(limit_mb));
+                    // The host's own view first: every region of this task that is costing
+                    // real memory, dirty or compressed, with the tag that says who made it.
+                    // Guest arenas carry tag 0 and show up below by process; a region that
+                    // is nowhere in the per-process lists is FEXCore's or the runtime's own.
+                    FATHOM_ERROR("memory: task internal %llu MB, compressed %llu MB",
+                                 static_cast<unsigned long long>(info.internal >> 20),
+                                 static_cast<unsigned long long>(info.compressed >> 20));
+                    {
+                        // Totals by who made the region: tag 242 is guest memory, a region
+                        // that is executable is JIT code, tag 0 otherwise is FEXCore's own
+                        // (lookup caches, its heap), and the small tags are the C library's.
+                        std::map<std::pair<unsigned, bool>, std::pair<uint64_t, unsigned>> totals;
+                        vm_address_t address = 0;
+                        for (;;) {
+                            vm_size_t size = 0;
+                            natural_t depth = 0;
+                            vm_region_submap_info_data_64_t region {};
+                            mach_msg_type_number_t region_count = VM_REGION_SUBMAP_INFO_COUNT_64;
+                            if (vm_region_recurse_64(mach_task_self(), &address, &size, &depth,
+                                                       reinterpret_cast<vm_region_recurse_info_t>(&region),
+                                                       &region_count) != KERN_SUCCESS) {
+                                break;
+                            }
+                            const uint64_t costing = (static_cast<uint64_t>(region.pages_dirtied) +
+                                                      region.pages_swapped_out) * vm_page_size;
+                            auto& total = totals[{region.user_tag, (region.protection & VM_PROT_EXECUTE) != 0}];
+                            total.first += costing;
+                            total.second += 1;
+                            if (costing >= (16u << 20)) {
+                                FATHOM_ERROR("memory:   host region %#llx..%#llx tag %u prot %d: %llu MB dirty+compressed, "
+                                             "%llu MB resident of %llu MB",
+                                             static_cast<unsigned long long>(address),
+                                             static_cast<unsigned long long>(address + size), region.user_tag,
+                                             region.protection, static_cast<unsigned long long>(costing >> 20),
+                                             static_cast<unsigned long long>(
+                                                 (static_cast<uint64_t>(region.pages_resident) * vm_page_size) >> 20),
+                                             static_cast<unsigned long long>(size >> 20));
+                            }
+                            address += size;
+                        }
+                        for (const auto& [kind, total] : totals) {
+                            if (total.first >= (8u << 20)) {
+                                FATHOM_ERROR("memory:   tag %u%s: %llu MB dirty+compressed over %u regions", kind.first,
+                                             kind.second ? " (executable)" : "",
+                                             static_cast<unsigned long long>(total.first >> 20), total.second);
+                            }
+                        }
+                    }
+                    std::unique_lock lock {process_mutex, std::try_to_lock};
+                    if (lock.owns_lock()) {
+                        for (const auto& [pid, process] : processes) {
+                            if (process == nullptr || process->finished || process->space == nullptr) {
+                                continue;
+                            }
+                            // Committed says what the guest asked for; dirty says what it is
+                            // costing. A reservation the program never touches is the first and
+                            // not the second, and the difference is the whole question. Counted
+                            // from the host's regions, since a page the compressor took is still
+                            // paid for, and the guest ranges it lands in are named by guest address.
+                            const uint64_t base = process->space->Base();
+                            const uint64_t guest_base = process->space->GuestBase();
+                            const uint64_t limit_address = base + process->space->Size();
+                            uint64_t dirty_total = 0;
+                            unsigned regions = 0;
+                            vm_address_t cursor = base;
+                            uint64_t run_begin = 0;
+                            uint64_t run_dirty = 0;
+                            const auto flush_run = [&](uint64_t run_end) {
+                                if (run_dirty >= (16u << 20)) {
+                                    FATHOM_ERROR("memory:     guest %#llx..%#llx: %llu MB dirty+compressed",
+                                                 static_cast<unsigned long long>(run_begin - base + guest_base),
+                                                 static_cast<unsigned long long>(run_end - base + guest_base),
+                                                 static_cast<unsigned long long>(run_dirty >> 20));
+                                }
+                                run_dirty = 0;
+                            };
+                            while (cursor < limit_address) {
+                                vm_size_t size = 0;
+                                natural_t depth = 0;
+                                vm_region_submap_info_data_64_t region {};
+                                mach_msg_type_number_t region_count = VM_REGION_SUBMAP_INFO_COUNT_64;
+                                if (vm_region_recurse_64(mach_task_self(), &cursor, &size, &depth,
+                                                           reinterpret_cast<vm_region_recurse_info_t>(&region),
+                                                           &region_count) != KERN_SUCCESS || cursor >= limit_address) {
+                                    break;
+                                }
+                                const uint64_t costing = (static_cast<uint64_t>(region.pages_dirtied) +
+                                                          region.pages_swapped_out) * vm_page_size;
+                                regions += 1;
+                                dirty_total += costing;
+                                // Adjacent regions that cost something are reported as one run, so a
+                                // heap split into thousands of regions by per-page protection changes
+                                // reads as one line.
+                                if (run_dirty == 0) {
+                                    run_begin = cursor;
+                                } else if (costing == 0) {
+                                    flush_run(cursor);
+                                }
+                                run_dirty += costing;
+                                cursor += size;
+                            }
+                            flush_run(cursor);
+                            FATHOM_ERROR("memory:   pid %d %s: %llu MB committed, %llu MB dirty+compressed in %u regions",
+                                         pid, process->path.c_str(),
+                                         static_cast<unsigned long long>(process->space->CommittedBytes() >> 20),
+                                         static_cast<unsigned long long>(dirty_total >> 20), regions);
+                        }
+                    }
+                    fflush(nullptr);
+                    _exit(137);
+                }
+            }};
+        }
+    }
     const char* setting = getenv("FATHOM_WATCHDOG");
     if (setting == nullptr) {
         return;
@@ -1555,6 +1731,9 @@ void fathom_session::StopWatchdog() {
     if (watchdog.joinable()) {
         watchdog.join();
     }
+    if (memory_watchdog.joinable()) {
+        memory_watchdog.join();
+    }
 }
 
 int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack, bool shares_memory) {
@@ -1603,6 +1782,18 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack, bool shares_
             if (child_space == nullptr) {
                 FATHOM_ERROR("fork: no address space for pid %d's child: %s", caller_pid, reason.c_str());
                 return -11; // -EAGAIN
+            }
+            // vfork's bargain: the parent's other threads stand still until the child has
+            // exec'd or exited. Left running, every page they write while the copy is
+            // alive is duplicated for it -- a busy parent and a child that takes a second
+            // to reach exec under emulation together ate the machine's memory.
+            auto* caller_thread = fathom::FexEngine::Current();
+            if (caller_thread == nullptr) {
+                caller_thread = parent->thread.get();
+            }
+            static const bool freeze_for_copy = getenv("FATHOM_NO_FREEZE_COPY") == nullptr;
+            if (freeze_for_copy) {
+                FreezeOtherThreads(parent, caller_thread, true);
             }
             const auto started = std::chrono::steady_clock::now();
             size_t pieces = 0;
@@ -1673,8 +1864,8 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack, bool shares_
         // through its parent's frames, so there is nothing of the parent's to put back.
         uint64_t held = 0;
         if (copies) {
-            // Nothing borrowed, nothing to put back; the parent goes on at once.
-            child->released = true;
+            // Nothing borrowed and nothing to put back; the parent's threads stay still
+            // until the child's exec or exit releases them.
         } else if (stack != 0 && shares_memory) {
             FATHOM_INFO("fork: pid %d starts pid %d on its own stack %#llx", caller_pid,
                         child_pid, static_cast<unsigned long long>(stack));

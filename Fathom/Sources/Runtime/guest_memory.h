@@ -48,6 +48,9 @@ struct GuestRange {
     /// handed out again. A caller holding a copy of guest memory taken earlier can ask
     /// whether what is there now is still the same thing it copied.
     uint64_t epoch {};
+    /// Whether the range has ever been writable, so may hold anything. A range that
+    /// never was is a reservation the program has not used: nothing to copy for a fork.
+    bool written {};
 
     uint64_t end() const { return begin + size; }
 };
@@ -100,7 +103,21 @@ public:
     /// Records a mapping made inside the arena by other means -- a copy-on-write remap
     /// of another process's memory -- so the allocator never hands the span out and the
     /// guest can protect and release it like anything else.
-    bool AdoptCopiedMapping(uint64_t address, uint64_t size, int protection);
+    bool AdoptCopiedMapping(uint64_t address, uint64_t size, int protection, bool written = true);
+
+    /// The parts of [begin, end) that are committed right now. What a fixed mapping is
+    /// about to be placed over asks this first: those parts hold the old contents and
+    /// have to be zeroed by hand, where the free parts come back from the kernel as
+    /// fresh zero pages and must not be touched -- touching them is what makes a
+    /// gigabyte reservation cost a gigabyte.
+    std::vector<std::pair<uint64_t, uint64_t>> CommittedIn(uint64_t begin, uint64_t end) const;
+
+    /// Makes a committed, host-page-aligned range read as zero by mapping it fresh, so
+    /// the pages it held are given back rather than written over -- an anonymous mapping
+    /// placed over memory the program never touched costs nothing this way, where
+    /// zeroing it by hand made every page real. Left readable and writable; the caller
+    /// applies the protection it wants afterwards, as it does after a commit.
+    void DropPages(uint64_t address, uint64_t size);
 
     /// Releases a guest range. Host pages are returned to the kernel; the address range
     /// goes back on the free list.

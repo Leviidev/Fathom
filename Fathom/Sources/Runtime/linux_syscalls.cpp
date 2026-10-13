@@ -4138,6 +4138,16 @@ bool LinuxSyscalls::ProcFileContents(const std::string& guest_path, std::string*
 
 void LinuxSyscalls::SetCommandLine(std::vector<std::string> argv) {
     command_line_ = std::move(argv);
+    // FATHOM_TRACE_PROGRAM matches the arguments too: every Windows program is the same
+    // Wine loader by path, and only its command line says which one it is.
+    if (const char* wanted = getenv("FATHOM_TRACE_PROGRAM")) {
+        for (const auto& argument : command_line_) {
+            if (argument.find(wanted) != std::string::npos) {
+                config_.trace = true;
+                break;
+            }
+        }
+    }
     if (thread_name_.empty() && !command_line_.empty()) {
         const auto slash = command_line_.front().rfind('/');
         thread_name_ = slash == std::string::npos ? command_line_.front()

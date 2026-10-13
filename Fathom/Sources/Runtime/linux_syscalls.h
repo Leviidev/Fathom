@@ -23,6 +23,7 @@
 #include <sys/un.h>
 
 #include <atomic>
+#include <pthread.h>
 #include <memory>
 #include <condition_variable>
 #include <cstdint>
@@ -229,6 +230,25 @@ public:
     bool SignalPending() const {
         return (pending_signals_.load(std::memory_order_acquire) & ~signal_mask_) != 0;
     }
+    /// One entry of a process's signal table: what rt_sigaction installed.
+    struct SignalAction {
+        uint64_t handler {};
+        uint64_t flags {};
+        uint64_t restorer {};
+        uint64_t mask {};
+    };
+    /// The host thread this guest thread runs on, so a signal for it can interrupt the
+    /// JIT rather than wait for its next syscall.
+    void SetHostThread(pthread_t thread) { host_thread_ = thread; host_thread_set_ = true; }
+    /// Takes the next deliverable signal off the queue. Returns its number with the
+    /// action to run, or 0 when there is nothing to run -- an ignored signal is consumed
+    /// here, and one whose default is to die ends the process from here.
+    int TakePendingSignal(SignalAction* action, int* sender);
+    /// Writes a signal frame for `signal` below the stack in `state` and points `state`
+    /// at the handler. `state` is the thread's registers at the moment of delivery and
+    /// comes back as the registers to resume with. False if the frame could not be
+    /// written, in which case `state` is untouched.
+    bool PushSignalFrame(GuestCpuState* state, int signal, int sender, const SignalAction& action);
 
     void SetOutputCallback(OutputCallback callback, void* context) { console_.SetOutputCallback(callback, context); }
 
@@ -429,17 +449,12 @@ private:
     /// id, its own GuestThreadControl and its own exit status. Linux gives all of them
     /// one descriptor table and one heap, though, and a program that opens a file on one
     /// thread and reads it on another depends on precisely that.
+public:
     struct ProcessFiles {
         mutable std::mutex mutex;
         std::map<int, OpenFile> files;
         /// What the process asked to happen on each signal: rt_sigaction's answer, kept
         /// per process because a handler is shared by every thread of it.
-        struct SignalAction {
-            uint64_t handler {};
-            uint64_t flags {};
-            uint64_t restorer {};
-            uint64_t mask {};
-        };
         SignalAction signal_actions[65] {};
         std::string cwd {"/"};
         uint64_t heap_base {};
@@ -459,6 +474,7 @@ private:
         };
         std::vector<ImageRegion> image_data;
     };
+private:
 
     /// Lowest unused guest descriptor, which is the number open() and pipe() must return:
     /// a shell closes fd 0 and opens a file precisely because it knows it gets fd 0 back.
@@ -619,6 +635,8 @@ private:
     /// Set by a syscall that placed the instruction pointer itself (rt_sigreturn, exec),
     /// so the usual step past the syscall instruction is skipped.
     bool rip_placed_ {};
+    pthread_t host_thread_ {};
+    bool host_thread_set_ {};
     uint64_t HandleInner(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4,
                          uint64_t arg5, uint64_t arg6);
     uint64_t FinishSyscall(uint64_t guest_number, uint64_t result);

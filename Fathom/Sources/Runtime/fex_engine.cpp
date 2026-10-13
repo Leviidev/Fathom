@@ -603,6 +603,100 @@ bool EndFaultedGuestThread(int signal, siginfo_t* info, void* raw_context) {
 #endif
 }
 
+/// Whether FEXCore keeps the vector registers in its AVX layout (32 bytes each) rather
+/// than the SSE one (16 bytes, then padding). Read by the register capture below.
+std::atomic<bool> g_avx_layout {true};
+/// The delegator FEXCore configured with its dispatcher addresses and static-register
+/// mapping: what a host signal handler needs to drop a guest thread into its handler.
+std::atomic<FEXCore::SignalDelegator*> g_signal_delegator {nullptr};
+
+/// A guest signal for a thread that is in compiled code. The thread's registers live in
+/// host registers (FEXCore's static register allocation), so they are gathered from the
+/// interrupted host context into the frame, the guest rip is recovered from the host pc,
+/// the signal frame is written, and the host pc is pointed at the dispatcher's entry
+/// that reloads the registers and runs whatever rip now says -- the guest's handler.
+/// Inside a syscall nothing is done: the syscall's exit delivers. Anywhere else in the
+/// emulator's own code it is left for the next syscall exit too.
+void HandleGuestSignalNudge(int, siginfo_t*, void* raw_context) {
+#if defined(__aarch64__) && defined(__APPLE__)
+    const int saved_errno = errno;
+    auto* syscalls = g_current_syscalls;
+    auto* thread = g_active.thread;
+    auto* context = g_active.context;
+    auto* delegator = g_signal_delegator.load(std::memory_order_acquire);
+    auto* guest_thread = g_current_guest_thread;
+    if (syscalls == nullptr || thread == nullptr || context == nullptr || delegator == nullptr ||
+        guest_thread == nullptr || raw_context == nullptr || !syscalls->SignalPending() || syscalls->InRuntime()) {
+        errno = saved_errno;
+        return;
+    }
+    auto* host = static_cast<ucontext_t*>(raw_context);
+    auto& ss = host->uc_mcontext->__ss;
+    const auto pc = static_cast<uintptr_t>(arm_thread_state64_get_pc(ss));
+    if (!context->IsAddressInCodeBuffer(thread, pc)) {
+        errno = saved_errno;
+        return;
+    }
+    auto* frame = thread->CurrentFrame;
+    if (frame->InSyscallInfo != 0 || frame->State.DeferredSignalRefCount.Load() != 0) {
+        errno = saved_errno;
+        return;
+    }
+    const auto& config = delegator->GetConfig();
+    frame->State.rip = context->RestoreRIPFromHostPC(thread, pc);
+    for (size_t index = 0; index < config.SRAGPRCount; ++index) {
+        frame->State.gregs[index] = ss.__x[config.SRAGPRMapping[index]];
+    }
+    const bool avx = g_avx_layout.load(std::memory_order_relaxed);
+    auto& ns = host->uc_mcontext->__ns;
+    for (size_t index = 0; index < config.SRAFPRCount; ++index) {
+        const auto value = ns.__v[config.SRAFPRMapping[index]];
+        if (avx) {
+            std::memcpy(&frame->State.xmm.avx.data[index][0], &value, 16);
+        } else {
+            std::memcpy(&frame->State.xmm.sse.data[index][0], &value, 16);
+        }
+    }
+    const uint32_t eflags = context->ReconstructCompactedEFLAGS(thread, true, &ss.__x[0], ss.__cpsr);
+    context->SetFlagsFromCompactedEFLAGS(thread, eflags);
+
+    GuestCpuState state;
+    if (!guest_thread->CaptureCpuState(&state)) {
+        errno = saved_errno;
+        return;
+    }
+    LinuxSyscalls::SignalAction action;
+    int sender = 0;
+    const int signal = syscalls->TakePendingSignal(&action, &sender);
+    if (signal == 0 || !syscalls->PushSignalFrame(&state, signal, sender, action)) {
+        errno = saved_errno;
+        return;
+    }
+    guest_thread->RestoreCpuState(state);
+    FATHOM_INFO("[pid %d/%d] signal %d from pid %d -> handler %#llx in compiled code, frame %#llx, resumes at %#llx",
+                syscalls->Pid(), syscalls->Tid(), signal, sender, static_cast<unsigned long long>(action.handler),
+                static_cast<unsigned long long>(state.gregs[4]), static_cast<unsigned long long>(frame->State.rip));
+    // Back into the dispatcher: it reloads the registers from the frame and runs rip.
+    arm_thread_state64_set_pc_fptr(ss, reinterpret_cast<void*>(config.AbsoluteLoopTopAddressFillSRA));
+    ss.__x[28] = reinterpret_cast<uint64_t>(frame);
+    ss.__x[1] = 0;
+    errno = saved_errno;
+#else
+    (void)raw_context;
+#endif
+}
+
+void InstallGuestSignalNudge() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        struct sigaction action {};
+        action.sa_sigaction = HandleGuestSignalNudge;
+        action.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGUSR2, &action, nullptr);
+    });
+}
+
 class FathomSignalDelegator final : public FEXCore::SignalDelegator {
 public:
     uintptr_t GetThunkCallbackRET() const override {
@@ -1076,6 +1170,7 @@ RunResult GuestThread::Run() {
     g_current_syscalls = &impl_->syscalls;
     g_current_guest_thread = this;
     g_current_guest_base = impl_->guest_base;
+    impl_->syscalls.SetHostThread(pthread_self());
     // Timed, because a guest thread that takes seconds to reach its first instruction is
     // invisible from outside -- the process exists, its rip never moves -- and a forked
     // child that starts late is a child still standing in its parent's memory when the
@@ -1197,9 +1292,10 @@ bool GuestThread::CaptureCpuState(GuestCpuState* out) const {
     out->mxcsr = state.mxcsr;
     out->fs_base = state.fs_cached;
     out->gs_base = state.gs_cached;
+    const bool avx = g_avx_layout.load(std::memory_order_relaxed);
     for (size_t index = 0; index < 16; ++index) {
-        out->xmm[index][0] = state.xmm.sse.data[index][0];
-        out->xmm[index][1] = state.xmm.sse.data[index][1];
+        out->xmm[index][0] = avx ? state.xmm.avx.data[index][0] : state.xmm.sse.data[index][0];
+        out->xmm[index][1] = avx ? state.xmm.avx.data[index][1] : state.xmm.sse.data[index][1];
     }
     std::memcpy(out->mm, state.mm, sizeof(out->mm));
     out->fcw = state.FCW;
@@ -1216,9 +1312,15 @@ bool GuestThread::RestoreCpuState(const GuestCpuState& in) {
     state.rip = in.rip;
     impl_->context->SetFlagsFromCompactedEFLAGS(impl_->thread, in.eflags);
     state.mxcsr = in.mxcsr;
+    const bool avx = g_avx_layout.load(std::memory_order_relaxed);
     for (size_t index = 0; index < 16; ++index) {
-        state.xmm.sse.data[index][0] = in.xmm[index][0];
-        state.xmm.sse.data[index][1] = in.xmm[index][1];
+        if (avx) {
+            state.xmm.avx.data[index][0] = in.xmm[index][0];
+            state.xmm.avx.data[index][1] = in.xmm[index][1];
+        } else {
+            state.xmm.sse.data[index][0] = in.xmm[index][0];
+            state.xmm.sse.data[index][1] = in.xmm[index][1];
+        }
     }
     std::memcpy(state.mm, in.mm, sizeof(state.mm));
     state.FCW = in.fcw;
@@ -1376,6 +1478,9 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
     }
 
     impl->signals = std::make_unique<FathomSignalDelegator>();
+    g_signal_delegator.store(impl->signals.get(), std::memory_order_release);
+    g_avx_layout.store(impl->host_features.SupportsAVX, std::memory_order_release);
+    InstallGuestSignalNudge();
     impl->guest_is_32bit = options.guest_is_32bit;
     impl->handler = std::make_unique<FathomSyscallHandler>(space, options.guest_is_32bit);
     impl->context->SetSignalDelegator(impl->signals.get());

@@ -7144,6 +7144,12 @@ void LinuxSyscalls::QueueSignal(int signal, int sender) {
     }
     signal_senders_[signal] = sender;
     pending_signals_.fetch_or(uint64_t {1} << (signal - 1), std::memory_order_acq_rel);
+    // A thread sitting in the JIT would otherwise only notice at its next syscall. The
+    // host signal's handler delivers the frame in place when the thread is in compiled
+    // code, and does nothing when it is inside a syscall, where the exit path delivers.
+    if (host_thread_set_ && !pthread_equal(host_thread_, pthread_self())) {
+        pthread_kill(host_thread_, SIGUSR2);
+    }
 }
 
 uint64_t LinuxSyscalls::FinishSyscall(uint64_t guest_number, uint64_t result) {
@@ -7198,34 +7204,29 @@ void ReadFxsave(const unsigned char* in, GuestCpuState* state) {
 
 } // namespace
 
-uint64_t LinuxSyscalls::DeliverSignal(uint64_t guest_number, uint64_t result) {
-    const uint64_t ready = pending_signals_.load(std::memory_order_acquire) & ~signal_mask_;
-    if (ready == 0) {
-        return result;
-    }
-    const int signal = __builtin_ctzll(ready) + 1;
-    pending_signals_.fetch_and(~(uint64_t {1} << (signal - 1)), std::memory_order_acq_rel);
-    const int sender = signal_senders_[signal];
-
-    ProcessFiles::SignalAction action;
-    {
-        std::scoped_lock lock {shared_->mutex};
-        action = shared_->signal_actions[signal];
-        if ((action.flags & kSaResethand) != 0) {
-            shared_->signal_actions[signal] = ProcessFiles::SignalAction {};
+int LinuxSyscalls::TakePendingSignal(SignalAction* action_out, int* sender_out) {
+    for (;;) {
+        const uint64_t ready = pending_signals_.load(std::memory_order_acquire) & ~signal_mask_;
+        if (ready == 0) {
+            return 0;
         }
-    }
-
-    // What the interrupted syscall is to answer: restarted outright if the handler asked
-    // for that, EINTR otherwise. An ordinary result is simply kept.
-    const bool interrupted = static_cast<int64_t>(result) == -kErestartsys;
-    const auto restart = [&]() -> uint64_t {
-        control_.AdvanceGuestRip(-2);
-        return guest_number;
-    };
-
-    const bool handled = action.handler != 0 && action.handler != 1;
-    if (!handled) {
+        const int signal = __builtin_ctzll(ready) + 1;
+        pending_signals_.fetch_and(~(uint64_t {1} << (signal - 1)), std::memory_order_acq_rel);
+        const int sender = signal_senders_[signal];
+        SignalAction action;
+        {
+            std::scoped_lock lock {shared_->mutex};
+            action = shared_->signal_actions[signal];
+            if ((action.flags & kSaResethand) != 0) {
+                shared_->signal_actions[signal] = SignalAction {};
+            }
+        }
+        const bool handled = action.handler != 0 && action.handler != 1;
+        if (handled) {
+            *action_out = action;
+            *sender_out = sender;
+            return signal;
+        }
         if (action.handler == 0 && signal != kSigchld && signal != kSigurg && signal != kSigwinch) {
             // Default action: the process ends. SIGKILL and SIGTERM are what Wine sends a
             // process that will not go quietly.
@@ -7233,30 +7234,13 @@ uint64_t LinuxSyscalls::DeliverSignal(uint64_t guest_number, uint64_t result) {
             exit_status_ = 128 + signal;
             control_.ExitGuest(128 + signal);
         }
-        // Ignored: as if it never happened, which for a blocked syscall means carrying on.
-        return interrupted ? restart() : result;
+        // Ignored: as if it never happened. Look for another.
     }
+}
 
-    GuestCpuState state;
-    if (!control_.CaptureCpuState(&state)) {
-        FATHOM_WARN("[pid %d/%d] cannot deliver signal %d: no register access", pid_, Tid(), signal);
-        return interrupted ? FailLinux(4) : result;
-    }
-    // rip is already past the syscall instruction. The frame records where the handler
-    // returns to, and what the syscall answered.
-    uint64_t saved_rip = state.rip;
-    uint64_t saved_rax = result;
-    if (interrupted) {
-        if ((action.flags & kSaRestart) != 0) {
-            saved_rip -= 2;
-            saved_rax = guest_number;
-        } else {
-            saved_rax = static_cast<uint64_t>(-4); // EINTR
-        }
-    }
-    state.gregs[kRax] = saved_rax;
-    state.rip = saved_rip;
-
+bool LinuxSyscalls::PushSignalFrame(GuestCpuState* in_out, int signal, int sender,
+                                    const SignalAction& action) {
+    GuestCpuState state = *in_out;
     const uint64_t old_mask = signal_mask_;
     uint64_t sp = state.gregs[kRsp];
     bool on_altstack = false;
@@ -7290,12 +7274,11 @@ uint64_t LinuxSyscalls::DeliverSignal(uint64_t guest_number, uint64_t result) {
         if (frame == nullptr) {
             FATHOM_WARN("[pid %d/%d] signal %d: no room on the stack at %#llx", pid_, Tid(), signal,
                         static_cast<unsigned long long>(handler_sp));
-            return interrupted ? FailLinux(4) : result;
+            return false;
         }
         std::memset(frame, 0, fp_address + 512 - handler_sp);
         std::memcpy(frame, &action.restorer, 8);
         unsigned char* uc = frame + 8;
-        // uc_flags, uc_link: zero. uc_stack at 16.
         const uint64_t ss_sp = altstack_sp_;
         const int32_t ss_flags = altstack_disabled_ ? kSsDisable : 0;
         const uint64_t ss_size = altstack_size_;
@@ -7323,7 +7306,6 @@ uint64_t LinuxSyscalls::DeliverSignal(uint64_t guest_number, uint64_t result) {
         std::memcpy(uc + 40 + 23 * 8, &fp_address, 8);  // fpregs
         std::memcpy(uc + 40 + 256, &old_mask, 8);       // uc_sigmask
         WriteFxsave(frame + (fp_address - handler_sp), state);
-        // siginfo: signo, errno, code, then the sender.
         unsigned char* info = frame + (info_address - handler_sp);
         const int32_t signo = signal;
         const int32_t code = sender == pid_ ? kSiTkill : kSiUser;
@@ -7349,7 +7331,7 @@ uint64_t LinuxSyscalls::DeliverSignal(uint64_t guest_number, uint64_t result) {
         if (frame == nullptr) {
             FATHOM_WARN("[pid %d/%d] signal %d: no room on the stack at %#llx", pid_, Tid(), signal,
                         static_cast<unsigned long long>(handler_sp));
-            return interrupted ? FailLinux(4) : result;
+            return false;
         }
         std::memset(frame, 0, kFrameSize);
         const uint32_t restorer = static_cast<uint32_t>(action.restorer);
@@ -7367,9 +7349,6 @@ uint64_t LinuxSyscalls::DeliverSignal(uint64_t guest_number, uint64_t result) {
         std::memcpy(info + 8, &code, 4);
         std::memcpy(info + 12, &sender_pid, 4);
         unsigned char* uc = frame + 16 + 128;
-        // uc_flags, uc_link (4 each), uc_stack {sp, flags, size} (12), then sigcontext at 20:
-        // gs, fs, es, ds, edi, esi, ebp, esp, ebx, edx, ecx, eax, trapno, err, eip, cs,
-        // eflags, esp_at_signal, ss, fpstate, oldmask, cr2 -- 22 words. uc_sigmask at 108.
         const uint32_t ss_sp = static_cast<uint32_t>(altstack_sp_);
         const int32_t ss_flags = altstack_disabled_ ? kSsDisable : 0;
         const uint32_t ss_size = static_cast<uint32_t>(altstack_size_);
@@ -7377,7 +7356,7 @@ uint64_t LinuxSyscalls::DeliverSignal(uint64_t guest_number, uint64_t result) {
         std::memcpy(uc + 12, &ss_flags, 4);
         std::memcpy(uc + 16, &ss_size, 4);
         uint32_t* sc = reinterpret_cast<uint32_t*>(uc + 20);
-        sc[0] = 0;  // gs: the guest's selector is kept in the thread, not here
+        sc[0] = 0;
         sc[1] = 0;
         sc[2] = 0x2b;
         sc[3] = 0x2b;
@@ -7409,17 +7388,54 @@ uint64_t LinuxSyscalls::DeliverSignal(uint64_t guest_number, uint64_t result) {
     }
     state.eflags &= ~uint32_t {0x400}; // DF clear, as the ABI promises a handler
     state.rip = action.handler;
+    *in_out = state;
+    return true;
+}
+
+uint64_t LinuxSyscalls::DeliverSignal(uint64_t guest_number, uint64_t result) {
+    SignalAction action;
+    int sender = 0;
+    const int signal = TakePendingSignal(&action, &sender);
+    const bool interrupted = static_cast<int64_t>(result) == -kErestartsys;
+    if (signal == 0) {
+        if (interrupted) {
+            control_.AdvanceGuestRip(-2);
+            return guest_number; // Nothing ran: the syscall simply goes again.
+        }
+        return result;
+    }
+
+    GuestCpuState state;
+    if (!control_.CaptureCpuState(&state)) {
+        FATHOM_WARN("[pid %d/%d] cannot deliver signal %d: no register access", pid_, Tid(), signal);
+        return interrupted ? FailLinux(4) : result;
+    }
+    // rip is already past the syscall instruction. The frame records where the handler
+    // returns to, and what the syscall answered: restarted outright if the handler asked
+    // for that, EINTR otherwise.
+    uint64_t saved_rip = state.rip;
+    uint64_t saved_rax = result;
+    if (interrupted) {
+        if ((action.flags & kSaRestart) != 0) {
+            saved_rip -= 2;
+            saved_rax = guest_number;
+        } else {
+            saved_rax = static_cast<uint64_t>(-4); // EINTR
+        }
+    }
+    state.gregs[kRax] = saved_rax;
+    state.rip = saved_rip;
+    if (!PushSignalFrame(&state, signal, sender, action)) {
+        return interrupted ? FailLinux(4) : result;
+    }
     if (!control_.RestoreCpuState(state)) {
         FATHOM_WARN("[pid %d/%d] signal %d: could not switch to the handler", pid_, Tid(), signal);
-        signal_mask_ = old_mask;
         return interrupted ? FailLinux(4) : result;
     }
     rip_placed_ = true;
-    // Said out loud for now: signals are rare, and the first ones through here are the
-    // ones to watch.
-    FATHOM_INFO("[pid %d/%d] signal %d from pid %d -> handler %#llx, frame %#llx, resumes at %#llx%s", pid_, Tid(),
-                signal, sender, static_cast<unsigned long long>(action.handler),
-                static_cast<unsigned long long>(handler_sp), static_cast<unsigned long long>(saved_rip),
+    FATHOM_INFO("[pid %d/%d] signal %d from pid %d -> handler %#llx at syscall exit, frame %#llx, resumes at %#llx%s",
+                pid_, Tid(), signal, sender, static_cast<unsigned long long>(action.handler),
+                static_cast<unsigned long long>(state.gregs[kRsp]), static_cast<unsigned long long>(saved_rip),
                 interrupted ? ((action.flags & kSaRestart) != 0 ? " (syscall restarted)" : " (EINTR)") : "");
     return state.gregs[kRax];
 }
@@ -7495,7 +7511,7 @@ uint64_t LinuxSyscalls::DoRtSigaction(int signal, uint64_t act_address, uint64_t
     // x86-64: handler, flags, restorer, mask -- eight bytes each. i386: handler, flags,
     // restorer at four bytes, then the eight-byte mask.
     const size_t size = narrow ? 20 : 32;
-    ProcessFiles::SignalAction current;
+    SignalAction current;
     {
         std::scoped_lock lock {shared_->mutex};
         current = shared_->signal_actions[signal];
@@ -7529,7 +7545,7 @@ uint64_t LinuxSyscalls::DoRtSigaction(int signal, uint64_t act_address, uint64_t
         if (in == nullptr) {
             return FailLinux(14);
         }
-        ProcessFiles::SignalAction next;
+        SignalAction next;
         if (narrow) {
             uint32_t handler = 0;
             uint32_t flags = 0;

@@ -763,11 +763,15 @@ bool fathom_session::FreezeOtherThreads(GuestProcess* process, const fathom::Gue
     const auto freeze = [&](pthread_t host_thread, const fathom::LinuxSyscalls* syscalls, int tid) {
         const auto port = pthread_mach_thread_np(host_thread);
         if (port == MACH_PORT_NULL) {
+            FATHOM_WARN("fork: tid %d of pid %d has no mach port; its host thread is gone", tid, process->pid);
             all_stopped = false;
             return;
         }
         for (int attempt = 0; attempt < 200; ++attempt) {
-            if (thread_suspend(port) != KERN_SUCCESS) {
+            const auto suspended = thread_suspend(port);
+            if (suspended != KERN_SUCCESS) {
+                FATHOM_WARN("fork: tid %d of pid %d would not suspend: kern_return %d", tid, process->pid,
+                            static_cast<int>(suspended));
                 all_stopped = false;
                 return;
             }

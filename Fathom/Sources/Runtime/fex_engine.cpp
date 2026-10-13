@@ -1524,7 +1524,7 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
 
 std::unique_ptr<GuestThread> FexEngine::StartThread(uint64_t rip, uint64_t rsp, LinuxSyscalls& syscalls,
                                                     std::string& error) {
-    auto impl = std::make_unique<GuestThread::Impl>(impl_->context.get(), syscalls, impl_->guest_is_32bit);
+    auto impl = std::make_unique<GuestThread::Impl>(impl_->context.get(), impl_->signals.get(), syscalls, impl_->guest_is_32bit);
 
     impl->callret = std::make_unique<CallRetStack>();
     if (!impl->callret->valid()) {
@@ -1569,7 +1569,7 @@ std::unique_ptr<GuestThread> FexEngine::ForkThread(const GuestThread& parent, Li
                                                    std::string& error, uint64_t new_rsp) {
     const auto& parent_state = parent.impl_->thread->CurrentFrame->State;
 
-    auto impl = std::make_unique<GuestThread::Impl>(impl_->context.get(), syscalls, impl_->guest_is_32bit);
+    auto impl = std::make_unique<GuestThread::Impl>(impl_->context.get(), impl_->signals.get(), syscalls, impl_->guest_is_32bit);
     impl->callret = std::make_unique<CallRetStack>();
     if (!impl->callret->valid()) {
         error = std::string {"could not reserve the child's call/return stack: "} +

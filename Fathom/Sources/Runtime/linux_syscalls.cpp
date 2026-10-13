@@ -52,6 +52,14 @@ bool TraceNet() {
     return enabled;
 }
 
+/// FATHOM_TRACE_FS=1: every rename, link, unlink and mkdir, with the guest's paths and
+/// the answer, in every process. An installer that silently leaves nothing behind is
+/// one of these refused somewhere in the middle.
+bool TraceFs() {
+    static const bool enabled = getenv("FATHOM_TRACE_FS") != nullptr;
+    return enabled;
+}
+
 void TraceNetBytes(int pid, const char* what, int fd, const void* data, size_t length, ssize_t result) {
     char hex[64] = "";
     const auto* bytes = static_cast<const unsigned char*>(data);
@@ -240,9 +248,15 @@ enum : uint64_t {
     kSysWait4 = 61,
     kSysFlock = 73,
     kSysFchdir = 81,
+    kSysSetxattr = 188,
+    kSysLsetxattr = 189,
+    kSysFsetxattr = 190,
     kSysGetxattr = 191,
     kSysLgetxattr = 192,
     kSysFgetxattr = 193,
+    kSysRemovexattr = 197,
+    kSysLremovexattr = 198,
+    kSysFremovexattr = 199,
     kSysListxattr = 194,
     kSysLlistxattr = 195,
     kSysFlistxattr = 196,
@@ -721,9 +735,15 @@ const char* SyscallName(uint64_t number) {
     case kSysFchmod: return "fchmod";
     case kSysFchmodat: return "fchmodat";
     case kSysUtimensat: return "utimensat";
+    case kSysSetxattr: return "setxattr";
+    case kSysLsetxattr: return "lsetxattr";
+    case kSysFsetxattr: return "fsetxattr";
     case kSysGetxattr: return "getxattr";
     case kSysLgetxattr: return "lgetxattr";
     case kSysFgetxattr: return "fgetxattr";
+    case kSysRemovexattr: return "removexattr";
+    case kSysLremovexattr: return "lremovexattr";
+    case kSysFremovexattr: return "fremovexattr";
     case kSysListxattr: return "listxattr";
     case kSysLlistxattr: return "llistxattr";
     case kSysFlistxattr: return "flistxattr";
@@ -5010,7 +5030,7 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                                                 path.c_str(), nullptr);
         const auto mode = static_cast<mode_t>(is_at ? arg3 : arg2);
         const int made = mkdir(host_path.c_str(), mode);
-        if (config_.trace) {
+        if (config_.trace || TraceFs()) {
             FATHOM_INFO("[pid %d] mkdir %s mode %#o -> %s", pid_, path.c_str(), static_cast<unsigned>(mode),
                         made == 0 ? "ok" : std::strerror(errno));
         }
@@ -5031,6 +5051,10 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                                                 path.c_str(), nullptr, false);
         const bool remove_directory = is_at && (arg3 & 0x200) != 0; // AT_REMOVEDIR
         const int result = remove_directory ? rmdir(host_path.c_str()) : unlink(host_path.c_str());
+        if (TraceFs()) {
+            FATHOM_INFO("[pid %d] fs %s %s -> %s", pid_, remove_directory ? "rmdir" : "unlink", path.c_str(),
+                        result == 0 ? "ok" : std::strerror(errno));
+        }
         if (result == 0) {
             return 0;
         }
@@ -6608,9 +6632,17 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         const std::string from = ResolveAt(old_dirfd, old_path.c_str(), nullptr, false);
         const std::string to = ResolveAt(new_dirfd, new_path.c_str(), nullptr, false);
         if ((flags & kRenameNoreplace) != 0 && access(to.c_str(), F_OK) == 0) {
+            if (TraceFs()) {
+                FATHOM_INFO("[pid %d] fs rename %s -> %s (noreplace) -> EEXIST", pid_, old_path.c_str(), new_path.c_str());
+            }
             return FailLinux(17); // EEXIST
         }
-        return rename(from.c_str(), to.c_str()) != 0 ? Fail(errno) : 0;
+        const int result = rename(from.c_str(), to.c_str());
+        if (TraceFs()) {
+            FATHOM_INFO("[pid %d] fs rename %s -> %s (flags %#llx) -> %s", pid_, old_path.c_str(), new_path.c_str(),
+                        static_cast<unsigned long long>(flags), result != 0 ? std::strerror(errno) : "ok");
+        }
+        return result != 0 ? Fail(errno) : 0;
     }
 
     case kSysSymlink:
@@ -6691,6 +6723,18 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     case kSysLlistxattr:
     case kSysFlistxattr:
         return 0;  // An empty list of attributes.
+
+    // No attributes are kept, so none can be set and none is there to remove. Wine
+    // stores a file's DOS attributes this way on every file it creates and takes the
+    // refusal quietly; ENOSYS, on the other hand, it reports once per file.
+    case kSysSetxattr:
+    case kSysLsetxattr:
+    case kSysFsetxattr:
+        return FailLinux(95); // EOPNOTSUPP
+    case kSysRemovexattr:
+    case kSysLremovexattr:
+    case kSysFremovexattr:
+        return FailLinux(61); // ENODATA
 
     case kSysFchdir: {
         // The working directory is tracked as a guest path, not as a host descriptor, so

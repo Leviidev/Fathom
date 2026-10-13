@@ -1163,6 +1163,16 @@ void LinuxSyscalls::SetProcess(int pid, int ppid, ProcessHost* host) {
     }
 }
 
+void LinuxSyscalls::RebaseHostRecords(int64_t delta) {
+    std::scoped_lock lock {shared_->mutex};
+    for (auto& [begin, length] : shared_->mappings) {
+        begin = static_cast<uint64_t>(static_cast<int64_t>(begin) + delta);
+    }
+    for (auto& region : shared_->image_data) {
+        region.begin = static_cast<uint64_t>(static_cast<int64_t>(region.begin) + delta);
+    }
+}
+
 void LinuxSyscalls::CloneInto(LinuxSyscalls& child) const {
     std::scoped_lock lock {shared_->mutex};
     // Every descriptor is dup'd rather than shared outright: the child must be able to
@@ -1417,7 +1427,9 @@ void* LinuxSyscalls::GuestPointer(uint64_t address, uint64_t size, bool writable
     // reason the guest can see. Whether the memory exists at all is the thing this can
     // answer accurately, and it is what catches a genuinely wild pointer.
     (void)writable;
-    if (!space_->Validate(address, size, kGuestProtRead)) {
+    // Inside the host signal handler nothing may lock, and the check would. The
+    // addresses asked for there are the thread's own stack, which is mapped.
+    if (!in_host_handler_ && !space_->Validate(address, size, kGuestProtRead)) {
         return nullptr;
     }
     return reinterpret_cast<void*>(address);
@@ -7214,7 +7226,12 @@ int LinuxSyscalls::TakePendingSignal(SignalAction* action_out, int* sender_out) 
         pending_signals_.fetch_and(~(uint64_t {1} << (signal - 1)), std::memory_order_acq_rel);
         const int sender = signal_senders_[signal];
         SignalAction action;
-        {
+        if (in_host_handler_) {
+            action = shared_->signal_actions[signal];
+            if ((action.flags & kSaResethand) != 0) {
+                shared_->signal_actions[signal] = SignalAction {};
+            }
+        } else {
             std::scoped_lock lock {shared_->mutex};
             action = shared_->signal_actions[signal];
             if ((action.flags & kSaResethand) != 0) {

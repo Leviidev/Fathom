@@ -97,6 +97,10 @@ public:
     /// memory for every purpose (validation, executable-range queries) and is unmapped
     /// when the address space is torn down.
     bool AdoptExternalMapping(uint64_t address, uint64_t size, int protection);
+    /// Records a mapping made inside the arena by other means -- a copy-on-write remap
+    /// of another process's memory -- so the allocator never hands the span out and the
+    /// guest can protect and release it like anything else.
+    bool AdoptCopiedMapping(uint64_t address, uint64_t size, int protection);
 
     /// Releases a guest range. Host pages are returned to the kernel; the address range
     /// goes back on the free list.

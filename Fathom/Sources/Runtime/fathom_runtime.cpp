@@ -18,6 +18,7 @@
 #include <dlfcn.h>
 #include <mach/arm/thread_status.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach/thread_act.h>
 #include <pthread.h>
 
@@ -419,6 +420,10 @@ struct fathom_session final : fathom::ProcessHost {
     std::mutex arenas_mutex;
     /// A new 4GB space and JIT context for a 32-bit program.
     fathom::GuestAddressSpace* NewArena(bool is_32bit, std::string& error);
+    /// Frees the spaces (and JIT contexts) only this finished process was using: a
+    /// fork's copy, an exec's image. Each is a terabyte or two of address space, and a
+    /// Steam session spawns dozens of processes.
+    void ReleaseOwnArenas(GuestProcess* process);
     /// 64-bit programs get a relocated space of their own too, the way 32-bit ones do. 64-bit Wine needs this: it puts
     /// Windows' shared user data at 0x7ffe0000 and its PE images just above 4GB, and nothing in a Darwin process can
     /// live below 4GB. FATHOM_RELOCATE64=1 turns it on.
@@ -608,6 +613,59 @@ struct ChildStart {
 
 void* RunChildThread(void* raw);
 
+/// Gives `to` a copy-on-write copy of everything committed in `from`, at the same offsets.
+/// Shared file views stay shared, the way a fork leaves them. Returns the bytes covered.
+uint64_t CopyAddressSpace(fathom::GuestAddressSpace& from, fathom::GuestAddressSpace& to, size_t* pieces_out) {
+    const int64_t delta = static_cast<int64_t>(to.Base()) - static_cast<int64_t>(from.Base());
+    const uint64_t page = from.HostPageSize();
+    auto shared = fathom::LinuxSyscalls::SharedRangesIn(from.Base(), from.Base() + from.Size());
+    std::sort(shared.begin(), shared.end());
+    uint64_t covered = 0;
+    size_t pieces = 0;
+    const auto remap = [&](uint64_t begin, uint64_t end, int protection, bool copy) {
+        begin &= ~(page - 1);
+        end = (end + page - 1) & ~(page - 1);
+        if (end <= begin) {
+            return;
+        }
+        mach_vm_address_t target = static_cast<mach_vm_address_t>(static_cast<int64_t>(begin) + delta);
+        vm_prot_t current = 0;
+        vm_prot_t maximum = 0;
+        const auto result = mach_vm_remap(mach_task_self(), &target, end - begin, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                          mach_task_self(), begin, copy ? TRUE : FALSE, &current, &maximum,
+                                          VM_INHERIT_NONE);
+        if (result != KERN_SUCCESS) {
+            FATHOM_WARN("fork: could not copy %#llx..%#llx into the child: %s", static_cast<unsigned long long>(begin),
+                        static_cast<unsigned long long>(end), mach_error_string(result));
+            return;
+        }
+        int host_protection = 0;
+        if ((protection & fathom::kGuestProtRead) != 0) host_protection |= PROT_READ;
+        if ((protection & fathom::kGuestProtWrite) != 0) host_protection |= PROT_READ | PROT_WRITE;
+        mprotect(reinterpret_cast<void*>(target), end - begin, host_protection);
+        to.AdoptCopiedMapping(static_cast<uint64_t>(target), end - begin, protection);
+        covered += end - begin;
+        ++pieces;
+    };
+    for (const auto& range : from.Snapshot()) {
+        uint64_t cursor = range.begin;
+        const uint64_t finish = range.end();
+        for (const auto& [shared_begin, shared_end] : shared) {
+            if (shared_end <= cursor || shared_begin >= finish) {
+                continue;
+            }
+            remap(cursor, std::min(shared_begin, finish), range.protection, true);
+            remap(std::max(cursor, shared_begin), std::min(shared_end, finish), range.protection, false);
+            cursor = std::max(cursor, shared_end);
+        }
+        remap(cursor, finish, range.protection, true);
+    }
+    if (pieces_out != nullptr) {
+        *pieces_out = pieces;
+    }
+    return covered;
+}
+
 } // namespace
 
 fathom::FexEngine* fathom_session::EngineFor(bool is_32bit, std::string& error) {
@@ -657,6 +715,55 @@ fathom::GuestAddressSpace* fathom_session::NewArena(bool is_32bit, std::string& 
     std::scoped_lock lock {arenas_mutex};
     arenas32.push_back(std::move(arena));
     return space_ptr;
+}
+
+void fathom_session::ReleaseOwnArenas(GuestProcess* process) {
+    std::vector<fathom::GuestAddressSpace*> candidates {process->space, process->previous_space};
+    std::vector<std::unique_ptr<Arena32>> doomed;
+    {
+        std::scoped_lock lock {process_mutex, arenas_mutex};
+        for (auto* candidate : candidates) {
+            if (candidate == nullptr || candidate == space.get()) {
+                continue;
+            }
+            bool used = false;
+            for (auto& [pid, other] : processes) {
+                if (other.get() == process) {
+                    continue;
+                }
+                if (!other->finished && (other->space == candidate || other->borrowed_space == candidate ||
+                                         other->previous_space == candidate)) {
+                    used = true;
+                    break;
+                }
+            }
+            if (used) {
+                continue;
+            }
+            for (auto it = arenas32.begin(); it != arenas32.end(); ++it) {
+                if ((*it)->space.get() == candidate) {
+                    doomed.push_back(std::move(*it));
+                    arenas32.erase(it);
+                    break;
+                }
+            }
+        }
+        if (!doomed.empty()) {
+            // The guest threads hold FEXCore state that belongs to the context about to go.
+            process->thread.reset();
+            for (auto& record : process->threads) {
+                record->thread.reset();
+            }
+            if (process->space != space.get()) process->space = nullptr;
+            process->previous_space = nullptr;
+        }
+    }
+    for (auto& arena : doomed) {
+        FATHOM_INFO("pid %d: releasing its %llu GB space at %#llx", process->pid,
+                    static_cast<unsigned long long>(arena->space->Size() >> 30),
+                    static_cast<unsigned long long>(arena->space->Base()));
+        arena.reset();
+    }
 }
 
 fathom::FexEngine* fathom_session::EngineIn(fathom::GuestAddressSpace* in, bool is_32bit, std::string& error) {
@@ -1481,6 +1588,31 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack, bool shares_
         child->guest_base = parent->guest_base;
         child->owns_program = false;
         child->control = std::make_unique<DeferredThreadControl>();
+        // A fork gets its own copy of the parent's memory, copy-on-write, in a space of
+        // its own -- what fork means. Borrowing the parent's memory instead, as this
+        // used to, meant the child's C library rewrote the parent's malloc bookkeeping
+        // and thread list on its way to exec, and the parent died of it later, when one
+        // of its threads exited. A clone that asks to share memory on a stack of its own
+        // (vfork) still borrows.
+        static const bool cow_forks = getenv("FATHOM_NO_COW_FORK") == nullptr;
+        const bool copies = cow_forks && !(stack != 0 && shares_memory);
+        fathom::GuestAddressSpace* child_space = parent->space;
+        std::string reason;
+        if (copies) {
+            child_space = NewArena(parent->is_32bit, reason);
+            if (child_space == nullptr) {
+                FATHOM_ERROR("fork: no address space for pid %d's child: %s", caller_pid, reason.c_str());
+                return -11; // -EAGAIN
+            }
+            const auto started = std::chrono::steady_clock::now();
+            size_t pieces = 0;
+            const uint64_t covered = CopyAddressSpace(*parent->space, *child_space, &pieces);
+            const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+            FATHOM_INFO("fork: pid %d gets a copy-on-write copy of pid %d's %llu MB in %zu pieces (%lld ms) at %#llx",
+                        child_pid, caller_pid, static_cast<unsigned long long>(covered >> 20), pieces,
+                        static_cast<long long>(took), static_cast<unsigned long long>(child_space->Base()));
+        }
+        const uint64_t child_base = copies ? child_space->Base() : parent->guest_base;
 
         fathom::SyscallConfig child_config;
         child_config.guest_root = guest_root;
@@ -1489,12 +1621,17 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack, bool shares_
         // the interesting thing is what the child did.
         child_config.trace = trace;
         child_config.guest_is_32bit = parent->is_32bit;
-        child_config.guest_base = parent->guest_base;
-        child->space = parent->space;
-        child->borrowed_space = parent->space;
-        child->syscalls = std::make_unique<fathom::LinuxSyscalls>(*parent->space, *child->control, console,
+        child_config.guest_base = child_base;
+        child->space = child_space;
+        child->guest_base = child_base;
+        child->borrowed_space = copies ? nullptr : parent->space;
+        child->syscalls = std::make_unique<fathom::LinuxSyscalls>(*child_space, *child->control, console,
                                                                   child_config);
         parent->syscalls->CloneInto(*child->syscalls);
+        if (copies) {
+            child->syscalls->RebaseHostRecords(static_cast<int64_t>(child_space->Base()) -
+                                               static_cast<int64_t>(parent->space->Base()));
+        }
         child->syscalls->SetProcess(child_pid, caller_pid, this);
 
         // As in CreateThread: the registers a fork copies are the calling thread's, and a
@@ -1503,9 +1640,7 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack, bool shares_
         if (caller == nullptr) {
             caller = parent->thread.get();
         }
-
-        std::string reason;
-        auto* engine = EngineIn(parent->space, parent->is_32bit, reason);
+        auto* engine = EngineIn(child_space, parent->is_32bit, reason);
         child->thread = engine == nullptr
                             ? nullptr
                             : engine->ForkThread(*caller, *child->syscalls, reason, stack);
@@ -1537,7 +1672,10 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack, bool shares_
         // Nothing is held when the child was given a stack of its own: it never returns
         // through its parent's frames, so there is nothing of the parent's to put back.
         uint64_t held = 0;
-        if (stack != 0 && shares_memory) {
+        if (copies) {
+            // Nothing borrowed, nothing to put back; the parent goes on at once.
+            child->released = true;
+        } else if (stack != 0 && shares_memory) {
             FATHOM_INFO("fork: pid %d starts pid %d on its own stack %#llx", caller_pid,
                         child_pid, static_cast<unsigned long long>(stack));
         } else {
@@ -2086,6 +2224,7 @@ void* RunChildThread(void* raw) {
         process->released = true;
     }
     session->process_changed.notify_all();
+    session->ReleaseOwnArenas(process);
     return nullptr;
 }
 

@@ -119,6 +119,18 @@ GuestAddressSpace::~GuestAddressSpace() {
     }
 }
 
+bool GuestAddressSpace::AdoptCopiedMapping(uint64_t address, uint64_t size, int protection) {
+    if (size == 0 || address < base_ || address + size > base_ + size_) {
+        return false;
+    }
+    std::unique_lock lock {mutex_};
+    if (!TakeFreeExtent(address, size)) {
+        return false;
+    }
+    RecordCommitted(address, size, protection);
+    return true;
+}
+
 bool GuestAddressSpace::AdoptExternalMapping(uint64_t address, uint64_t size, int protection) {
     if (size == 0) {
         return false;

@@ -609,6 +609,9 @@ std::atomic<bool> g_avx_layout {true};
 /// The delegator FEXCore configured with its dispatcher addresses and static-register
 /// mapping: what a host signal handler needs to drop a guest thread into its handler.
 std::atomic<FEXCore::SignalDelegator*> g_signal_delegator {nullptr};
+/// Signals delivered straight into compiled code, counted because the handler that
+/// does it cannot log.
+std::atomic<uint64_t> g_compiled_deliveries {0};
 
 /// A guest signal for a thread that is in compiled code. The thread's registers live in
 /// host registers (FEXCore's static register allocation), so they are gathered from the
@@ -665,17 +668,20 @@ void HandleGuestSignalNudge(int, siginfo_t*, void* raw_context) {
         errno = saved_errno;
         return;
     }
+    // No lock and no log from here on: this is a signal handler, and the thread it
+    // interrupted may hold any of them.
+    syscalls->SetInHostHandler(true);
     LinuxSyscalls::SignalAction action;
     int sender = 0;
     const int signal = syscalls->TakePendingSignal(&action, &sender);
-    if (signal == 0 || !syscalls->PushSignalFrame(&state, signal, sender, action)) {
+    const bool pushed = signal != 0 && syscalls->PushSignalFrame(&state, signal, sender, action);
+    syscalls->SetInHostHandler(false);
+    if (!pushed) {
         errno = saved_errno;
         return;
     }
     guest_thread->RestoreCpuState(state);
-    FATHOM_INFO("[pid %d/%d] signal %d from pid %d -> handler %#llx in compiled code, frame %#llx, resumes at %#llx",
-                syscalls->Pid(), syscalls->Tid(), signal, sender, static_cast<unsigned long long>(action.handler),
-                static_cast<unsigned long long>(state.gregs[4]), static_cast<unsigned long long>(frame->State.rip));
+    g_compiled_deliveries.fetch_add(1, std::memory_order_relaxed);
     // Back into the dispatcher: it reloads the registers from the frame and runs rip.
     arm_thread_state64_set_pc_fptr(ss, reinterpret_cast<void*>(config.AbsoluteLoopTopAddressFillSRA));
     ss.__x[28] = reinterpret_cast<uint64_t>(frame);

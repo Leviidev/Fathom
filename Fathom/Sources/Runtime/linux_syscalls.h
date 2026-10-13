@@ -192,6 +192,9 @@ public:
     /// Duplicates this process's open files, working directory and heap into `child`,
     /// which is what a fork inherits.
     void CloneInto(LinuxSyscalls& child) const;
+    /// After CloneInto for a child living in its own copy of the memory: the records kept
+    /// in host addresses (mappings, image data) move with it.
+    void RebaseHostRecords(int64_t delta);
 
     /// Points `thread` at this process's own descriptor table and heap rather than a copy.
     /// This is the difference between a fork and a thread, and it is the whole of it as
@@ -240,6 +243,9 @@ public:
     /// The host thread this guest thread runs on, so a signal for it can interrupt the
     /// JIT rather than wait for its next syscall.
     void SetHostThread(pthread_t thread) { host_thread_ = thread; host_thread_set_ = true; }
+    /// Marks the host signal handler's delivery: no lock may be taken in it, so the
+    /// guest-pointer check and the action table are read bare while this is set.
+    void SetInHostHandler(bool in) { in_host_handler_ = in; }
     /// Takes the next deliverable signal off the queue. Returns its number with the
     /// action to run, or 0 when there is nothing to run -- an ignored signal is consumed
     /// here, and one whose default is to die ends the process from here.
@@ -637,6 +643,7 @@ private:
     bool rip_placed_ {};
     pthread_t host_thread_ {};
     bool host_thread_set_ {};
+    bool in_host_handler_ {};
     uint64_t HandleInner(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4,
                          uint64_t arg5, uint64_t arg6);
     uint64_t FinishSyscall(uint64_t guest_number, uint64_t result);

@@ -588,17 +588,12 @@ bool EndFaultedGuestThread(int signal, siginfo_t* info, void* raw_context) {
     // memory nothing is mapped at, and from outside they look identical.
     if (info != nullptr) {
         const auto address = reinterpret_cast<uint64_t>(info->si_addr);
-        auto* space = g_arena_space.load(std::memory_order_acquire);
-        fathom::GuestRange range {};
-        if (space != nullptr && space->RangeForNoWait(address, &range)) {
-            FATHOM_WARN("guest fault at %#llx: mapped %#llx..%#llx, protection %d",
-                        static_cast<unsigned long long>(address),
-                        static_cast<unsigned long long>(range.begin),
-                        static_cast<unsigned long long>(range.end()), range.protection);
-        } else {
-            FATHOM_WARN("guest fault at %#llx: nothing is mapped there",
-                        static_cast<unsigned long long>(address));
-        }
+        // The lock-free map only: this is a signal handler, and the range list's shared_mutex
+        // blocks inside libc++ even when asked to try -- on a destroyed one it throws.
+        auto* space = g_current_syscalls != nullptr ? g_current_syscalls->Space() : nullptr;
+        FATHOM_WARN("guest fault at %#llx: %s", static_cast<unsigned long long>(address),
+                    space != nullptr && space->MaybeCommitted(address) ? "inside memory the guest was given"
+                                                                       : "nothing is mapped there");
     }
     return g_current_guest_thread->EndOnFault(signal);
 #else

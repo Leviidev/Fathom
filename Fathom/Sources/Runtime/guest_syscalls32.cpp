@@ -37,6 +37,7 @@ int64_t X86_64SyscallForI386(uint64_t i386_number) {
         {60, 95},    // umask
         {63, 33},    // dup2
         {64, 110},   // getppid
+        {77, 98},    // getrusage
         {78, 96},    // gettimeofday
         {83, 88},    // symlink
         {85, 89},    // readlink

@@ -4,7 +4,9 @@
 #include "guest_syscalls32.h"
 #include "guest_path.h"
 
+#include <mach/mach.h>
 #include <poll.h>
+#include <sys/resource.h>
 
 #include "crash_handler.h"
 #include "fathom_log.h"
@@ -265,6 +267,7 @@ enum : uint64_t {
     kSysUmask = 95,
     kSysGettimeofday = 96,
     kSysGetrlimit = 97,
+    kSysGetrusage = 98,
     kSysSysinfo = 99,
     kSysGetuid = 102,
     kSysGetgid = 104,
@@ -755,6 +758,7 @@ const char* SyscallName(uint64_t number) {
     case kSysReadlink: return "readlink";
     case kSysGettimeofday: return "gettimeofday";
     case kSysGetrlimit: return "getrlimit";
+    case kSysGetrusage: return "getrusage";
     case kSysSetuid: return "setuid";
     case kSysSetgid: return "setgid";
     case kSysGetuid: return "getuid";
@@ -5346,6 +5350,55 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         // that installs a handler simply never has it called -- which is materially
         // better than refusing the call and sending its libc down an error path.
         return 0;
+
+    case kSysGetrusage: {
+        // Two timevals and fourteen longs, every one of them half the width on i386: 72
+        // bytes there, 144 here. Wine asks for RUSAGE_THREAD on every thread-time query,
+        // and Steam asks that often enough that an ENOSYS a line at a time fills a disk.
+        constexpr int kRusageThread = 1;
+        const bool narrow = config_.guest_is_32bit;
+        const size_t width = narrow ? 4 : 8;
+        const size_t size = width * 18;
+        auto* out = static_cast<uint8_t*>(GuestPointer(arg2, size, true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        std::memset(out, 0, size);
+        struct rusage usage {};
+        const int who = static_cast<int32_t>(arg1);
+        if (who == kRusageThread) {
+            // Darwin has no per-thread rusage; the thread's own CPU time is close enough.
+            mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+            thread_basic_info_data_t info {};
+            if (thread_info(mach_thread_self(), THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info),
+                            &count) == KERN_SUCCESS) {
+                usage.ru_utime.tv_sec = info.user_time.seconds;
+                usage.ru_utime.tv_usec = info.user_time.microseconds;
+                usage.ru_stime.tv_sec = info.system_time.seconds;
+                usage.ru_stime.tv_usec = info.system_time.microseconds;
+            }
+        } else if (getrusage(who == -1 ? RUSAGE_CHILDREN : RUSAGE_SELF, &usage) != 0) {
+            return FailLinux(22);
+        }
+        const auto put = [&](size_t index, uint64_t value) {
+            if (narrow) {
+                const auto v = static_cast<uint32_t>(value);
+                std::memcpy(out + index * 4, &v, 4);
+            } else {
+                std::memcpy(out + index * 8, &value, 8);
+            }
+        };
+        put(0, static_cast<uint64_t>(usage.ru_utime.tv_sec));
+        put(1, static_cast<uint64_t>(usage.ru_utime.tv_usec));
+        put(2, static_cast<uint64_t>(usage.ru_stime.tv_sec));
+        put(3, static_cast<uint64_t>(usage.ru_stime.tv_usec));
+        put(4, static_cast<uint64_t>(usage.ru_maxrss / 1024)); // Linux reports kilobytes
+        put(10, static_cast<uint64_t>(usage.ru_minflt));
+        put(11, static_cast<uint64_t>(usage.ru_majflt));
+        put(14, static_cast<uint64_t>(usage.ru_nvcsw));
+        put(15, static_cast<uint64_t>(usage.ru_nivcsw));
+        return 0;
+    }
 
     case kSysGetrlimit:
     case kSysPrlimit64: {

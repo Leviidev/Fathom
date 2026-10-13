@@ -1126,7 +1126,8 @@ int64_t fathom_session::CreateThread(int caller_pid, uint64_t flags, uint64_t st
         fathom::SyscallConfig thread_config;
         thread_config.guest_root = guest_root;
         thread_config.work_dir = "/";
-        thread_config.trace = trace;
+        // A traced program's threads are traced too, whichever way the program was picked.
+        thread_config.trace = trace || process->syscalls->Tracing();
         thread_config.guest_is_32bit = process->is_32bit;
         thread_config.guest_base = process->guest_base;
         record->syscalls = std::make_unique<fathom::LinuxSyscalls>(*process->space, *record->control, console,

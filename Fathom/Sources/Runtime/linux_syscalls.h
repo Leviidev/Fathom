@@ -205,6 +205,7 @@ public:
 
     /// Asks every guest process to stop at its next syscall. Safe from any thread.
     void RequestStop() { console_.RequestStop(); }
+    bool Tracing() const { return config_.trace; }
     bool StopRequested() const { return console_.StopRequested(); }
 
     /// Asks the threads of *this* process to stop, without touching any other process.

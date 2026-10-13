@@ -544,11 +544,12 @@ struct fathom_session final : fathom::ProcessHost {
         if (signal == 0) {
             return true; // Only asking whether it exists.
         }
-        // SIGKILL cannot be caught: the whole process stops, from here.
+        // SIGKILL cannot be caught. It is also not acted on yet: Wine's server sends it to
+        // a unix process whose Windows side it has given up on, and until that judgement
+        // can be trusted here -- it fired on Steam's client because a helper of its had
+        // crashed -- the process is left to carry on, as it always was.
         if (signal == 9 && process != nullptr) {
-            FATHOM_INFO("pid %d killed by pid %d", process->pid, caller_pid);
-            process->syscalls->RequestProcessStop();
-            process_changed.notify_all();
+            FATHOM_INFO("pid %d: SIGKILL from pid %d noted, not acted on", process->pid, caller_pid);
             return true;
         }
         target->QueueSignal(signal, caller_pid);

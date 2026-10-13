@@ -662,7 +662,8 @@ size_t DescribeGuestState(char* buffer, size_t capacity) {
         return 0;
     }
     const auto& state = g_active.thread->CurrentFrame->State;
-    static const char* kNames[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+    // FEXCore numbers the registers the way the instruction encoding does.
+    static const char* kNames[] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
                                    "r8 ", "r9 ", "r10", "r11", "r12", "r13", "r14", "r15"};
     Appender out {buffer, capacity};
     out.Text("  rip ");

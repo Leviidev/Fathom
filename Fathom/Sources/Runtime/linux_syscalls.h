@@ -292,6 +292,9 @@ public:
 
     /// How far brk has grown: the part of the heap a fork actually has to preserve.
     uint64_t HeapBreak() const;
+    /// Where the brk heap's reservation ends now. It starts out as the full headroom and
+    /// shrinks whenever a mapping is placed inside it.
+    uint64_t HeapLimit() const;
 
     /// Where the guest's heap starts; established once the program image is loaded.
     void InitialiseHeap(uint64_t base, uint64_t reserved);

@@ -1148,6 +1148,10 @@ uint64_t LinuxSyscalls::HeapBreak() const {
     return shared_->heap_break;
 }
 
+uint64_t LinuxSyscalls::HeapLimit() const {
+    return shared_->heap_limit;
+}
+
 void LinuxSyscalls::ShareInto(LinuxSyscalls& thread) const {
     thread.shared_ = shared_;
     thread.process_stopping_ = process_stopping_;

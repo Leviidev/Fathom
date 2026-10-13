@@ -1509,7 +1509,12 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack, bool shares_
                                        ? 0
                                        : parent->syscalls->HeapBreak() + parent->guest_base;
 
-        const uint64_t heap_top = heap_low + kHeapReservation;
+        // As far as the heap reaches *now*, not as far as it was reserved: the reservation
+        // gives ground to mappings a program asks for inside it, and a 32-bit Wine puts its
+        // thread stacks there. Clamping those to the brk break would hold nothing of the
+        // stack the fork was made on, and the child's first push overwrites the return
+        // address the parent comes back through.
+        const uint64_t heap_top = heap_low == 0 ? 0 : parent->syscalls->HeapLimit() + parent->guest_base;
         const auto overlaps = [](uint64_t a1, uint64_t a2, uint64_t b1, uint64_t b2) {
             return a1 < b2 && b1 < a2;
         };
@@ -1577,8 +1582,8 @@ int64_t fathom_session::ForkProcess(int caller_pid, uint64_t stack, bool shares_
         // "corrupted double-linked list". Holding it is only safe because the parent's
         // threads are stopped for the duration and the copy goes back under the address
         // space's lock; without either, putting it back is worse than not.
-        if (heap_low != 0) {
-            owned.emplace_back(heap_low, kHeapReservation);
+        if (heap_low != 0 && heap_top > heap_low) {
+            owned.emplace_back(heap_low, heap_top - heap_low);
         }
         // Held either way: the writable parts of every image the process has mapped. That
         // is where a C library keeps what belongs to the process rather than to a thread

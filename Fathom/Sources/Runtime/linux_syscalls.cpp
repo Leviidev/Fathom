@@ -3585,6 +3585,9 @@ uint64_t LinuxSyscalls::DoEpollCtl(int epoll_fd, int operation, int fd, uint64_t
     EpollInterest interest;
     std::memcpy(&interest.events, raw, 4);
     std::memcpy(&interest.data, raw + 4, 8);
+    if (config_.trace) {
+        FATHOM_INFO("[pid %d]   epoll_ctl op %d fd %d events %#x", pid_, operation, fd, interest.events);
+    }
 
     std::scoped_lock lock {set->mutex};
     if (operation == kEpollCtlAdd) {
@@ -3692,6 +3695,9 @@ uint64_t LinuxSyscalls::DoEpollWait(int epoll_fd, uint64_t events_address, int m
             }
             std::memcpy(out + reported * 12, &events, 4);
             std::memcpy(out + reported * 12 + 4, &owners[index]->data, 8);
+            if (config_.trace) {
+                FATHOM_INFO("[pid %d]   epoll_wait: host fd %d events %#x", pid_, host_fds[index].fd, events);
+            }
             ++reported;
         }
         if (reported > 0) {

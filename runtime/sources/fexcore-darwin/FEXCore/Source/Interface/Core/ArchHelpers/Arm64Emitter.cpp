@@ -73,11 +73,25 @@ namespace x64 {
     ARMEmitter::Reg::r8, ARMEmitter::Reg::r16, ARMEmitter::Reg::r17,
   };
 
+#if defined(__APPLE__)
+  // x18 is Apple's platform register: the kernel may change it at any moment (context
+  // switches, signal delivery), so a value the register allocator parks there can read back
+  // as something else -- typically zero -- an instruction later. Bachata-S4 caught this on a
+  // phone as a pointer computed into x18 and stored through as address 0; Fathom's guests see
+  // it as pointers and return addresses that turn into small numbers in busy, signal-heavy
+  // processes (Chromium). Leave it out of the pool on Apple hosts.
+  constexpr std::array<ARMEmitter::Register, 6> RA = {
+    // All these callee saved
+    ARMEmitter::Reg::r20, ARMEmitter::Reg::r21, ARMEmitter::Reg::r22, ARMEmitter::Reg::r23,
+    ARMEmitter::Reg::r24, ARMEmitter::Reg::r30,
+  };
+#else
   constexpr std::array<ARMEmitter::Register, 7> RA = {
     // All these callee saved
     ARMEmitter::Reg::r20, ARMEmitter::Reg::r21, ARMEmitter::Reg::r22, ARMEmitter::Reg::r23,
     ARMEmitter::Reg::r24, ARMEmitter::Reg::r30, ARMEmitter::Reg::r18,
   };
+#endif
 
   constexpr unsigned RAPairs = 4;
 

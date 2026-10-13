@@ -35,6 +35,28 @@
 #include <unistd.h>
 
 namespace fathom {
+
+namespace {
+/// Linux's internal "restart this syscall" error. Never shown to the guest: a blocking
+/// syscall interrupted by a signal answers this, and the signal's delivery turns it into
+/// either a restart of the instruction or EINTR, as the handler's SA_RESTART says.
+constexpr int kErestartsys = 512;
+constexpr int kSigkill = 9;
+constexpr int kSigint = 2;
+constexpr int kSigterm = 15;
+constexpr int kSigchld = 17;
+constexpr int kSigurg = 23;
+constexpr int kSigwinch = 28;
+constexpr uint64_t kSaSiginfo = 0x4;
+constexpr uint64_t kSaRestorer = 0x04000000;
+constexpr uint64_t kSaOnstack = 0x08000000;
+constexpr uint64_t kSaRestart = 0x10000000;
+constexpr uint64_t kSaNodefer = 0x40000000;
+constexpr uint64_t kSaResethand = 0x80000000;
+constexpr int kSsDisable = 2;
+constexpr int kSiUser = 0;
+constexpr int kSiTkill = -6;
+} // namespace
 // The guest runs as uid/gid 1000 (getuid answers that), so files the host user owns have to be reported as 1000's too.
 // Passed through as the host's numbers (501 on a Mac), every file in the guest root belongs to someone else, and a
 // program that checks ownership -- Wine refuses a prefix it does not own -- stops.
@@ -1685,9 +1707,15 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
     // other is not an unusual thing to do; Chromium does it during startup, and the whole
     // process would stop dead the first time it did.
     const auto waiting = EnterBlockingWait();
-    if (!WaitUntilReadable(host_fd)) {
-        exit_status_ = -1;
-        control_.ExitGuest(-1);
+    {
+        const int readable = WaitUntilReadable(host_fd);
+        if (readable < 0) {
+            return FailLinux(kErestartsys);
+        }
+        if (readable == 0) {
+            exit_status_ = -1;
+            control_.ExitGuest(-1);
+        }
     }
     const ssize_t bytes = read(host_fd, data, count);
     return bytes < 0 ? Fail(errno) : static_cast<uint64_t>(bytes);
@@ -1701,23 +1729,26 @@ uint64_t LinuxSyscalls::DoRead(int fd, uint64_t buffer, uint64_t count) {
 /// while data flows and keeps every such thread answerable. No signals: on iOS each one
 /// is ruinously slow while the debugger that grants JIT is attached. Regular files and
 /// descriptors the guest made non-blocking are left alone; neither can block.
-bool LinuxSyscalls::WaitUntilReadable(int host_fd) {
+int LinuxSyscalls::WaitUntilReadable(int host_fd) {
     struct stat info {};
     if (fstat(host_fd, &info) == 0 && S_ISREG(info.st_mode)) {
-        return true;
+        return 1;
     }
     const int status = fcntl(host_fd, F_GETFL);
     if (status >= 0 && (status & O_NONBLOCK) != 0) {
-        return true;
+        return 1;
     }
     for (;;) {
         if (ShouldStop()) {
-            return false;
+            return 0;
+        }
+        if (SignalPending()) {
+            return -1;
         }
         struct pollfd entry {host_fd, POLLIN, 0};
         const int ready = poll(&entry, 1, 50);
         if (ready > 0 || (ready < 0 && errno != EINTR)) {
-            return true; // Readable, hung up, or in error: the read will say which.
+            return 1; // Readable, hung up, or in error: the read will say which.
         }
     }
 }
@@ -1837,6 +1868,9 @@ uint64_t LinuxSyscalls::DoSelect(int count, uint64_t read_address, uint64_t writ
             exit_status_ = -1;
             control_.ExitGuest(-1);
         }
+        if (SignalPending()) {
+            return FailLinux(kErestartsys);
+        }
 
         std::vector<uint64_t> ready_read(want_read.size(), 0);
         std::vector<uint64_t> ready_write(want_write.size(), 0);
@@ -1931,6 +1965,9 @@ uint64_t LinuxSyscalls::DoPoll(uint64_t fds_address, uint64_t count, int timeout
         if (ShouldStop()) {
             exit_status_ = -1;
             control_.ExitGuest(-1);
+        }
+        if (SignalPending()) {
+            return FailLinux(kErestartsys);
         }
 
         host_fds.clear();
@@ -2317,7 +2354,11 @@ uint64_t LinuxSyscalls::DoMessage(int fd, uint64_t header_address, int flags, bo
             }
             const auto got = EnterBlockingWait();
             (void)got;
-            if (!WaitUntilReadable(host_fd)) {
+            const int readable = WaitUntilReadable(host_fd);
+            if (readable < 0) {
+                return filled > 0 ? static_cast<uint64_t>(filled) : FailLinux(kErestartsys);
+            }
+            if (readable == 0) {
                 exit_status_ = -1;
                 control_.ExitGuest(-1);
             }
@@ -3769,6 +3810,9 @@ uint64_t LinuxSyscalls::DoEpollWait(int epoll_fd, uint64_t events_address, int m
             exit_status_ = -1;
             control_.ExitGuest(-1);
         }
+        if (SignalPending()) {
+            return FailLinux(kErestartsys);
+        }
 
         // A snapshot, so the host poll below runs without either lock held.
         std::vector<std::pair<int, EpollInterest>> watched;
@@ -4473,6 +4517,13 @@ uint64_t LinuxSyscalls::DoIpc(uint64_t call, uint64_t first, uint64_t second, ui
 
 uint64_t LinuxSyscalls::Handle(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3,
                                uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    rip_placed_ = false;
+    const uint64_t result = HandleInner(number, arg1, arg2, arg3, arg4, arg5, arg6);
+    return FinishSyscall(number, result);
+}
+
+uint64_t LinuxSyscalls::HandleInner(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                                    uint64_t arg4, uint64_t arg5, uint64_t arg6) {
     // Marks this thread as being inside the syscall layer for as long as it is, so that a
     // fork elsewhere in this process knows not to freeze it here -- it may be holding a
     // lock the forking child is about to need.
@@ -5351,8 +5402,27 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
         // matters because a fork cannot take a copy of its parent while any thread of that
         // parent is still writing, and Steam's client keeps several threads asleep.
         const auto waiting = EnterBlockingWait();
-        nanosleep(&host, nullptr);
-        return 0;
+        // In slices, so a signal for this thread cuts the sleep short the way it would on
+        // Linux. The remaining time is not written back: nothing here asks for it.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(host.tv_sec) +
+                              std::chrono::nanoseconds(host.tv_nsec);
+        for (;;) {
+            if (ShouldStop()) {
+                exit_status_ = -1;
+                control_.ExitGuest(-1);
+            }
+            if (SignalPending()) {
+                return FailLinux(kErestartsys);
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                return 0;
+            }
+            const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
+            const long slice = static_cast<long>(std::min<int64_t>(left, 50'000'000));
+            struct timespec piece {0, slice};
+            nanosleep(&piece, nullptr);
+        }
     }
 
     case kSysSchedYield:
@@ -5507,12 +5577,13 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
     }
 
     case kSysRtSigaction:
+        return DoRtSigaction(static_cast<int>(arg1), arg2, arg3);
     case kSysRtSigprocmask:
+        return DoRtSigprocmask(static_cast<int>(arg1), arg2, arg3);
     case kSysSigaltstack:
-        // Accepted and ignored. Guest signal delivery is not implemented, so a program
-        // that installs a handler simply never has it called -- which is materially
-        // better than refusing the call and sending its libc down an error path.
-        return 0;
+        return DoSigaltstack(arg1, arg2);
+    case kSysRtSigreturn:
+        return DoRtSigreturn();
 
     case 100: { // times: process and child CPU times in clock ticks (100 a second)
         struct rusage self {};
@@ -5835,6 +5906,9 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                     exit_status_ = -1;
                     control_.ExitGuest(-1);
                 }
+                if (SignalPending()) {
+                    return FailLinux(kErestartsys);
+                }
                 // Woken by a FUTEX_WAKE, or by the value changing under us. Either way the
                 // caller re-checks its own condition, which is what the API promises.
                 if (queue.generation != seen || *value != static_cast<uint32_t>(arg3)) {
@@ -5896,6 +5970,9 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                     lock.unlock();
                     exit_status_ = -1;
                     control_.ExitGuest(-1);
+                }
+                if (SignalPending()) {
+                    return FailLinux(kErestartsys);
                 }
                 queue.changed.wait_for(lock, std::chrono::milliseconds(20));
             }
@@ -6019,7 +6096,33 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
 
     case kSysKill:
     case kSysTgkill:
+    case 200: { // tkill
+        int target_pid = 0;
+        int target_tid = 0;
+        int signal = 0;
+        if (number == kSysKill) {
+            target_pid = static_cast<int>(static_cast<int32_t>(arg1));
+            signal = static_cast<int>(arg2);
+        } else if (number == kSysTgkill) {
+            target_pid = static_cast<int>(arg1);
+            target_tid = static_cast<int>(arg2);
+            signal = static_cast<int>(arg3);
+        } else {
+            target_tid = static_cast<int>(arg1);
+            signal = static_cast<int>(arg2);
+        }
+        if (signal < 0 || signal > 64) {
+            return FailLinux(22);
+        }
+        if (target_pid <= 0 && target_tid == 0) {
+            // Process groups and "everything" are nobody's business here.
+            return 0;
+        }
+        if (host_ == nullptr || !host_->QueueSignal(pid_, target_pid, target_tid, signal)) {
+            return FailLinux(3); // ESRCH
+        }
         return 0;
+    }
 
     case kSysRseq:
         // Refusing this is correct and expected: glibc treats ENOSYS as "no restartable
@@ -7023,6 +7126,509 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
                     SyscallName(number));
         return FailLinux(38); // ENOSYS
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// Signals
+// ---------------------------------------------------------------------------
+
+void LinuxSyscalls::QueueSignal(int signal, int sender) {
+    if (signal <= 0 || signal > 64) {
+        return;
+    }
+    signal_senders_[signal] = sender;
+    pending_signals_.fetch_or(uint64_t {1} << (signal - 1), std::memory_order_acq_rel);
+}
+
+uint64_t LinuxSyscalls::FinishSyscall(uint64_t guest_number, uint64_t result) {
+    // The syscall instruction ends its block, so the thread continues wherever rip says.
+    // For an ordinary syscall that is the next instruction: syscall, sysenter and int 0x80
+    // are two bytes each. A syscall that placed rip itself (rt_sigreturn) is left alone.
+    if (!rip_placed_) {
+        control_.AdvanceGuestRip(2);
+    }
+    if (SignalPending()) {
+        return DeliverSignal(guest_number, result);
+    }
+    if (static_cast<int64_t>(result) == -kErestartsys) {
+        return FailLinux(4); // EINTR, for a signal that turned out to be blocked meanwhile.
+    }
+    return result;
+}
+
+namespace {
+
+constexpr size_t kRax = 0, kRcx = 1, kRdx = 2, kRbx = 3, kRsp = 4, kRbp = 5, kRsi = 6, kRdi = 7;
+
+/// The 512-byte FXSAVE image Linux puts behind uc_mcontext.fpregs.
+void WriteFxsave(unsigned char* out, const GuestCpuState& state) {
+    std::memset(out, 0, 512);
+    std::memcpy(out + 0, &state.fcw, 2);
+    const uint16_t fsw = 0;
+    std::memcpy(out + 2, &fsw, 2);
+    out[4] = state.ftw;
+    std::memcpy(out + 24, &state.mxcsr, 4);
+    const uint32_t mxcsr_mask = 0xffff;
+    std::memcpy(out + 28, &mxcsr_mask, 4);
+    for (size_t index = 0; index < 8; ++index) {
+        std::memcpy(out + 32 + index * 16, state.mm[index], 16);
+    }
+    for (size_t index = 0; index < 16; ++index) {
+        std::memcpy(out + 160 + index * 16, state.xmm[index], 16);
+    }
+}
+
+void ReadFxsave(const unsigned char* in, GuestCpuState* state) {
+    std::memcpy(&state->fcw, in + 0, 2);
+    state->ftw = in[4];
+    std::memcpy(&state->mxcsr, in + 24, 4);
+    for (size_t index = 0; index < 8; ++index) {
+        std::memcpy(state->mm[index], in + 32 + index * 16, 16);
+    }
+    for (size_t index = 0; index < 16; ++index) {
+        std::memcpy(state->xmm[index], in + 160 + index * 16, 16);
+    }
+}
+
+} // namespace
+
+uint64_t LinuxSyscalls::DeliverSignal(uint64_t guest_number, uint64_t result) {
+    const uint64_t ready = pending_signals_.load(std::memory_order_acquire) & ~signal_mask_;
+    if (ready == 0) {
+        return result;
+    }
+    const int signal = __builtin_ctzll(ready) + 1;
+    pending_signals_.fetch_and(~(uint64_t {1} << (signal - 1)), std::memory_order_acq_rel);
+    const int sender = signal_senders_[signal];
+
+    ProcessFiles::SignalAction action;
+    {
+        std::scoped_lock lock {shared_->mutex};
+        action = shared_->signal_actions[signal];
+        if ((action.flags & kSaResethand) != 0) {
+            shared_->signal_actions[signal] = ProcessFiles::SignalAction {};
+        }
+    }
+
+    // What the interrupted syscall is to answer: restarted outright if the handler asked
+    // for that, EINTR otherwise. An ordinary result is simply kept.
+    const bool interrupted = static_cast<int64_t>(result) == -kErestartsys;
+    const auto restart = [&]() -> uint64_t {
+        control_.AdvanceGuestRip(-2);
+        return guest_number;
+    };
+
+    const bool handled = action.handler != 0 && action.handler != 1;
+    if (!handled) {
+        if (action.handler == 0 && signal != kSigchld && signal != kSigurg && signal != kSigwinch) {
+            // Default action: the process ends. SIGKILL and SIGTERM are what Wine sends a
+            // process that will not go quietly.
+            FATHOM_INFO("[pid %d/%d] signal %d with no handler: exiting", pid_, Tid(), signal);
+            exit_status_ = 128 + signal;
+            control_.ExitGuest(128 + signal);
+        }
+        // Ignored: as if it never happened, which for a blocked syscall means carrying on.
+        return interrupted ? restart() : result;
+    }
+
+    GuestCpuState state;
+    if (!control_.CaptureCpuState(&state)) {
+        FATHOM_WARN("[pid %d/%d] cannot deliver signal %d: no register access", pid_, Tid(), signal);
+        return interrupted ? FailLinux(4) : result;
+    }
+    // rip is already past the syscall instruction. The frame records where the handler
+    // returns to, and what the syscall answered.
+    uint64_t saved_rip = state.rip;
+    uint64_t saved_rax = result;
+    if (interrupted) {
+        if ((action.flags & kSaRestart) != 0) {
+            saved_rip -= 2;
+            saved_rax = guest_number;
+        } else {
+            saved_rax = static_cast<uint64_t>(-4); // EINTR
+        }
+    }
+    state.gregs[kRax] = saved_rax;
+    state.rip = saved_rip;
+
+    const uint64_t old_mask = signal_mask_;
+    uint64_t sp = state.gregs[kRsp];
+    bool on_altstack = false;
+    if ((action.flags & kSaOnstack) != 0 && !altstack_disabled_ && altstack_size_ != 0) {
+        const bool already = sp > altstack_sp_ && sp <= altstack_sp_ + altstack_size_;
+        if (!already) {
+            sp = altstack_sp_ + altstack_size_;
+        }
+        on_altstack = true;
+    }
+
+    const bool narrow = config_.guest_is_32bit;
+    uint64_t handler_sp = 0;
+    uint64_t info_address = 0;
+    uint64_t uc_address = 0;
+    uint64_t fp_address = 0;
+    if (!narrow) {
+        // Linux x86-64 rt_sigframe: the restorer's return address, the ucontext, the
+        // siginfo, then the FXSAVE image above them all. Below the red zone of whatever
+        // was running.
+        if (!on_altstack) {
+            sp -= 128;
+        }
+        sp = (sp - 512) & ~uint64_t {15};
+        fp_address = sp;
+        sp = ((sp - (8 + 424 + 128)) & ~uint64_t {15}) - 8;
+        handler_sp = sp;
+        uc_address = sp + 8;
+        info_address = uc_address + 424;
+        auto* frame = static_cast<unsigned char*>(GuestPointer(handler_sp, fp_address + 512 - handler_sp, true));
+        if (frame == nullptr) {
+            FATHOM_WARN("[pid %d/%d] signal %d: no room on the stack at %#llx", pid_, Tid(), signal,
+                        static_cast<unsigned long long>(handler_sp));
+            return interrupted ? FailLinux(4) : result;
+        }
+        std::memset(frame, 0, fp_address + 512 - handler_sp);
+        std::memcpy(frame, &action.restorer, 8);
+        unsigned char* uc = frame + 8;
+        // uc_flags, uc_link: zero. uc_stack at 16.
+        const uint64_t ss_sp = altstack_sp_;
+        const int32_t ss_flags = altstack_disabled_ ? kSsDisable : 0;
+        const uint64_t ss_size = altstack_size_;
+        std::memcpy(uc + 16, &ss_sp, 8);
+        std::memcpy(uc + 24, &ss_flags, 4);
+        std::memcpy(uc + 32, &ss_size, 8);
+        // uc_mcontext.gregs at 40: r8..r15, rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip,
+        // efl, csgsfs, err, trapno, oldmask, cr2.
+        uint64_t* gregs = reinterpret_cast<uint64_t*>(uc + 40);
+        for (size_t index = 0; index < 8; ++index) {
+            gregs[index] = state.gregs[8 + index];
+        }
+        gregs[8] = state.gregs[kRdi];
+        gregs[9] = state.gregs[kRsi];
+        gregs[10] = state.gregs[kRbp];
+        gregs[11] = state.gregs[kRbx];
+        gregs[12] = state.gregs[kRdx];
+        gregs[13] = state.gregs[kRax];
+        gregs[14] = state.gregs[kRcx];
+        gregs[15] = state.gregs[kRsp];
+        gregs[16] = state.rip;
+        gregs[17] = state.eflags;
+        gregs[18] = 0x33; // cs: the 64-bit user code selector
+        gregs[21] = old_mask;
+        std::memcpy(uc + 40 + 23 * 8, &fp_address, 8);  // fpregs
+        std::memcpy(uc + 40 + 256, &old_mask, 8);       // uc_sigmask
+        WriteFxsave(frame + (fp_address - handler_sp), state);
+        // siginfo: signo, errno, code, then the sender.
+        unsigned char* info = frame + (info_address - handler_sp);
+        const int32_t signo = signal;
+        const int32_t code = sender == pid_ ? kSiTkill : kSiUser;
+        const int32_t sender_pid = sender;
+        std::memcpy(info + 0, &signo, 4);
+        std::memcpy(info + 8, &code, 4);
+        std::memcpy(info + 16, &sender_pid, 4);
+
+        state.gregs[kRsp] = handler_sp;
+        state.gregs[kRdi] = static_cast<uint64_t>(signal);
+        state.gregs[kRsi] = info_address;
+        state.gregs[kRdx] = uc_address;
+        state.gregs[kRax] = 0;
+    } else {
+        // Linux i386 rt_sigframe: pretcode, sig, pinfo, puc, siginfo (128), ucontext
+        // (116), retcode (8). No FPU state is carried: Wine copes with a null fpstate.
+        constexpr uint64_t kFrameSize = 4 + 4 + 4 + 4 + 128 + 116 + 8;
+        sp = ((sp - kFrameSize + 4) & ~uint64_t {15}) - 4;
+        handler_sp = sp;
+        info_address = sp + 16;
+        uc_address = info_address + 128;
+        auto* frame = static_cast<unsigned char*>(GuestPointer(handler_sp, kFrameSize, true));
+        if (frame == nullptr) {
+            FATHOM_WARN("[pid %d/%d] signal %d: no room on the stack at %#llx", pid_, Tid(), signal,
+                        static_cast<unsigned long long>(handler_sp));
+            return interrupted ? FailLinux(4) : result;
+        }
+        std::memset(frame, 0, kFrameSize);
+        const uint32_t restorer = static_cast<uint32_t>(action.restorer);
+        const uint32_t sig32 = static_cast<uint32_t>(signal);
+        const uint32_t pinfo = static_cast<uint32_t>(info_address);
+        const uint32_t puc = static_cast<uint32_t>(uc_address);
+        std::memcpy(frame + 0, &restorer, 4);
+        std::memcpy(frame + 4, &sig32, 4);
+        std::memcpy(frame + 8, &pinfo, 4);
+        std::memcpy(frame + 12, &puc, 4);
+        unsigned char* info = frame + 16;
+        const int32_t code = sender == pid_ ? kSiTkill : kSiUser;
+        const int32_t sender_pid = sender;
+        std::memcpy(info + 0, &sig32, 4);
+        std::memcpy(info + 8, &code, 4);
+        std::memcpy(info + 12, &sender_pid, 4);
+        unsigned char* uc = frame + 16 + 128;
+        // uc_flags, uc_link (4 each), uc_stack {sp, flags, size} (12), then sigcontext at 20:
+        // gs, fs, es, ds, edi, esi, ebp, esp, ebx, edx, ecx, eax, trapno, err, eip, cs,
+        // eflags, esp_at_signal, ss, fpstate, oldmask, cr2 -- 22 words. uc_sigmask at 108.
+        const uint32_t ss_sp = static_cast<uint32_t>(altstack_sp_);
+        const int32_t ss_flags = altstack_disabled_ ? kSsDisable : 0;
+        const uint32_t ss_size = static_cast<uint32_t>(altstack_size_);
+        std::memcpy(uc + 8, &ss_sp, 4);
+        std::memcpy(uc + 12, &ss_flags, 4);
+        std::memcpy(uc + 16, &ss_size, 4);
+        uint32_t* sc = reinterpret_cast<uint32_t*>(uc + 20);
+        sc[0] = 0;  // gs: the guest's selector is kept in the thread, not here
+        sc[1] = 0;
+        sc[2] = 0x2b;
+        sc[3] = 0x2b;
+        sc[4] = static_cast<uint32_t>(state.gregs[kRdi]);
+        sc[5] = static_cast<uint32_t>(state.gregs[kRsi]);
+        sc[6] = static_cast<uint32_t>(state.gregs[kRbp]);
+        sc[7] = static_cast<uint32_t>(state.gregs[kRsp]);
+        sc[8] = static_cast<uint32_t>(state.gregs[kRbx]);
+        sc[9] = static_cast<uint32_t>(state.gregs[kRdx]);
+        sc[10] = static_cast<uint32_t>(state.gregs[kRcx]);
+        sc[11] = static_cast<uint32_t>(state.gregs[kRax]);
+        sc[14] = static_cast<uint32_t>(state.rip);
+        sc[15] = 0x23;
+        sc[16] = state.eflags;
+        sc[17] = static_cast<uint32_t>(state.gregs[kRsp]);
+        sc[18] = 0x2b;
+        sc[20] = static_cast<uint32_t>(old_mask);
+        std::memcpy(uc + 108, &old_mask, 8);
+
+        state.gregs[kRsp] = handler_sp;
+        state.gregs[kRax] = static_cast<uint64_t>(signal);
+        state.gregs[kRdx] = info_address;
+        state.gregs[kRcx] = uc_address;
+    }
+
+    signal_mask_ |= action.mask;
+    if ((action.flags & kSaNodefer) == 0) {
+        signal_mask_ |= uint64_t {1} << (signal - 1);
+    }
+    state.eflags &= ~uint32_t {0x400}; // DF clear, as the ABI promises a handler
+    state.rip = action.handler;
+    if (!control_.RestoreCpuState(state)) {
+        FATHOM_WARN("[pid %d/%d] signal %d: could not switch to the handler", pid_, Tid(), signal);
+        signal_mask_ = old_mask;
+        return interrupted ? FailLinux(4) : result;
+    }
+    rip_placed_ = true;
+    if (config_.trace) {
+        FATHOM_INFO("[pid %d/%d]   signal %d from %d delivered to handler %#llx (frame %#llx)", pid_, Tid(), signal,
+                    sender, static_cast<unsigned long long>(action.handler),
+                    static_cast<unsigned long long>(handler_sp));
+    }
+    return state.gregs[kRax];
+}
+
+uint64_t LinuxSyscalls::DoRtSigreturn() {
+    GuestCpuState state;
+    if (!control_.CaptureCpuState(&state)) {
+        return FailLinux(38);
+    }
+    const bool narrow = config_.guest_is_32bit;
+    if (!narrow) {
+        // The restorer ran `syscall` with rsp at the ucontext.
+        const uint64_t uc_address = state.gregs[kRsp];
+        const auto* uc = static_cast<const unsigned char*>(GuestPointer(uc_address, 424, false));
+        if (uc == nullptr) {
+            return FailLinux(14);
+        }
+        const uint64_t* gregs = reinterpret_cast<const uint64_t*>(uc + 40);
+        for (size_t index = 0; index < 8; ++index) {
+            state.gregs[8 + index] = gregs[index];
+        }
+        state.gregs[kRdi] = gregs[8];
+        state.gregs[kRsi] = gregs[9];
+        state.gregs[kRbp] = gregs[10];
+        state.gregs[kRbx] = gregs[11];
+        state.gregs[kRdx] = gregs[12];
+        state.gregs[kRax] = gregs[13];
+        state.gregs[kRcx] = gregs[14];
+        state.gregs[kRsp] = gregs[15];
+        state.rip = gregs[16];
+        state.eflags = static_cast<uint32_t>(gregs[17]);
+        uint64_t fp_address = 0;
+        std::memcpy(&fp_address, uc + 40 + 23 * 8, 8);
+        if (fp_address != 0) {
+            if (const auto* fx = static_cast<const unsigned char*>(GuestPointer(fp_address, 512, false))) {
+                ReadFxsave(fx, &state);
+            }
+        }
+        std::memcpy(&signal_mask_, uc + 40 + 256, 8);
+    } else {
+        // The restorer ran `int 0x80` with esp just past pretcode: at the frame's `sig`.
+        const uint64_t frame_address = state.gregs[kRsp] - 4;
+        const auto* uc = static_cast<const unsigned char*>(GuestPointer(frame_address + 16 + 128, 116, false));
+        if (uc == nullptr) {
+            return FailLinux(14);
+        }
+        const uint32_t* sc = reinterpret_cast<const uint32_t*>(uc + 20);
+        state.gregs[kRdi] = sc[4];
+        state.gregs[kRsi] = sc[5];
+        state.gregs[kRbp] = sc[6];
+        state.gregs[kRsp] = sc[7];
+        state.gregs[kRbx] = sc[8];
+        state.gregs[kRdx] = sc[9];
+        state.gregs[kRcx] = sc[10];
+        state.gregs[kRax] = sc[11];
+        state.rip = sc[14];
+        state.eflags = sc[16];
+        std::memcpy(&signal_mask_, uc + 108, 8);
+    }
+    signal_mask_ &= ~((uint64_t {1} << (kSigkill - 1)) | (uint64_t {1} << (19 - 1)));
+    if (!control_.RestoreCpuState(state)) {
+        return FailLinux(38);
+    }
+    rip_placed_ = true;
+    return state.gregs[kRax];
+}
+
+uint64_t LinuxSyscalls::DoRtSigaction(int signal, uint64_t act_address, uint64_t old_address) {
+    if (signal <= 0 || signal > 64) {
+        return FailLinux(22);
+    }
+    const bool narrow = config_.guest_is_32bit;
+    // x86-64: handler, flags, restorer, mask -- eight bytes each. i386: handler, flags,
+    // restorer at four bytes, then the eight-byte mask.
+    const size_t size = narrow ? 20 : 32;
+    ProcessFiles::SignalAction current;
+    {
+        std::scoped_lock lock {shared_->mutex};
+        current = shared_->signal_actions[signal];
+    }
+    if (old_address != 0) {
+        auto* out = static_cast<unsigned char*>(GuestPointer(old_address, size, true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        std::memset(out, 0, size);
+        if (narrow) {
+            const uint32_t handler = static_cast<uint32_t>(current.handler);
+            const uint32_t flags = static_cast<uint32_t>(current.flags);
+            const uint32_t restorer = static_cast<uint32_t>(current.restorer);
+            std::memcpy(out + 0, &handler, 4);
+            std::memcpy(out + 4, &flags, 4);
+            std::memcpy(out + 8, &restorer, 4);
+            std::memcpy(out + 12, &current.mask, 8);
+        } else {
+            std::memcpy(out + 0, &current.handler, 8);
+            std::memcpy(out + 8, &current.flags, 8);
+            std::memcpy(out + 16, &current.restorer, 8);
+            std::memcpy(out + 24, &current.mask, 8);
+        }
+    }
+    if (act_address != 0) {
+        if (signal == kSigkill || signal == 19) {
+            return FailLinux(22);
+        }
+        const auto* in = static_cast<const unsigned char*>(GuestPointer(act_address, size, false));
+        if (in == nullptr) {
+            return FailLinux(14);
+        }
+        ProcessFiles::SignalAction next;
+        if (narrow) {
+            uint32_t handler = 0;
+            uint32_t flags = 0;
+            uint32_t restorer = 0;
+            std::memcpy(&handler, in + 0, 4);
+            std::memcpy(&flags, in + 4, 4);
+            std::memcpy(&restorer, in + 8, 4);
+            std::memcpy(&next.mask, in + 12, 8);
+            next.handler = handler;
+            next.flags = flags;
+            next.restorer = restorer;
+        } else {
+            std::memcpy(&next.handler, in + 0, 8);
+            std::memcpy(&next.flags, in + 8, 8);
+            std::memcpy(&next.restorer, in + 16, 8);
+            std::memcpy(&next.mask, in + 24, 8);
+        }
+        std::scoped_lock lock {shared_->mutex};
+        shared_->signal_actions[signal] = next;
+    }
+    return 0;
+}
+
+uint64_t LinuxSyscalls::DoRtSigprocmask(int how, uint64_t set_address, uint64_t old_address) {
+    if (old_address != 0) {
+        auto* out = static_cast<uint64_t*>(GuestPointer(old_address, 8, true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        *out = signal_mask_;
+    }
+    if (set_address != 0) {
+        const auto* in = static_cast<const uint64_t*>(GuestPointer(set_address, 8, false));
+        if (in == nullptr) {
+            return FailLinux(14);
+        }
+        const uint64_t set = *in;
+        switch (how) {
+        case 0: signal_mask_ |= set; break;          // SIG_BLOCK
+        case 1: signal_mask_ &= ~set; break;         // SIG_UNBLOCK
+        case 2: signal_mask_ = set; break;           // SIG_SETMASK
+        default: return FailLinux(22);
+        }
+        signal_mask_ &= ~((uint64_t {1} << (kSigkill - 1)) | (uint64_t {1} << (19 - 1)));
+    }
+    return 0;
+}
+
+uint64_t LinuxSyscalls::DoSigaltstack(uint64_t new_address, uint64_t old_address) {
+    const bool narrow = config_.guest_is_32bit;
+    const size_t size = narrow ? 12 : 24;
+    if (old_address != 0) {
+        auto* out = static_cast<unsigned char*>(GuestPointer(old_address, size, true));
+        if (out == nullptr) {
+            return FailLinux(14);
+        }
+        std::memset(out, 0, size);
+        const int32_t flags = altstack_disabled_ ? kSsDisable : 0;
+        if (narrow) {
+            const uint32_t sp = static_cast<uint32_t>(altstack_sp_);
+            const uint32_t stack_size = static_cast<uint32_t>(altstack_size_);
+            std::memcpy(out + 0, &sp, 4);
+            std::memcpy(out + 4, &flags, 4);
+            std::memcpy(out + 8, &stack_size, 4);
+        } else {
+            std::memcpy(out + 0, &altstack_sp_, 8);
+            std::memcpy(out + 8, &flags, 4);
+            std::memcpy(out + 16, &altstack_size_, 8);
+        }
+    }
+    if (new_address != 0) {
+        const auto* in = static_cast<const unsigned char*>(GuestPointer(new_address, size, false));
+        if (in == nullptr) {
+            return FailLinux(14);
+        }
+        int32_t flags = 0;
+        uint64_t sp = 0;
+        uint64_t stack_size = 0;
+        if (narrow) {
+            uint32_t sp32 = 0;
+            uint32_t size32 = 0;
+            std::memcpy(&sp32, in + 0, 4);
+            std::memcpy(&flags, in + 4, 4);
+            std::memcpy(&size32, in + 8, 4);
+            sp = sp32;
+            stack_size = size32;
+        } else {
+            std::memcpy(&sp, in + 0, 8);
+            std::memcpy(&flags, in + 8, 4);
+            std::memcpy(&stack_size, in + 16, 8);
+        }
+        if ((flags & kSsDisable) != 0) {
+            altstack_disabled_ = true;
+            altstack_sp_ = 0;
+            altstack_size_ = 0;
+        } else {
+            if (stack_size < 2048) {
+                return FailLinux(12); // ENOMEM
+            }
+            altstack_disabled_ = false;
+            altstack_sp_ = sp;
+            altstack_size_ = stack_size;
+        }
+    }
+    return 0;
 }
 
 } // namespace fathom

@@ -93,6 +93,9 @@ public:
     void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit,
                           bool point_gs_at_it = false) override;
     uint64_t GuestRip() const override { return Rip(); }
+    bool CaptureCpuState(GuestCpuState* out) const override;
+    bool RestoreCpuState(const GuestCpuState& state) override;
+    void AdvanceGuestRip(int64_t bytes) override;
 
     /// Unwinds this thread out of the JIT with a fatal signal recorded, so that the guest
     /// process it belongs to ends rather than the emulator. Returns false, without

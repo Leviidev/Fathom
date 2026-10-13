@@ -34,10 +34,35 @@
 
 namespace fathom {
 
+/// A guest thread's registers, as a signal frame has to carry them: enough to put the
+/// thread back exactly where it was once its signal handler returns.
+struct GuestCpuState {
+    uint64_t gregs[16] {};  ///< x86 encoding order: rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8..r15.
+    uint64_t rip {};
+    uint32_t eflags {};
+    uint32_t mxcsr {};
+    uint64_t fs_base {};
+    uint64_t gs_base {};
+    uint64_t xmm[16][2] {};
+    uint64_t mm[8][2] {};
+    uint16_t fcw {};
+    uint8_t ftw {};
+};
+
 /// What the syscall layer needs from whatever is driving the CPU.
 class GuestThreadControl {
 public:
     virtual ~GuestThreadControl() = default;
+
+    /// The thread's registers as they stand at this syscall, and the means to put a
+    /// different set back. Both are what delivering a guest signal is made of: the old
+    /// state goes into the frame on the guest stack, and the new one points the thread at
+    /// its handler. A driver that cannot do this answers false, and no signal is delivered.
+    virtual bool CaptureCpuState(GuestCpuState* out) const { (void)out; return false; }
+    virtual bool RestoreCpuState(const GuestCpuState& state) { (void)state; return false; }
+    /// Moves the guest's instruction pointer: a syscall instruction ends its block, so
+    /// where the thread continues is whatever this says when the syscall returns.
+    virtual void AdvanceGuestRip(int64_t bytes) { (void)bytes; }
 
     /// Backing store for the guest's FS segment base, which is where its thread-local
     /// storage lives. Set through arch_prctl(ARCH_SET_FS) during libc startup.
@@ -113,6 +138,13 @@ public:
     /// whether the helper is still alive, and with no answer it concludes the helper died
     /// and starts another one -- forever. Returns false when there is no such process.
     virtual bool DescribeProcess(int pid, int* ppid, std::string* name) = 0;
+    /// Queues a signal for a guest thread anywhere in the session: `pid` 0 means any
+    /// process with that thread, `tid` 0 means the process's first thread. False when no
+    /// such thread exists.
+    virtual bool QueueSignal(int caller_pid, int pid, int tid, int signal) {
+        (void)caller_pid; (void)pid; (void)tid; (void)signal;
+        return false;
+    }
 };
 
 struct SyscallConfig {
@@ -188,6 +220,15 @@ public:
     /// returned as a negated errno the way the Linux kernel does it.
     uint64_t Handle(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4,
                     uint64_t arg5, uint64_t arg6);
+
+    /// A signal for this thread, from any thread. Delivered the next time this thread
+    /// returns from a syscall -- or sooner, if it is sitting in a blocking one, which is
+    /// interrupted. `sender` is the pid the handler's siginfo names.
+    void QueueSignal(int signal, int sender);
+    /// Whether a queued signal is not blocked: what every blocking loop checks.
+    bool SignalPending() const {
+        return (pending_signals_.load(std::memory_order_acquire) & ~signal_mask_) != 0;
+    }
 
     void SetOutputCallback(OutputCallback callback, void* context) { console_.SetOutputCallback(callback, context); }
 
@@ -391,6 +432,15 @@ private:
     struct ProcessFiles {
         mutable std::mutex mutex;
         std::map<int, OpenFile> files;
+        /// What the process asked to happen on each signal: rt_sigaction's answer, kept
+        /// per process because a handler is shared by every thread of it.
+        struct SignalAction {
+            uint64_t handler {};
+            uint64_t flags {};
+            uint64_t restorer {};
+            uint64_t mask {};
+        };
+        SignalAction signal_actions[65] {};
         std::string cwd {"/"};
         uint64_t heap_base {};
         uint64_t heap_limit {};
@@ -446,7 +496,9 @@ private:
     // Individual syscalls that are long enough to deserve a name.
     uint64_t DoOpenAt(int dirfd, uint64_t path_address, int flags, int mode);
     uint64_t DoRead(int fd, uint64_t buffer, uint64_t count);
-    bool WaitUntilReadable(int host_fd);
+    /// 1 when the descriptor is readable (or hung up, or in error), 0 when the session is
+    /// stopping, -1 when a signal arrived for this thread first.
+    int WaitUntilReadable(int host_fd);
     uint64_t DoPoll(uint64_t fds_address, uint64_t count, int timeout_ms);
     uint64_t DoSelect(int count, uint64_t read_address, uint64_t write_address,
                       uint64_t except_address, int64_t timeout_us);
@@ -553,6 +605,28 @@ private:
 
     /// Set for the duration of one i386 time32 syscall. See TimeWidth.
     bool narrow_time_ {};
+    /// Signals queued for this thread and not yet delivered, one bit per signal number.
+    std::atomic<uint64_t> pending_signals_ {0};
+    /// Who sent each of them, for the siginfo the handler is given.
+    int signal_senders_[65] {};
+    /// Signals this thread has blocked: rt_sigprocmask's mask, plus whatever a running
+    /// handler's action asked to block until it returns.
+    uint64_t signal_mask_ {};
+    /// sigaltstack: where a handler asked for its own stack runs.
+    uint64_t altstack_sp_ {};
+    uint64_t altstack_size_ {};
+    bool altstack_disabled_ {true};
+    /// Set by a syscall that placed the instruction pointer itself (rt_sigreturn, exec),
+    /// so the usual step past the syscall instruction is skipped.
+    bool rip_placed_ {};
+    uint64_t HandleInner(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4,
+                         uint64_t arg5, uint64_t arg6);
+    uint64_t FinishSyscall(uint64_t guest_number, uint64_t result);
+    uint64_t DeliverSignal(uint64_t guest_number, uint64_t result);
+    uint64_t DoRtSigreturn();
+    uint64_t DoRtSigaction(int signal, uint64_t act_address, uint64_t old_address);
+    uint64_t DoRtSigprocmask(int how, uint64_t set_address, uint64_t old_address);
+    uint64_t DoSigaltstack(uint64_t new_address, uint64_t old_address);
     std::atomic<bool> in_runtime_ {false};
     /// The syscall being serviced, or none. Not zero for "none": zero is read.
     static constexpr uint64_t kNoSyscall = ~0ull;

@@ -127,6 +127,17 @@ public:
     }
 
     uint64_t GuestRip() const override { return target_ == nullptr ? 0 : target_->GuestRip(); }
+    bool CaptureCpuState(fathom::GuestCpuState* out) const override {
+        return target_ != nullptr && target_->CaptureCpuState(out);
+    }
+    bool RestoreCpuState(const fathom::GuestCpuState& state) override {
+        return target_ != nullptr && target_->RestoreCpuState(state);
+    }
+    void AdvanceGuestRip(int64_t bytes) override {
+        if (target_ != nullptr) {
+            target_->AdvanceGuestRip(bytes);
+        }
+    }
 
     void SetTlsDescriptor(int entry, uint32_t base, uint32_t limit,
                           bool point_gs_at_it = false) override {
@@ -483,6 +494,64 @@ struct fathom_session final : fathom::ProcessHost {
             const auto slash = process->path.rfind('/');
             *name = slash == std::string::npos ? process->path : process->path.substr(slash + 1);
         }
+        return true;
+    }
+
+    bool QueueSignal(int caller_pid, int pid, int tid, int signal) override {
+        std::scoped_lock lock {process_mutex};
+        GuestProcess* process = nullptr;
+        fathom::LinuxSyscalls* target = nullptr;
+        if (pid > 0) {
+            process = Find(pid);
+            if (process == nullptr || process->finished) {
+                return false;
+            }
+            if (tid == 0 || tid == process->pid) {
+                target = process->syscalls.get();
+            } else {
+                for (auto& record : process->threads) {
+                    if (record->tid == tid && record->syscalls != nullptr) {
+                        target = record->syscalls.get();
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (auto& [candidate_pid, candidate] : processes) {
+                if (candidate->finished) {
+                    continue;
+                }
+                if (candidate_pid == tid) {
+                    process = candidate.get();
+                    target = candidate->syscalls.get();
+                    break;
+                }
+                for (auto& record : candidate->threads) {
+                    if (record->tid == tid && record->syscalls != nullptr) {
+                        process = candidate.get();
+                        target = record->syscalls.get();
+                        break;
+                    }
+                }
+                if (target != nullptr) {
+                    break;
+                }
+            }
+        }
+        if (target == nullptr) {
+            return false;
+        }
+        if (signal == 0) {
+            return true; // Only asking whether it exists.
+        }
+        // SIGKILL cannot be caught: the whole process stops, from here.
+        if (signal == 9 && process != nullptr) {
+            FATHOM_INFO("pid %d killed by pid %d", process->pid, caller_pid);
+            process->syscalls->RequestProcessStop();
+            process_changed.notify_all();
+            return true;
+        }
+        target->QueueSignal(signal, caller_pid);
         return true;
     }
 

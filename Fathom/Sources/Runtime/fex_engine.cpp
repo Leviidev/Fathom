@@ -1200,6 +1200,55 @@ uint64_t GuestThread::Rsp() const {
                                     : impl_->thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP];
 }
 
+// Only meaningful from inside a syscall on this thread: the JIT spills every register
+// into the frame before calling the syscall handler and reloads them after, and the
+// syscall instruction ends its block, so a changed rip is where the thread goes next.
+bool GuestThread::CaptureCpuState(GuestCpuState* out) const {
+    if (impl_->thread == nullptr || impl_->context == nullptr || out == nullptr) {
+        return false;
+    }
+    auto& state = impl_->thread->CurrentFrame->State;
+    std::memcpy(out->gregs, state.gregs, sizeof(out->gregs));
+    out->rip = state.rip;
+    out->eflags = impl_->context->ReconstructCompactedEFLAGS(impl_->thread, false, nullptr, 0);
+    out->mxcsr = state.mxcsr;
+    out->fs_base = state.fs_cached;
+    out->gs_base = state.gs_cached;
+    for (size_t index = 0; index < 16; ++index) {
+        out->xmm[index][0] = state.xmm.sse.data[index][0];
+        out->xmm[index][1] = state.xmm.sse.data[index][1];
+    }
+    std::memcpy(out->mm, state.mm, sizeof(out->mm));
+    out->fcw = state.FCW;
+    out->ftw = state.AbridgedFTW;
+    return true;
+}
+
+bool GuestThread::RestoreCpuState(const GuestCpuState& in) {
+    if (impl_->thread == nullptr || impl_->context == nullptr) {
+        return false;
+    }
+    auto& state = impl_->thread->CurrentFrame->State;
+    std::memcpy(state.gregs, in.gregs, sizeof(state.gregs));
+    state.rip = in.rip;
+    impl_->context->SetFlagsFromCompactedEFLAGS(impl_->thread, in.eflags);
+    state.mxcsr = in.mxcsr;
+    for (size_t index = 0; index < 16; ++index) {
+        state.xmm.sse.data[index][0] = in.xmm[index][0];
+        state.xmm.sse.data[index][1] = in.xmm[index][1];
+    }
+    std::memcpy(state.mm, in.mm, sizeof(state.mm));
+    state.FCW = in.fcw;
+    state.AbridgedFTW = in.ftw;
+    return true;
+}
+
+void GuestThread::AdvanceGuestRip(int64_t bytes) {
+    if (impl_->thread != nullptr) {
+        impl_->thread->CurrentFrame->State.rip += static_cast<uint64_t>(bytes);
+    }
+}
+
 uint64_t GuestThread::Rax() const {
     return impl_->thread == nullptr ? 0 : impl_->thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RAX];
 }

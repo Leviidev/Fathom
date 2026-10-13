@@ -6119,7 +6119,12 @@ uint64_t LinuxSyscalls::Dispatch(uint64_t number, uint64_t arg1, uint64_t arg2, 
             return 0;
         }
         if (host_ == nullptr || !host_->QueueSignal(pid_, target_pid, target_tid, signal)) {
+            FATHOM_INFO("[pid %d/%d] signal %d for pid %d tid %d: no such thread", pid_, Tid(), signal, target_pid,
+                        target_tid);
             return FailLinux(3); // ESRCH
+        }
+        if (signal != 0) {
+            FATHOM_INFO("[pid %d/%d] sent signal %d to pid %d tid %d", pid_, Tid(), signal, target_pid, target_tid);
         }
         return 0;
     }
@@ -7410,11 +7415,12 @@ uint64_t LinuxSyscalls::DeliverSignal(uint64_t guest_number, uint64_t result) {
         return interrupted ? FailLinux(4) : result;
     }
     rip_placed_ = true;
-    if (config_.trace) {
-        FATHOM_INFO("[pid %d/%d]   signal %d from %d delivered to handler %#llx (frame %#llx)", pid_, Tid(), signal,
-                    sender, static_cast<unsigned long long>(action.handler),
-                    static_cast<unsigned long long>(handler_sp));
-    }
+    // Said out loud for now: signals are rare, and the first ones through here are the
+    // ones to watch.
+    FATHOM_INFO("[pid %d/%d] signal %d from pid %d -> handler %#llx, frame %#llx, resumes at %#llx%s", pid_, Tid(),
+                signal, sender, static_cast<unsigned long long>(action.handler),
+                static_cast<unsigned long long>(handler_sp), static_cast<unsigned long long>(saved_rip),
+                interrupted ? ((action.flags & kSaRestart) != 0 ? " (syscall restarted)" : " (EINTR)") : "");
     return state.gregs[kRax];
 }
 

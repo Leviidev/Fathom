@@ -715,28 +715,11 @@ public:
             FATHOM_ERROR("syscall on a host thread with no guest thread bound");
             return static_cast<uint64_t>(-38); // -ENOSYS
         }
-        const uint64_t before_rip = frame == nullptr ? 0 : frame->State.rip;
-        const uint64_t before_rsp =
-            frame == nullptr ? 0 : frame->State.gregs[FEXCore::X86State::REG_RSP];
-        const auto result = syscalls->Handle(args->Argument[0], args->Argument[1], args->Argument[2],
-                                             args->Argument[3], args->Argument[4], args->Argument[5],
-                                             args->Argument[6]);
-        // A syscall must leave the thread exactly where it found it. One that does not is
-        // the moment a thread's state is lost, and without this the loss is only noticed
-        // later, in whatever garbage the thread then runs.
-        if (frame != nullptr) {
-            const uint64_t after_rip = frame->State.rip;
-            const uint64_t after_rsp = frame->State.gregs[FEXCore::X86State::REG_RSP];
-            if (after_rip != before_rip || after_rsp != before_rsp) {
-                FATHOM_WARN("syscall %llu moved the thread: rip %#llx -> %#llx, rsp %#llx -> %#llx",
-                            static_cast<unsigned long long>(args->Argument[0]),
-                            static_cast<unsigned long long>(before_rip),
-                            static_cast<unsigned long long>(after_rip),
-                            static_cast<unsigned long long>(before_rsp),
-                            static_cast<unsigned long long>(after_rsp));
-            }
-        }
-        return result;
+        // The syscall instruction ends its block, and the syscall layer places rip: past
+        // the instruction, or at a signal handler with a frame pushed on the guest stack.
+        return syscalls->Handle(args->Argument[0], args->Argument[1], args->Argument[2],
+                                args->Argument[3], args->Argument[4], args->Argument[5],
+                                args->Argument[6]);
     }
 
     FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*,

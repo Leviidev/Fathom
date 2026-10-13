@@ -285,7 +285,14 @@ bool CommitRange(uint64_t begin, uint64_t end, uint64_t page_size, int host_prot
     if (cursor < end) {
         fill(cursor, end);
     }
-    return mprotect(reinterpret_cast<void*>(begin), end - begin, host_protection) == 0;
+    // Whole host pages: a fixed mapping's free part starts where its committed
+    // neighbour stops, at a guest page, and Darwin refuses a protection change that
+    // does not start on one of its own pages -- which a browser committing its reserved
+    // heap saw as ENOMEM, and died of. The neighbour sharing the page gets this
+    // protection too, as it does from every other protection change here.
+    const uint64_t low = begin & ~(page_size - 1);
+    const uint64_t high = (end + page_size - 1) & ~(page_size - 1);
+    return mprotect(reinterpret_cast<void*>(low), high - low, host_protection) == 0;
 }
 
 } // namespace

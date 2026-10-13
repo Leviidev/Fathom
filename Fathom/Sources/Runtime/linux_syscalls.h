@@ -644,6 +644,15 @@ private:
     pthread_t host_thread_ {};
     bool host_thread_set_ {};
     bool in_host_handler_ {};
+    /// The last signal frame this thread was given: what was interrupted, where the frame
+    /// went, and whether it was pushed in place in compiled code. Read back when the
+    /// matching rt_sigreturn restores something that cannot be right.
+    uint64_t last_push_rip_ {};
+    uint64_t last_push_rsp_ {};
+    uint64_t last_push_uc_ {};
+    uint64_t last_push_handler_ {};
+    int last_push_signal_ {};
+    bool last_push_in_place_ {};
     uint64_t HandleInner(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4,
                          uint64_t arg5, uint64_t arg6);
     uint64_t FinishSyscall(uint64_t guest_number, uint64_t result);

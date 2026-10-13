@@ -7441,6 +7441,12 @@ bool LinuxSyscalls::PushSignalFrame(GuestCpuState* in_out, int signal, int sende
     if ((action.flags & kSaNodefer) == 0) {
         signal_mask_ |= uint64_t {1} << (signal - 1);
     }
+    last_push_rip_ = in_out->rip;
+    last_push_rsp_ = in_out->gregs[kRsp];
+    last_push_uc_ = uc_address;
+    last_push_handler_ = action.handler;
+    last_push_signal_ = signal;
+    last_push_in_place_ = in_host_handler_;
     state.eflags &= ~uint32_t {0x400}; // DF clear, as the ABI promises a handler
     state.rip = action.handler;
     *in_out = state;
@@ -7551,6 +7557,19 @@ uint64_t LinuxSyscalls::DoRtSigreturn() {
         std::memcpy(&signal_mask_, uc + 108, 8);
     }
     signal_mask_ &= ~((uint64_t {1} << (kSigkill - 1)) | (uint64_t {1} << (19 - 1)));
+    if (state.rip < 0x10000 || !space_->Contains(ToHost(state.rip), 1)) {
+        // The handler returned into nothing. Say what the frame held when it was built
+        // and how it was built, since a frame pushed in place in compiled code has a
+        // reconstructed rip and spilled registers that could each be the wrong ones.
+        FATHOM_WARN("[pid %d/%d] rt_sigreturn restores rip %#llx rsp %#llx (frame at %#llx): signal %d was pushed %s "
+                    "interrupting rip %#llx rsp %#llx, handler %#llx, ucontext %#llx",
+                    pid_, Tid(), static_cast<unsigned long long>(state.rip),
+                    static_cast<unsigned long long>(state.gregs[kRsp]),
+                    static_cast<unsigned long long>(narrow ? state.gregs[kRsp] - 4 : state.gregs[kRsp]),
+                    last_push_signal_, last_push_in_place_ ? "in place in compiled code" : "at a syscall exit",
+                    static_cast<unsigned long long>(last_push_rip_), static_cast<unsigned long long>(last_push_rsp_),
+                    static_cast<unsigned long long>(last_push_handler_), static_cast<unsigned long long>(last_push_uc_));
+    }
     if (!control_.RestoreCpuState(state)) {
         return FailLinux(38);
     }

@@ -220,6 +220,9 @@ std::mutex g_thread_lifecycle;
 struct ActiveExecution {
     FEXCore::Context::Context* context {};
     FEXCore::Core::InternalThreadState* thread {};
+    /// The context's own signal delegator: its dispatcher addresses are what an in-place
+    /// signal delivery jumps back through, and every process has its own context now.
+    FEXCore::SignalDelegator* delegator {};
 };
 thread_local ActiveExecution g_active;
 
@@ -626,7 +629,10 @@ void HandleGuestSignalNudge(int, siginfo_t*, void* raw_context) {
     auto* syscalls = g_current_syscalls;
     auto* thread = g_active.thread;
     auto* context = g_active.context;
-    auto* delegator = g_signal_delegator.load(std::memory_order_acquire);
+    // This context's delegator, not a global one: every process has its own JIT context
+    // now, each with its own dispatcher addresses, and the last context created (or torn
+    // down) is not the one this thread is running in.
+    auto* delegator = g_active.delegator;
     auto* guest_thread = g_current_guest_thread;
     if (syscalls == nullptr || thread == nullptr || context == nullptr || delegator == nullptr ||
         guest_thread == nullptr || raw_context == nullptr || !syscalls->SignalPending() || syscalls->InRuntime()) {
@@ -1119,8 +1125,10 @@ void ReleaseInvalidations() {
 
 class GuestThread::Impl {
 public:
-    Impl(FEXCore::Context::Context* context, LinuxSyscalls& syscalls, bool guest_is_32bit)
+    Impl(FEXCore::Context::Context* context, FEXCore::SignalDelegator* engine_signals, LinuxSyscalls& syscalls,
+         bool guest_is_32bit)
         : context {context}
+        , engine_signals {engine_signals}
         , syscalls {syscalls}
         , guest_is_32bit {guest_is_32bit} {}
 
@@ -1139,6 +1147,7 @@ public:
     }
 
     FEXCore::Context::Context* context {};
+    FEXCore::SignalDelegator* engine_signals {};
     LinuxSyscalls& syscalls;
     bool guest_is_32bit {};
     uint64_t guest_base {};
@@ -1209,7 +1218,7 @@ RunResult GuestThread::Run() {
     }
     if (FEXCore::UncheckedLongJump::SetJump(impl_->exit_jump) == 0) {
         impl_->exit_jump_armed = true;
-        g_active = ActiveExecution {impl_->context, impl_->thread};
+        g_active = ActiveExecution {impl_->context, impl_->thread, impl_->engine_signals};
         impl_->context->ExecuteThread(impl_->thread);
         g_active = ActiveExecution {};
         impl_->exit_jump_armed = false;

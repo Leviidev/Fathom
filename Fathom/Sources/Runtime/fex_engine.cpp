@@ -327,7 +327,7 @@ bool RecoverAlignmentFault(int signal, siginfo_t* info, void* raw_context) {
     // readable whether or not the guest has been given any of it, so every address looks
     // valid to a write() probe.
     bool wild = false;
-    if (auto* space = g_arena_space.load(std::memory_order_acquire)) {
+    if (auto* space = g_current_syscalls != nullptr ? g_current_syscalls->Space() : nullptr) {
         wild = !space->MaybeCommitted(reinterpret_cast<uint64_t>(info->si_addr));
     }
     if (wild) {
@@ -561,8 +561,11 @@ bool EndFaultedGuestThread(int signal, siginfo_t* info, void* raw_context) {
         // being inside the guest's own arena is what says this is still the guest's fault
         // and not ours.
         const auto address = info == nullptr ? 0 : reinterpret_cast<uint64_t>(info->si_addr);
-        const uint64_t begin = g_arena_begin.load(std::memory_order_acquire);
-        const uint64_t end = g_arena_end.load(std::memory_order_acquire);
+        // This thread's own arena. The globals name whichever arena was created last, which
+        // is often a finished process's that has already been released.
+        auto* own = g_current_syscalls != nullptr ? g_current_syscalls->Space() : nullptr;
+        const uint64_t begin = own != nullptr ? own->Base() : 0;
+        const uint64_t end = own != nullptr ? own->Base() + own->Size() : 0;
         if (begin == 0 || address < begin || address >= end) {
             // Neither generated code nor an address the guest owns -- but this host thread
             // is inside ExecuteThread, so it is running a guest program and nothing else.
@@ -606,9 +609,15 @@ bool EndFaultedGuestThread(int signal, siginfo_t* info, void* raw_context) {
 #endif
 }
 
-/// Whether FEXCore keeps the vector registers in its AVX layout (32 bytes each) rather
-/// than the SSE one (16 bytes, then padding). Read by the register capture below.
-std::atomic<bool> g_avx_layout {true};
+/// Whether FEXCore keeps the vector registers in its converged AVX layout (32 bytes each,
+/// only with 256-bit SVE) rather than sse.data plus avx_high. Read by the nudge below.
+std::atomic<bool> g_avx_layout {false};
+/// In-place delivery into compiled code is off unless FATHOM_INPLACE_SIGNALS=1. It resumes
+/// the thread at the start of the guest instruction whose host code was interrupted, with
+/// registers that already hold part of that instruction's work -- a call that had pushed
+/// its return address pushes it again -- so it trades a prompt signal for a corrupt thread.
+/// Off, a signal waits for the thread's next syscall, where its state is exact.
+std::atomic<bool> g_inplace_signals {false};
 /// The delegator FEXCore configured with its dispatcher addresses and static-register
 /// mapping: what a host signal handler needs to drop a guest thread into its handler.
 std::atomic<FEXCore::SignalDelegator*> g_signal_delegator {nullptr};
@@ -626,6 +635,10 @@ std::atomic<uint64_t> g_compiled_deliveries {0};
 void HandleGuestSignalNudge(int, siginfo_t*, void* raw_context) {
 #if defined(__aarch64__) && defined(__APPLE__)
     const int saved_errno = errno;
+    if (!g_inplace_signals.load(std::memory_order_relaxed)) {
+        errno = saved_errno;
+        return;
+    }
     auto* syscalls = g_current_syscalls;
     auto* thread = g_active.thread;
     auto* context = g_active.context;
@@ -701,6 +714,8 @@ void HandleGuestSignalNudge(int, siginfo_t*, void* raw_context) {
 void InstallGuestSignalNudge() {
     static std::once_flag once;
     std::call_once(once, [] {
+        const char* inplace = getenv("FATHOM_INPLACE_SIGNALS");
+        g_inplace_signals.store(inplace != nullptr && std::atoi(inplace) != 0, std::memory_order_relaxed);
         struct sigaction action {};
         action.sa_sigaction = HandleGuestSignalNudge;
         action.sa_flags = SA_SIGINFO | SA_RESTART;
@@ -723,6 +738,7 @@ public:
 /// one LinuxSyscalls per process, so the handler has to route to whichever guest thread
 /// is currently executing on this host thread.
 thread_local LinuxSyscalls* g_current_syscalls = nullptr;
+
 
 /// Writes the executing guest thread's registers out for a crash record. Signal-handler
 /// context: no allocation, no locks, and g_active is thread-local so it describes the
@@ -1307,11 +1323,14 @@ bool GuestThread::CaptureCpuState(GuestCpuState* out) const {
     out->mxcsr = state.mxcsr;
     out->fs_base = state.fs_cached;
     out->gs_base = state.gs_cached;
-    const bool avx = g_avx_layout.load(std::memory_order_relaxed);
-    for (size_t index = 0; index < 16; ++index) {
-        out->xmm[index][0] = avx ? state.xmm.avx.data[index][0] : state.xmm.sse.data[index][0];
-        out->xmm[index][1] = avx ? state.xmm.avx.data[index][1] : state.xmm.sse.data[index][1];
-    }
+    // Through FEXCore, which knows its own layout: avx.data only when the host has 256-bit
+    // SVE, otherwise sse.data with the upper halves in avx_high. Guessing from SupportsAVX
+    // alone picked the wrong one on every Apple chip and scrambled half the registers.
+    __uint128_t low[16] {};
+    __uint128_t high[16] {};
+    impl_->context->ReconstructXMMRegisters(impl_->thread, low, high);
+    std::memcpy(out->xmm, low, sizeof(out->xmm));
+    std::memcpy(out->ymm_high, high, sizeof(out->ymm_high));
     std::memcpy(out->mm, state.mm, sizeof(out->mm));
     out->fcw = state.FCW;
     out->ftw = state.AbridgedFTW;
@@ -1327,16 +1346,11 @@ bool GuestThread::RestoreCpuState(const GuestCpuState& in) {
     state.rip = in.rip;
     impl_->context->SetFlagsFromCompactedEFLAGS(impl_->thread, in.eflags);
     state.mxcsr = in.mxcsr;
-    const bool avx = g_avx_layout.load(std::memory_order_relaxed);
-    for (size_t index = 0; index < 16; ++index) {
-        if (avx) {
-            state.xmm.avx.data[index][0] = in.xmm[index][0];
-            state.xmm.avx.data[index][1] = in.xmm[index][1];
-        } else {
-            state.xmm.sse.data[index][0] = in.xmm[index][0];
-            state.xmm.sse.data[index][1] = in.xmm[index][1];
-        }
-    }
+    __uint128_t low[16] {};
+    __uint128_t high[16] {};
+    std::memcpy(low, in.xmm, sizeof(low));
+    std::memcpy(high, in.ymm_high, sizeof(high));
+    impl_->context->SetXMMRegistersFromState(impl_->thread, low, high);
     std::memcpy(state.mm, in.mm, sizeof(state.mm));
     state.FCW = in.fcw;
     state.AbridgedFTW = in.ftw;
@@ -1460,6 +1474,13 @@ const char* FexEngine::FexRevision() {
 
 std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const EngineOptions& options,
                                              std::string& error) {
+    // One engine at a time, from setting FEXCore's global configuration until the new
+    // context has read it. The 64-bit flag is process-global and every context copies it
+    // when it is built: a 32-bit and a 64-bit process starting together (a 32-bit Steam
+    // spawning a 64-bit helper) otherwise got a 64-bit context built in 32-bit mode, which
+    // fails at the new program's first instructions.
+    static std::mutex create_mutex;
+    std::unique_lock create_lock {create_mutex};
     auto impl = std::make_unique<Impl>(space);
 
     ConfigLease::Acquire(options);
@@ -1494,7 +1515,7 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
 
     impl->signals = std::make_unique<FathomSignalDelegator>();
     g_signal_delegator.store(impl->signals.get(), std::memory_order_release);
-    g_avx_layout.store(impl->host_features.SupportsAVX, std::memory_order_release);
+    g_avx_layout.store(impl->host_features.SupportsAVX && impl->host_features.SupportsSVE256, std::memory_order_release);
     InstallGuestSignalNudge();
     impl->guest_is_32bit = options.guest_is_32bit;
     impl->handler = std::make_unique<FathomSyscallHandler>(space, options.guest_is_32bit);
@@ -1510,6 +1531,7 @@ std::unique_ptr<FexEngine> FexEngine::Create(GuestAddressSpace& space, const Eng
                 "permission looks like: the code buffers cannot be made executable.";
         return nullptr;
     }
+    create_lock.unlock();
 
     // From here on, a guest alignment fault is recoverable rather than fatal.
     SetFaultRecovery(RecoverAlignmentFault);

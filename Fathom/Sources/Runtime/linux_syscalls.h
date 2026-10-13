@@ -45,6 +45,7 @@ struct GuestCpuState {
     uint64_t fs_base {};
     uint64_t gs_base {};
     uint64_t xmm[16][2] {};
+    uint64_t ymm_high[16][2] {};  ///< Upper halves of ymm0-15, carried through signal frames as Linux xstate.
     uint64_t mm[8][2] {};
     uint16_t fcw {};
     uint8_t ftw {};
@@ -230,6 +231,8 @@ public:
     /// interrupted. `sender` is the pid the handler's siginfo names.
     void QueueSignal(int signal, int sender);
     /// Whether a queued signal is not blocked: what every blocking loop checks.
+    /// The address space this thread's process runs in now (exec replaces it). Lock-free, for fault handlers.
+    GuestAddressSpace* Space() const { return space_; }
     bool SignalPending() const {
         return (pending_signals_.load(std::memory_order_acquire) & ~signal_mask_) != 0;
     }

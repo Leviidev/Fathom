@@ -7240,6 +7240,45 @@ void WriteFxsave(unsigned char* out, const GuestCpuState& state) {
     }
 }
 
+// Linux x86-64 xstate after the FXSAVE image: fpx_sw_bytes in its reserved tail, the XSAVE
+// header at 512, YMM_Hi128 at 576, and FP_XSTATE_MAGIC2 right after the xstate.
+constexpr uint32_t kXstateMagic1 = 0x46505853;
+constexpr uint32_t kXstateMagic2 = 0x46505845;
+constexpr uint64_t kXstateSize = 512 + 64 + 256;
+constexpr uint64_t kXstateFrameSize = kXstateSize + 4;
+
+void WriteXstate(unsigned char* out, const GuestCpuState& state) {
+    const uint32_t extended = static_cast<uint32_t>(kXstateFrameSize);
+    const uint64_t features = 7; // x87 | SSE | YMM
+    const uint32_t size = static_cast<uint32_t>(kXstateSize);
+    std::memcpy(out + 464, &kXstateMagic1, 4);
+    std::memcpy(out + 468, &extended, 4);
+    std::memcpy(out + 472, &features, 8);
+    std::memcpy(out + 480, &size, 4);
+    std::memcpy(out + 512, &features, 8); // xstate_bv
+    for (size_t index = 0; index < 16; ++index) {
+        std::memcpy(out + 576 + index * 16, state.ymm_high[index], 16);
+    }
+    std::memcpy(out + kXstateSize, &kXstateMagic2, 4);
+}
+
+void ReadXstate(const unsigned char* in, GuestCpuState* state) {
+    uint32_t magic1 = 0;
+    uint64_t xstate_bv = 0;
+    std::memcpy(&magic1, in + 464, 4);
+    std::memcpy(&xstate_bv, in + 512, 8);
+    if (magic1 != kXstateMagic1) {
+        return; // a plain FXSAVE frame: leave the upper halves as they are
+    }
+    for (size_t index = 0; index < 16; ++index) {
+        if ((xstate_bv & 4) != 0) {
+            std::memcpy(state->ymm_high[index], in + 576 + index * 16, 16);
+        } else {
+            std::memset(state->ymm_high[index], 0, 16); // YMM in its init state
+        }
+    }
+}
+
 void ReadFxsave(const unsigned char* in, GuestCpuState* state) {
     std::memcpy(&state->fcw, in + 0, 2);
     state->ftw = in[4];
@@ -7319,21 +7358,27 @@ bool LinuxSyscalls::PushSignalFrame(GuestCpuState* in_out, int signal, int sende
         if (!on_altstack) {
             sp -= 128;
         }
-        sp = (sp - 512) & ~uint64_t {15};
+        // The fpstate is Linux's XSAVE layout, 64-byte aligned: the FXSAVE image, the XSAVE
+        // header, the upper halves of ymm0-15, then FP_XSTATE_MAGIC2. Without the ymm part a
+        // handler that runs AVX2 string functions (glibc's do, and they end in vzeroupper)
+        // hands the interrupted code back with its upper halves zeroed.
+        sp = (sp - kXstateFrameSize) & ~uint64_t {63};
         fp_address = sp;
         sp = ((sp - (8 + 424 + 128)) & ~uint64_t {15}) - 8;
         handler_sp = sp;
         uc_address = sp + 8;
         info_address = uc_address + 424;
-        auto* frame = static_cast<unsigned char*>(GuestPointer(handler_sp, fp_address + 512 - handler_sp, true));
+        auto* frame = static_cast<unsigned char*>(GuestPointer(handler_sp, fp_address + kXstateFrameSize - handler_sp, true));
         if (frame == nullptr) {
             FATHOM_WARN("[pid %d/%d] signal %d: no room on the stack at %#llx", pid_, Tid(), signal,
                         static_cast<unsigned long long>(handler_sp));
             return false;
         }
-        std::memset(frame, 0, fp_address + 512 - handler_sp);
+        std::memset(frame, 0, fp_address + kXstateFrameSize - handler_sp);
         std::memcpy(frame, &action.restorer, 8);
         unsigned char* uc = frame + 8;
+        const uint64_t uc_flags = 1; // UC_FP_XSTATE: the fpstate carries an xstate block
+        std::memcpy(uc, &uc_flags, 8);
         const uint64_t ss_sp = altstack_sp_;
         const int32_t ss_flags = altstack_disabled_ ? kSsDisable : 0;
         const uint64_t ss_size = altstack_size_;
@@ -7361,6 +7406,7 @@ bool LinuxSyscalls::PushSignalFrame(GuestCpuState* in_out, int signal, int sende
         std::memcpy(uc + 40 + 23 * 8, &fp_address, 8);  // fpregs
         std::memcpy(uc + 40 + 256, &old_mask, 8);       // uc_sigmask
         WriteFxsave(frame + (fp_address - handler_sp), state);
+        WriteXstate(frame + (fp_address - handler_sp), state);
         unsigned char* info = frame + (info_address - handler_sp);
         const int32_t signo = signal;
         const int32_t code = sender == pid_ ? kSiTkill : kSiUser;
@@ -7533,6 +7579,9 @@ uint64_t LinuxSyscalls::DoRtSigreturn() {
         if (fp_address != 0) {
             if (const auto* fx = static_cast<const unsigned char*>(GuestPointer(fp_address, 512, false))) {
                 ReadFxsave(fx, &state);
+                if (const auto* xs = static_cast<const unsigned char*>(GuestPointer(fp_address, kXstateFrameSize, false))) {
+                    ReadXstate(xs, &state);
+                }
             }
         }
         std::memcpy(&signal_mask_, uc + 40 + 256, 8);

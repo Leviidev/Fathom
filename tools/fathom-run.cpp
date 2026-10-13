@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <signal.h>
 #include <termios.h>
 #include <thread>
 #include <unistd.h>
@@ -216,6 +217,20 @@ int main(int argc, char** argv) {
 
     fathom_session_set_output_sink(g_session, &WriteOut, nullptr);
     RawTerminal();
+
+    // A termination request ends the whole session at once. Installed after the session
+    // exists, so it wins over anything the JIT's signal setup put in place: a Steam
+    // session that outlives the `timeout` around it is several gigabytes left running.
+    {
+        struct sigaction action {};
+        action.sa_handler = [](int) {
+            RestoreTerminal();
+            _exit(143);
+        };
+        sigaction(SIGTERM, &action, nullptr);
+        sigaction(SIGINT, &action, nullptr);
+        sigaction(SIGHUP, &action, nullptr);
+    }
 
     // Host stdin into the guest. Detached because the guest decides when the program
     // ends, and a thread parked in read() must not hold that up.

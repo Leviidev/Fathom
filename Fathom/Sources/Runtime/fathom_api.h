@@ -112,6 +112,10 @@ typedef struct {
     bool reduced_precision_x87;
     bool disable_avx;               ///< Tell the guest's CPUID there is no AVX.
     bool trace_syscalls;           ///< Log every guest syscall (very loud).
+    /// Keep the session alive until every guest process has exited, not just the first.
+    /// A launcher that starts the real program and then exits -- Steam's bootstrapper --
+    /// otherwise takes the program down with it.
+    bool wait_for_children;
 } fathom_session_config;
 
 /// Fills `config` with the defaults Settings starts from.

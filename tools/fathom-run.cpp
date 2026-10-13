@@ -78,6 +78,7 @@ void Usage() {
                  "  --env K=V      add an environment variable (repeatable)\n"
                  "  --trace        log every guest syscall\n"
                  "  --quiet        only warnings and errors from the emulator itself\n"
+                 "  --wait-all     stay until every guest process has exited, not just the first\n"
                  "  --tso          emulate x86 memory ordering (every unaligned access then faults)\n"
                  "  --arena MB     guest address space reservation\n"
                  "\n"
@@ -94,6 +95,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> env;
     bool trace = false;
     bool tso = false;
+    bool wait_all = false;
     bool multiblock = true;
     int max_inst = 0;
     bool quiet = false;
@@ -117,6 +119,8 @@ int main(int argc, char** argv) {
             multiblock = false;
         } else if (option == "--quiet") {
             quiet = true;
+        } else if (option == "--wait-all") {
+            wait_all = true;
         } else if (option == "--single-step") {
             // One guest instruction per block, so a fault's reported RIP is the instruction itself.
             max_inst = 1;
@@ -194,6 +198,7 @@ int main(int argc, char** argv) {
     config.envp = env_pointers.data();
     config.envc = static_cast<int>(env_pointers.size());
     config.trace_syscalls = trace;
+    config.wait_for_children = wait_all;
     config.tso_enabled = tso;
     config.multiblock = multiblock;
     config.max_inst_per_block = max_inst;

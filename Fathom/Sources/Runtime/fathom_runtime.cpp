@@ -415,6 +415,7 @@ struct fathom_session final : fathom::ProcessHost {
     std::string guest_root;
     uint64_t stack_size {};
     bool trace {};
+    bool wait_for_children {};
     /// Whether this session's guest is an i386 one, which every process it forks needs to
     /// be told: its syscalls are numbered differently, and a child that is not told
     /// dispatches its parent's numbers as though they were x86-64's.
@@ -2272,6 +2273,7 @@ fathom_session* fathom_session_create(const fathom_session_config* config, char*
     session->guest_root = config->guest_root == nullptr ? "" : config->guest_root;
     session->stack_size = config->stack_size != 0 ? config->stack_size : kDefaultStack;
     session->trace = config->trace_syscalls;
+    session->wait_for_children = config->wait_for_children;
 
     std::vector<std::string> argv = script_argv;
     if (config->argv != nullptr && config->argc > 0) {
@@ -2428,6 +2430,25 @@ int fathom_session_run(fathom_session* session) {
     session->SetMessage("running");
 
     const auto result = session->RunProcess(init);
+
+    // A launcher's exit is not the program's. Steam's bootstrapper updates the client,
+    // starts the real steam.exe and returns 42; what it started is the session now.
+    if (session->wait_for_children && result.outcome == fathom::RunOutcome::Exited) {
+        std::unique_lock lock {session->process_mutex};
+        for (;;) {
+            bool running = false;
+            for (auto& [pid, process] : session->processes) {
+                if (pid != init->pid && !process->finished) {
+                    running = true;
+                    break;
+                }
+            }
+            if (!running || session->console.StopRequested()) {
+                break;
+            }
+            session->process_changed.wait_for(lock, std::chrono::milliseconds(200));
+        }
+    }
 
     // The first thread returning means the guest is finished, but its other threads are
     // still inside the JIT -- parked in a futex, or polling -- holding references to state

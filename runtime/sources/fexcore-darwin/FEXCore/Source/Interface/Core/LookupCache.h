@@ -12,6 +12,7 @@
 #include <FEXCore/fextl/vector.h>
 #include <FEXCore/fextl/memory_resource.h>
 
+#include <atomic>
 #include <cstdint>
 #include <stddef.h>
 #include <utility>
@@ -227,9 +228,14 @@ public:
           auto BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
 
           if (BlockPointers[PageOffset].GuestCode == Address) {
+            // Data before tag, held in that order by a compiler barrier: the L1 slot is read
+            // without a lock, and this thread can be interrupted between the two stores. Tag
+            // first lets an interrupting lookup see GuestCode matching while HostCode still
+            // names the slot's previous occupant (Bachata-S4 caught that on a phone).
+            HostPtr = BlockPointers[PageOffset].HostCode;
+            L1Entry.HostCode = HostPtr;
+            std::atomic_signal_fence(std::memory_order_seq_cst);
             L1Entry.GuestCode = Address;
-            L1Entry.HostCode = BlockPointers[PageOffset].HostCode;
-            HostPtr = L1Entry.HostCode;
           }
         }
       }
@@ -418,8 +424,10 @@ private:
 
     // Do L1
     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
-    L1Entry.GuestCode = Address;
+    // Data before tag: see FindBlock's L2-promotion write above.
     L1Entry.HostCode = Entry.HostCode;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    L1Entry.GuestCode = Address;
 
     if (!DisableL2Cache() && !L1Only) {
       // Do ful map

@@ -47,6 +47,7 @@ $end_info$
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/HLE/SourcecodeResolver.h>
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/Event.h>
 #include <FEXCore/Utils/File.h>
 #include <FEXCore/Utils/LogManager.h>
@@ -119,6 +120,15 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
     // When operating in 32-bit mode, the virtual memory we care about is only the lower 32-bits.
     Config.VirtualMemSize = 1ULL << 32;
   }
+#ifdef FEX_APPLE_DUAL_MAPPED_JIT
+  else {
+    // iOS gives large mappings one 64GB window, shared with the guest's own memory, and every
+    // guest thread reserves a lookup table sized from this: 32MB at 16GB instead of 128MB at
+    // 64GB. The table is indexed by the address masked to this size and each entry is checked
+    // against the full address, so a smaller one only collides more.
+    Config.VirtualMemSize = 1ULL << 34;
+  }
+#endif
 
   if (Config.BlockJITNaming() || Config.GlobalJITNaming() || Config.LibraryJITNaming()) {
     // Only initialize symbols file if enabled. Ensures we don't pollute /tmp with empty files.

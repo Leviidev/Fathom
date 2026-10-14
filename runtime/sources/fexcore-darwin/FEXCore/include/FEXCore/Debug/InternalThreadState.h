@@ -109,7 +109,9 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   ///< Data pointer for exclusive use by the frontend
   void* FrontendPtr;
 
-  static constexpr size_t CALLRET_STACK_SIZE {0x400000};
+  // 16 MB: one Rocket League session overflowed 4 MB (Bachata-S4), and every overflow is a guard-page signal.
+  // Untouched pages cost nothing.
+  static constexpr size_t CALLRET_STACK_SIZE {0x1000000};
 
   // The low address of the call-ret stack allocation (not including guard pages)
   void* CallRetStackBase {};

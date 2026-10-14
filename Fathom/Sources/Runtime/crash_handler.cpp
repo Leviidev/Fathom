@@ -16,6 +16,7 @@
 #include <initializer_list>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <execinfo.h>
 #include <unistd.h>
 
@@ -302,7 +303,11 @@ extern "C" void fathom_install_crash_handler(const char* log_path) {
     }
     // Opened now, while everything still works. Opening a file from inside a signal
     // handler is exactly the kind of thing that fails when it matters.
-    fathom::g_crash_fd = open(log_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    // Appended to across runs, but started afresh once it passes 64 MB: a session that
+    // faults in a loop otherwise grows it without end (it reached 2.7 GB in the temp folder).
+    struct stat existing {};
+    const bool too_big = stat(log_path, &existing) == 0 && existing.st_size > (64 << 20);
+    fathom::g_crash_fd = open(log_path, O_WRONLY | O_APPEND | O_CREAT | (too_big ? O_TRUNC : 0), 0644);
     if (fathom::g_crash_fd < 0) {
         return;
     }

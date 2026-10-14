@@ -189,6 +189,33 @@ DEF_OP(ExitFunction) {
     ARMEmitter::ForwardLabel SkipFullLookup;
     auto RipReg = GetReg(Op->NewRIP);
 
+    // Snapshot the reuse-generation counter before either lookup below (call-ret shadow stack or
+    // L1 cache) reads a cached HostCode -- same mechanism as DispatcherLoopTop's own block lookup
+    // and ExitFunctionLinker (see JITPointers::ReuseGenerationCounterAddress's own comment,
+    // CoreState.h, and SafepointSignalHandler's, fex_guest_engine.cpp, for the full story). This
+    // path handles genuinely computed/indirect guest branches -- register-indirect calls/jumps,
+    // returns, and memory-indirect jumps like x86 `jmp [mem]` -- a third instance of the same
+    // lock-free read-then-branch shape, with its own separate cache, that neither of those two
+    // fixes reached. Confirmed on-device as the actual remaining source of the reuse-in-place
+    // crash: the guest instruction at the fault RIP was exactly `jmp [rip+disp]`, a case that can
+    // only ever route through this indirect path, never the other two. TMP3 is unused elsewhere
+    // in this function's indirect-branch handling, so it's safe as the snapshot register across
+    // everything below, regardless of which of the three branch kinds (call/return/jump) is taken.
+    //
+    // ComputedBranchGenerationUnwired guards ONLY the dereference on the next line (can't safely
+    // dereference a null ReuseGenerationCounterAddress) -- it must never skip past the shadow
+    // stack / L1 lookup logic below. An earlier version of this check used one label for both
+    // "unwired, skip the whole mechanism" and "skip just the re-check at the end", which for the
+    // *unwired* case jumped straight past the entire original lookup, leaving TMP2 completely
+    // uninitialized before the final call/return/jump -- confirmed on-device as a new,
+    // unrelated-looking crash (garbage register values, fault address 0x0) that had nothing to
+    // do with JIT reuse at all, introduced by this fix itself.
+    ARMEmitter::ForwardLabel ComputedBranchGenerationUnwired;
+    ldr(TMP3, STATE_PTR(CpuStateFrame, Pointers.ReuseGenerationCounterAddress));
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP3, &ComputedBranchGenerationUnwired);
+    ldr(TMP3, TMP3, 0);
+    (void)Bind(&ComputedBranchGenerationUnwired);
+
     if (Op->Hint == IR::BranchHint::Return) {
       // First try to pop from the call-ret stack, otherwise follow the normal path (but ending in a ret)
       ldp<ARMEmitter::IndexType::POST>(TMP1, TMP2, REG_CALLRET_SP, 0x10);
@@ -213,6 +240,30 @@ DEF_OP(ExitFunction) {
     str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
 
     (void)Bind(&SkipFullLookup);
+
+    // Re-check right before trusting TMP2 (a cache-hit HostCode from either lookup above, or --
+    // harmlessly redundant in that specific case -- DispatcherLoopTop's own address from the
+    // fallback just above, converged to the same TMP2 by this point): if the generation changed
+    // since the snapshot, redirect to DispatcherLoopTop instead of whatever TMP2 currently holds.
+    // Safe unconditionally, same reasoning as the other two checks of this kind -- and TMP1 is
+    // free to reuse here regardless of which path led to this point (none of the three branch
+    // kinds below rely on its value surviving from earlier in this function).
+    //
+    // Re-loads and re-checks ReuseGenerationCounterAddress itself here rather than reusing TMP3's
+    // zero-ness, deliberately: TMP3 legitimately reads as 0 both when unwired (nothing to compare
+    // against) AND when wired but no reuse cycle has happened yet this session (a real, valid
+    // snapshot that just happens to be 0) -- conflating those would skip this whole check for
+    // that second, perfectly normal case.
+    ARMEmitter::ForwardLabel SkipComputedBranchRecheck;
+    ldr(TMP1, STATE_PTR(CpuStateFrame, Pointers.ReuseGenerationCounterAddress));
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipComputedBranchRecheck);
+    ldr(TMP1, TMP1, 0);
+    sub(TMP1, TMP1, TMP3);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipComputedBranchRecheck);
+    ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.DispatcherLoopTop));
+    str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+
+    (void)Bind(&SkipComputedBranchRecheck);
     if (Op->Hint == IR::BranchHint::Call) {
       ARMEmitter::ForwardLabel l_CallReturn;
       if (!Op->CallReturnBlock.IsInvalid()) {

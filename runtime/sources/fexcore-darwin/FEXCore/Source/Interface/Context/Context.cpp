@@ -72,13 +72,26 @@ bool FEXCore::Context::ContextImpl::DumpDispatcherStateForDiagnostics(FEXCore::C
   // this field, ran before the dispatcher's own value was finalized, or something later wrote
   // over it -- as opposed to a dispatcher-level translation bug, which would show the *same*
   // (wrong) value in both columns.
+  // ReuseGenerationCounterAddress and ExitFunctionLinkValidatedGeneration were never included
+  // here before -- added specifically to test whether the iOS reuse-in-place generation-check
+  // fallback (Dispatcher.cpp's ExitFunctionLinker, JIT.cpp's ExitFunctionLink) is actually wired
+  // up for whichever thread crashes next. If ReuseGenerationCounterAddress reads 0 here, that
+  // check is silently skipped entirely for this thread (cbz falls straight through to trusting
+  // TMP1 unconditionally) -- a completely different bug from the race the mechanism itself is
+  // designed to close, but one that would produce the exact same symptom (stale HostCode branch
+  // target, "not tracked" JIT allocation fault).
+  const uint64_t LiveGenValue = Live.ReuseGenerationCounterAddress != 0
+    ? *reinterpret_cast<const volatile uint64_t*>(Live.ReuseGenerationCounterAddress)
+    : 0;
   const int Written = std::snprintf(
     OutBuf, OutBufSize,
     "dispatcher known-good: DispatchPtr=%#llx Start=%#llx End=%#llx ExitFunctionLinker=%#llx "
     "DispatcherLoopTop=%#llx | "
     "thread live Pointers: DispatcherLoopTop=%#llx%s ExitFunctionLinker=%#llx%s "
     "DispatcherLoopTopFillSRA=%#llx DispatcherLoopTopEnterEC=%#llx DispatcherLoopTopEnterECFillSRA=%#llx "
-    "SignalReturnHandler=%#llx SignalReturnHandlerRT=%#llx ThreadStopHandlerSpillSRA=%#llx ThreadPauseHandlerSpillSRA=%#llx",
+    "SignalReturnHandler=%#llx SignalReturnHandlerRT=%#llx ThreadStopHandlerSpillSRA=%#llx "
+    "ThreadPauseHandlerSpillSRA=%#llx | ReuseGenerationCounterAddress=%#llx%s live_gen=%llu "
+    "ExitFunctionLinkValidatedGeneration=%llu",
     static_cast<unsigned long long>(Known.DispatchPtr), static_cast<unsigned long long>(Known.Start),
     static_cast<unsigned long long>(Known.End), static_cast<unsigned long long>(Known.ExitFunctionLinkerAddress),
     static_cast<unsigned long long>(Known.DispatcherLoopTopAddress),
@@ -89,7 +102,11 @@ bool FEXCore::Context::ContextImpl::DumpDispatcherStateForDiagnostics(FEXCore::C
     static_cast<unsigned long long>(Live.DispatcherLoopTopFillSRA), static_cast<unsigned long long>(Live.DispatcherLoopTopEnterEC),
     static_cast<unsigned long long>(Live.DispatcherLoopTopEnterECFillSRA), static_cast<unsigned long long>(Live.SignalReturnHandler),
     static_cast<unsigned long long>(Live.SignalReturnHandlerRT), static_cast<unsigned long long>(Live.ThreadStopHandlerSpillSRA),
-    static_cast<unsigned long long>(Live.ThreadPauseHandlerSpillSRA));
+    static_cast<unsigned long long>(Live.ThreadPauseHandlerSpillSRA),
+    static_cast<unsigned long long>(Live.ReuseGenerationCounterAddress),
+    (Live.ReuseGenerationCounterAddress == 0 ? " NOT-WIRED-CHECK-SKIPPED" : ""),
+    static_cast<unsigned long long>(LiveGenValue),
+    static_cast<unsigned long long>(Thread->CurrentFrame->ExitFunctionLinkValidatedGeneration));
   return Written > 0;
 }
 } // namespace FEXCore::Context

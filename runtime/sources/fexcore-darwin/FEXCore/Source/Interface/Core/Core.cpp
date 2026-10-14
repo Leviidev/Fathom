@@ -8,7 +8,11 @@ desc: Glues Frontend, OpDispatcher and IR Opts & Compilation, LookupCache, Dispa
 $end_info$
 */
 
+#include <atomic>
 #include <cstdint>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 #ifdef ZYDIS_DISASSEMBLER
 #include <Zydis/Zydis.h>
 #endif
@@ -78,6 +82,35 @@ $end_info$
 #include <xxhash.h>
 
 namespace FEXCore::Context {
+
+// See CreateThread()'s own comment (below, at its call site) for why these exist -- diagnostic
+// only, tracking how many guest threads' JIT code buffers are alive at once so a real game's
+// peak can be measured instead of guessed at.
+namespace {
+std::atomic<int> BachataConcurrentJitThreads{0};
+std::atomic<int> BachataPeakConcurrentJitThreads{0};
+
+#if defined(__APPLE__)
+// Real (resident) memory footprint, matching what iOS's Jetsam out-of-memory killer actually
+// tracks -- logged alongside the concurrent-thread count below because each guest thread's
+// dedicated LookupCache reserves ~272MB of *virtual*, Commit=false address space (see
+// LookupCache.cpp), which does not by itself count toward the resident footprint iOS actually
+// enforces. Seeing whether resident_mb climbs in lockstep with concurrent thread count (as
+// opposed to, say, already being near the ceiling early for an unrelated reason) is what tells
+// us whether per-thread LookupCache growth is really the ENOMEM driver before touching any of
+// that (much more invasive) code. Returns 0 on failure; never crashes/asserts.
+uint64_t BachataResidentMemoryBytes() noexcept {
+  task_vm_info_data_t info{};
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) !=
+      KERN_SUCCESS) {
+    return 0;
+  }
+  return static_cast<uint64_t>(info.phys_footprint);
+}
+#endif
+} // namespace
+
 ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   : HostFeatures {Features}
   , CPUID {this}
@@ -110,11 +143,22 @@ struct GetFrameBlockInfoResult {
   const CPU::CPUBackend::JITCodeTail* InlineTail;
 };
 static GetFrameBlockInfoResult GetFrameBlockInfo(FEXCore::Core::CpuStateFrame* Frame) {
-  const uint64_t BlockBegin = Frame->State.InlineJITBlockHeader;
+  // InlineJITBlockHeader is a PC-relative (adr-computed) address written by the JIT's own
+  // generated entry-point code (Arm64JITCore::EmitEntryPoint: `adr TMP1, HeaderLabel`), so it
+  // always points at the EXECUTABLE-side alias of the code buffer. On iOS's dual-mapped JIT
+  // memory that alias is not guaranteed readable -- Utils/ArchHelpers/Arm64.cpp's own SIGBUS
+  // backpatch handler hit this exact trap already (see its detailed comment at the equivalent
+  // dereference): reading the executable alias directly, from inside a signal handler, produced
+  // a second, undeliverable fault that silently killed the handling thread with no crash report
+  // and no further log output. Translate to the writable alias first, same as that fixed site;
+  // the header/tail layout and offsets are address-independent (same physical page), so this is
+  // a no-op on every platform except iOS, where GetWritableAddress does a real translation.
+  const uint64_t BlockBegin = reinterpret_cast<uint64_t>(
+      FEXCore::Allocator::GetWritableAddress(reinterpret_cast<void*>(Frame->State.InlineJITBlockHeader)));
   auto InlineHeader = reinterpret_cast<const CPU::CPUBackend::JITCodeHeader*>(BlockBegin);
 
   if (InlineHeader) {
-    auto InlineTail = reinterpret_cast<const CPU::CPUBackend::JITCodeTail*>(Frame->State.InlineJITBlockHeader + InlineHeader->OffsetToBlockTail);
+    auto InlineTail = reinterpret_cast<const CPU::CPUBackend::JITCodeTail*>(BlockBegin + InlineHeader->OffsetToBlockTail);
     return {InlineHeader, InlineTail};
   }
 
@@ -138,6 +182,12 @@ uint64_t ContextImpl::GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thr
 
 uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) {
   const auto Frame = Thread->CurrentFrame;
+  // BlockBegin stays in the same (executable-alias) address space as HostPC -- both come from
+  // live PC values (InlineJITBlockHeader is adr-computed by the JIT's own generated code, see
+  // GetFrameBlockInfo's comment), so the range check and StartingHostPC accumulation below only
+  // ever compare/add numeric PC values, never dereference through BlockBegin directly. Only the
+  // RIPEntry table itself needs the writable-alias translation, since that's an actual memory
+  // read -- GetFrameBlockInfo already applies it internally for InlineHeader/InlineTail.
   const uint64_t BlockBegin = Frame->State.InlineJITBlockHeader;
   auto [InlineHeader, InlineTail] = GetFrameBlockInfo(Thread->CurrentFrame);
 
@@ -147,8 +197,12 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
     // This is currently as close as FEX can get RIP reconstructions.
     if (HostPC >= reinterpret_cast<uint64_t>(BlockBegin) && HostPC < reinterpret_cast<uint64_t>(BlockBegin + InlineTail->Size)) {
 
-      auto RIPEntry =
-        reinterpret_cast<const uint8_t*>(Frame->State.InlineJITBlockHeader + InlineHeader->OffsetToBlockTail + InlineTail->OffsetToRIPEntries);
+      // InlineHeader/InlineTail already point into the writable alias (translated inside
+      // GetFrameBlockInfo) -- derive RIPEntry from InlineTail directly instead of re-deriving
+      // from the raw, execute-only Frame->State.InlineJITBlockHeader the way this line
+      // originally did, which would dereference unreadable iOS JIT memory (see
+      // GetFrameBlockInfo's comment for the exact on-device failure mode this caused).
+      auto RIPEntry = reinterpret_cast<const uint8_t*>(InlineTail) + InlineTail->OffsetToRIPEntries;
 
       // Reconstruct RIP from JIT entries for this block.
       uint64_t StartingHostPC = BlockBegin;
@@ -431,6 +485,33 @@ ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXC
 
   InitializeCompiler(Thread);
 
+  // Diagnostic only (iOS): each guest thread's InitializeCompiler() call above just allocated
+  // its own dedicated ~16MB JIT code buffer, individually granted execute permission through
+  // StikDebug's BreakpointJIT mechanism (see ios_jit_allocator.h) -- a fresh interaction with
+  // that external, historically-unreliable-after-a-few-requests debugger EVERY time any guest
+  // thread is created, whenever during the session that happens to occur, not just at boot.
+  // Logging the concurrent-thread high-water mark here (not the cumulative total, which is a
+  // different, less useful number for sizing a fix) is what tells us how large an upfront,
+  // pre-warmed pool of reusable buffers would need to be to cover a real game like GTA V
+  // without ever making one of these late, risky calls again. See BachataConcurrentJitThreads'
+  // own definition (top of this file) -- shared with DestroyThread() below.
+  {
+    const int Now = BachataConcurrentJitThreads.fetch_add(1, std::memory_order_relaxed) + 1;
+    int Peak = BachataPeakConcurrentJitThreads.load(std::memory_order_relaxed);
+    while (Now > Peak &&
+           !BachataPeakConcurrentJitThreads.compare_exchange_weak(Peak, Now, std::memory_order_relaxed)) {
+    }
+#if defined(__APPLE__)
+    { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::IFmt("BACHATA_GUEST_THREAD_JIT_COUNT: created Thread={:#x}, concurrent={}, "
+                      "peak={}, resident_mb={}",
+                      reinterpret_cast<uintptr_t>(Thread), Now, std::max(Now, Peak),
+                      BachataResidentMemoryBytes() / (1024 * 1024)); }
+#else
+    { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::IFmt("BACHATA_GUEST_THREAD_JIT_COUNT: created Thread={:#x}, concurrent={}, peak={}",
+                      reinterpret_cast<uintptr_t>(Thread), Now, std::max(Now, Peak)); }
+#endif
+  }
+
   Thread->CurrentFrame->State.DeferredSignalRefCount.Store(0);
 
   if (Config.BlockJITNaming() || Config.GlobalJITNaming() || Config.LibraryJITNaming()) {
@@ -442,9 +523,20 @@ ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXC
 }
 
 void ContextImpl::DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
+  // See CreateThread's own comment above -- same counter, so the concurrent count this logs
+  // reflects threads still alive right after this one's own buffer is freed.
+  const int Now = BachataConcurrentJitThreads.fetch_sub(1, std::memory_order_relaxed) - 1;
+  { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::IFmt("BACHATA_GUEST_THREAD_JIT_COUNT: destroyed Thread={:#x}, concurrent={}",
+                    reinterpret_cast<uintptr_t>(Thread), Now); }
   FEXCore::Allocator::VirtualProtect(&Thread->InterruptFaultPage, sizeof(Thread->InterruptFaultPage),
                                      Allocator::ProtectOptions::Read | Allocator::ProtectOptions::Write);
   delete Thread;
+#if defined(__APPLE__)
+  // After the delete, not before -- this is what actually frees the thread's LookupCache/
+  // CPUBackend, so this is the resident footprint the destruction actually achieved.
+  { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::IFmt("BACHATA_GUEST_THREAD_JIT_COUNT: post-destroy resident_mb={}",
+                    BachataResidentMemoryBytes() / (1024 * 1024)); }
+#endif
 }
 
 #ifndef _WIN32
@@ -505,40 +597,54 @@ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, boo
     // now (not just compiling into -- a thread running already-JIT'd code never touches
     // CodeInvalidationMutex at all) needs the same exclusion this codebase's existing code-
     // invalidation entry points (InvalidateCodeBuffersCodeRange, InvalidateThreadCachedCodeRange)
-    // already rely on CodeInvalidationMutex for, so take it here too, unique/exclusive, for the
-    // duration of the actual clear. The caller (Arm64JITCore::CompileCode, on the iOS-only path
-    // that reaches this branch) is responsible for having already released its own shared lock
-    // on this same mutex before calling in here and re-acquiring it after returning -- this
-    // mutex doesn't support recursive/upgrade locking, so holding the shared lock across this
-    // call would deadlock against the exclusive lock taken here.
-    LogMan::Msg::IFmt("BACHATA_BUFFER_REUSE: begin, Thread={:#x}", reinterpret_cast<uintptr_t>(Thread));
-    std::unique_lock inval_lock {CodeInvalidationMutex};
-    LogMan::Msg::IFmt("BACHATA_BUFFER_REUSE: got CodeInvalidationMutex exclusive");
-    // By this point no other thread can be mid-compile (that would require CodeInvalidationMutex
-    // shared, which we now hold exclusively) -- but a thread executing already-JIT'd code never
-    // touches this mutex at all, so it's still safe for one to be mid-execution of a direct
-    // branch into memory we're about to invalidate. Pause any such threads before touching
-    // anything, for the same reason OnBufferReusedInPlace exists -- see
-    // BeginBufferInvalidationSafepoint's own comment, Context.h.
-    if (BeginBufferInvalidationSafepoint) {
-      BeginBufferInvalidationSafepoint(Thread);
-    }
+    // already rely on CodeInvalidationMutex for.
+    //
+    // Unlike those entry points, though, this function does NOT acquire that lock itself -- the
+    // caller (Arm64JITCore::CompileCode, on the iOS-only path that reaches this branch) must
+    // already hold it exclusive, AND must already have BeginBufferInvalidationSafepoint active,
+    // before calling in here. This used to be the other way around (acquire the mutex here, then
+    // pause other threads), which deadlocks: BeginBufferInvalidationSafepoint's pause signal can
+    // land on another guest thread at literally any point in its execution, including while that
+    // thread is mid-way through CompileBlock or ExitFunctionLink holding this same mutex *shared*
+    // (via GuardSignalDeferringSection) -- a signal handler can't run that thread's own unlock, so
+    // it stays frozen holding the shared reference until its pause is lifted, which can't happen
+    // until this function's caller finishes and calls EndBufferInvalidationSafepoint, which can't
+    // happen until this function returns, which can't happen until the exclusive lock is granted --
+    // a real, permanent deadlock, confirmed on-device as a "BACHATA_BUFFER_REUSE: begin" with no
+    // matching "got CodeInvalidationMutex exclusive" ever following it, session stuck indefinitely
+    // (CPU still busy from other threads, but zero further progress) despite the safepoint's own
+    // accounting showing all other threads successfully paused. Acquiring the mutex *before*
+    // signaling the pause avoids this by construction: a successful exclusive acquire already
+    // proves no thread currently holds it shared (ordinary mutex semantics guarantee that), so
+    // freezing every other thread afterward can never catch one mid-hold of it.
+    //
+    // The pause itself (BeginBufferInvalidationSafepoint/EndBufferInvalidationSafepoint) also has
+    // to span not just this metadata clear but the caller's subsequent memcpy that overwrites the
+    // buffer's bytes with newly compiled code -- a thread paused mid-block (not at a link site)
+    // and then resumed keeps executing forward through whatever bytes are physically there, which
+    // are still the *original*, unchanged bytes immediately after this clear, since nothing has
+    // overwritten them yet at this point. It's only unsafe once those bytes actually change, which
+    // doesn't happen until that later memcpy. Ending the safepoint before that memcpy was
+    // separately confirmed on-device to let a just-resumed thread race a concurrent compile's
+    // memcpy into the exact bytes it was already executing -- two different guest threads faulting
+    // on instruction-fetch at addresses only 0x80 apart, both landing in memory the LookupCache
+    // had already forgotten about, is exactly the signature of that race. See CompileCode's own
+    // comment (JIT.cpp) for the full Begin/lock -> clear -> memcpy -> End/unlock ordering.
+    { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::IFmt("BACHATA_BUFFER_REUSE: begin, Thread={:#x}", reinterpret_cast<uintptr_t>(Thread)); }
     auto lk = Thread->LookupCache->AcquireWriteLock();
-    LogMan::Msg::IFmt("BACHATA_BUFFER_REUSE: got own LookupCache write lock, clearing");
+    { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::IFmt("BACHATA_BUFFER_REUSE: got own LookupCache write lock, clearing"); }
     Thread->LookupCache->ClearCache(lk);
-    LogMan::Msg::IFmt("BACHATA_BUFFER_REUSE: own cache cleared, invoking OnBufferReusedInPlace={}",
-                      OnBufferReusedInPlace ? "set" : "unset");
-    // Still inside the exclusive lock's window here, so any other thread that might attempt
+    { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::IFmt("BACHATA_BUFFER_REUSE: own cache cleared, invoking OnBufferReusedInPlace={}",
+                      OnBufferReusedInPlace ? "set" : "unset"); }
+    // Still inside the caller's exclusive lock here, so any other thread that might attempt
     // to compile (and so update its own L1/L2 from this now-current L3 state) stays blocked
-    // until this returns -- see OnBufferReusedInPlace's own comment (Context.h) for why other
-    // threads' independent L1/L2 caches need to be reached at all.
+    // until the caller releases it (after its own subsequent memcpy) -- see OnBufferReusedInPlace's
+    // own comment (Context.h) for why other threads' independent L1/L2 caches need to be reached
+    // at all.
     if (OnBufferReusedInPlace) {
       OnBufferReusedInPlace(Thread, lk);
     }
-    if (EndBufferInvalidationSafepoint) {
-      EndBufferInvalidationSafepoint(Thread);
-    }
-    LogMan::Msg::IFmt("BACHATA_BUFFER_REUSE: end, releasing CodeInvalidationMutex");
+    { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::IFmt("BACHATA_BUFFER_REUSE: metadata clear done, returning to caller"); }
   }
   Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
 }
@@ -873,6 +979,26 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   };
 }
 
+} // namespace FEXCore::Context
+
+// Forward declaration only, deliberately not an #include of Bachata-S4's own app-level header
+// from this vendored FEXCore file -- this is temporary, diagnostic-only wiring (see its call
+// site below, inside ContextImpl::CompileBlock), not a permanent architectural dependency. Both
+// this file and its real definition (fex_guest_engine.cpp) end up in the same final static
+// library, so this links correctly as long as the signature matches exactly. Declared here, at
+// true global scope with FEXCore::Context closed and reopened around it, rather than nested
+// three levels deep inside it (this whole file is one un-closed `namespace FEXCore::Context {`
+// block starting near its top) -- a nested `namespace AetherPS4::Fex {}` here would silently
+// declare FEXCore::Context::AetherPS4::Fex::... instead of the real, top-level one, which then
+// fails to link against the call site's `::AetherPS4::Fex::...`.
+namespace AetherPS4::Fex {
+// A weak, empty default, so FEXCore links into hosts that are not AetherPS4 (Fathom); the
+// app's real definition overrides it at link time.
+__attribute__((weak)) void BachataRecordKnownBlockSnapshot(uintptr_t, const unsigned char*, std::size_t) noexcept {}
+}
+
+namespace FEXCore::Context {
+
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
   if constexpr (BLOCK_DEBUGGING) {
     // Block debugging logic is hand-written and needs to be handled with care.
@@ -905,6 +1031,70 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
+
+  // Diagnostic only, gated to a single known-deterministic guest RIP: a 100%-reproducible
+  // "write to address 0x0" crash traces back to this exact block (a VEX MOVAPS pair with
+  // RIP-relative operands), with the fault's own register dump showing a scratch register (x18)
+  // as zero even though the host code physically at the fault PC, read moments after the fault,
+  // disassembles as a correct mov/movk/movk sequence that should have set it. That could mean
+  // the disassembly-after-the-fact is stale (something rewrote this exact memory between fault
+  // and read), or it could mean the compile-time-emitted bytes were never actually correct at
+  // this address in the first place and the crash dump's read is accurate. Logging the freshly
+  // compiled host entry address and its first bytes right here, at the moment of compilation
+  // (before this thread or any other could possibly have executed or reused any of it), settles
+  // which one it is.
+  if (GuestRIP == 0x7001a19ed0ULL && CodePtr != nullptr) {
+    auto* Bytes = reinterpret_cast<const unsigned char*>(
+      FEXCore::Allocator::GetWritableAddress(const_cast<void*>(reinterpret_cast<const void*>(CodePtr))));
+    // Capture the *entire* compiled fragment, not just its first few bytes -- the crash this is
+    // chasing faults partway through a block (not necessarily at its very entry point), so a
+    // short, fixed-size snapshot from CodePtr could miss the actual faulting address entirely
+    // if the block is longer than that. CompiledCode.Size is the true host code size for this
+    // exact compile; capped defensively since this is a fixed-size diagnostic buffer, not
+    // because any real block is expected to approach that cap.
+    const std::size_t CaptureLen = std::min<std::size_t>(CompiledCode.Size, 4096);
+    fextl::string HexDump;
+    for (std::size_t i = 0; i < std::min<std::size_t>(CaptureLen, 64); ++i) {
+      HexDump += fmt::format("{:02x} ", Bytes[i]);
+    }
+    { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::EFmt("BACHATA_COMPILE_SNAPSHOT: GuestRIP={:#x} CodePtr={:#x} CompiledSize={:#x} first64bytes={}",
+                      GuestRIP, reinterpret_cast<uintptr_t>(CodePtr), CompiledCode.Size, HexDump); }
+    // Also dump the raw *guest* x86 bytes this block was actually compiled from -- FEX
+    // identity-maps guest memory into the host process, so GuestRIP is directly readable as a
+    // host pointer, no translation needed. This sidesteps offline PS4 SELF-format extraction
+    // entirely (individually compressed segments made a naive raw-file dump of the exported
+    // eboot.bin unreliable past the first instruction or two -- disassembly repeated
+    // suspiciously, a classic sign of reading through non-code/compressed bytes) by capturing
+    // exactly what the JIT itself decoded, straight from the live, already-decompressed guest
+    // image.
+    //
+    // A prior fixed 2048-byte capture only covered the first 248 x86 instructions -- a
+    // branch-free run of RIP-relative vmovaps/mov stores -- and never reached the actual fault
+    // site, which the ARM64-side offset math places roughly 65% of the way through this
+    // (unusually large, 24852-byte host) block. `Length` here is CompileCode's own guest-side
+    // byte length for this exact block (destructured above from its CompileCode() call), so
+    // using it instead of a guess guarantees this single capture covers the real fault site
+    // regardless of how large the block turns out to be.
+    {
+      const auto* GuestBytes = reinterpret_cast<const unsigned char*>(GuestRIP);
+      fextl::string GuestHexDump;
+      const std::size_t GuestCaptureLen = std::min<std::size_t>(std::max<std::size_t>(Length, 2048), 65536);
+      for (std::size_t i = 0; i < GuestCaptureLen; ++i) {
+        GuestHexDump += fmt::format("{:02x}", GuestBytes[i]);
+      }
+      { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::EFmt("BACHATA_GUEST_SOURCE_SNAPSHOT: GuestRIP={:#x} BlockLength={:#x} len={:#x} bytes={}", GuestRIP,
+                        Length, GuestCaptureLen, GuestHexDump); }
+    }
+    // Also stash the full capture for a byte-for-byte crash-time comparison (see
+    // AetherPS4::Fex::BachataCompareKnownBlockSnapshot, called from signals.cpp) -- a plain
+    // forward declaration rather than including Bachata-S4's own app-level header from this
+    // vendored FEXCore file, since this is temporary, diagnostic-only wiring, not a permanent
+    // architectural dependency. Same final static library, so this links correctly as long as
+    // the signature here matches the real definition exactly (namespace included -- name
+    // mangling depends on it).
+    ::AetherPS4::Fex::BachataRecordKnownBlockSnapshot(reinterpret_cast<uintptr_t>(Bytes), Bytes, CaptureLen);
+  }
+
   if (CodePtr == nullptr) {
     return 0;
   } else if (!DebugData) {
@@ -974,6 +1164,19 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   // Insert to lookup cache
 
   for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
+    // Diagnostic only, gated to one known-deterministic guest RIP under investigation (see
+    // JIT.cpp's BACHATA_EXITFUNCTIONLINK_TARGET, which already proved a bad HostCode is sitting
+    // in the cache by the time it's read back, not corrupted between read and use). This is the
+    // one and only site that ever writes this guest address's entry (AddBlockMapping), so logging
+    // exactly what gets stored here -- and whether it's already invalid at the moment of storage
+    // -- settles whether the bug is in what CompileCode computed, or something overwriting the
+    // BlockList entry afterward.
+    if (GuestAddr == 0x70007b9cf0ULL) {
+      { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::EFmt("BACHATA_ADDBLOCKMAPPING: GuestAddr={:#x} HostAddr={:#x} Thread={:#x} "
+                        "IsAddressInCodeBuffer={}",
+                        GuestAddr, reinterpret_cast<uint64_t>(HostAddr), reinterpret_cast<uintptr_t>(Thread),
+                        IsAddressInCodeBuffer(Thread, reinterpret_cast<uintptr_t>(HostAddr))); }
+    }
     Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr);
   }
 
@@ -1011,6 +1214,14 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
 void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
   FEXCORE_PROFILE_SCOPED("InvalidateCodeBuffersCodeRange");
 
+  // Diagnostic only, temporary: unconditional (not gated behind a debug log level) since real
+  // invalidations should be rare -- typically self-modifying-code detection or an explicit
+  // guest unmap/remap, not a hot path -- so this is cheap insurance while chasing a
+  // reproducible crash whose root cause (compiled-correct-but-wrong-at-crash-time memory, or
+  // something else) is still unconfirmed. Directly answers whether anything ever invalidates a
+  // range overlapping the one known-deterministic guest RIP under investigation.
+  { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::EFmt("BACHATA_INVALIDATE_CODE_RANGE: Start={:#x} Length={:#x} End={:#x}", Start, Length, Start + Length); }
+
   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
   std::scoped_lock lk {CodeBufferListLock};
   auto it = CodeBufferList.begin();
@@ -1025,6 +1236,11 @@ void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length
 }
 
 void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
+  // Diagnostic only, temporary: see InvalidateCodeBuffersCodeRange's own comment, just above --
+  // same reasoning, same investigation.
+  { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::EFmt("BACHATA_INVALIDATE_THREAD_RANGE: Thread={:#x} Start={:#x} Length={:#x} End={:#x}",
+                    reinterpret_cast<uintptr_t>(Thread), Start, Length, Start + Length); }
+
   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
 
   // Ensures now-modified mappings aren't cached as being in their previous non-executable state.

@@ -217,13 +217,14 @@
 #define META_END_NAMESPACE_CONTAINER
 #endif
 
-#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION >= 4000
-#define META_TEMPLATE_VIS _LIBCPP_TEMPLATE_VIS
-#elif defined(_LIBCPP_VERSION)
-#define META_TEMPLATE_VIS _LIBCPP_TYPE_VIS_ONLY
-#else
+// Newer libc++ (observed with Xcode-beta's toolchain) changed _LIBCPP_TEMPLATE_VIS in a way
+// that conflicts with these non-portable forward declarations ("redefinition ... as different
+// kind of symbol" for vector/set/map/etc, since the annotation no longer matches how libc++'s
+// own headers declare the same class template). These forward declarations only need to name
+// the same entity for meta.hpp's own type-trait purposes -- they don't need to reproduce
+// libc++'s exact ABI visibility attribute -- so drop the attribute entirely rather than
+// chasing libc++'s internal macro semantics across versions.
 #define META_TEMPLATE_VIS
-#endif
 /// \endcond
 
 namespace meta

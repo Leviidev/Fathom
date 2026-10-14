@@ -228,10 +228,15 @@ public:
           auto BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
 
           if (BlockPointers[PageOffset].GuestCode == Address) {
-            // Data before tag, held in that order by a compiler barrier: the L1 slot is read
-            // without a lock, and this thread can be interrupted between the two stores. Tag
-            // first lets an interrupting lookup see GuestCode matching while HostCode still
-            // names the slot's previous occupant (Bachata-S4 caught that on a phone).
+            // Data before tag, with a compiler barrier holding that order: this L1 slot is read
+            // lock-free (FindBlock's "no lock needed" L1 check, above) and this same thread can be
+            // interrupted by a signal between these two stores. Tag-then-data (the order this used
+            // to be written in) lets an interrupting reentrant lookup observe GuestCode already
+            // matching Address while HostCode still holds this slot's previous (possibly stale/
+            // freed, hash-collision-unrelated) occupant -- a torn read that looks fully valid to
+            // FindBlock's caller. Confirmed on-device: ExitFunctionLink returning a HostCode for
+            // GuestRip=0x70007b9cf0 that pointed completely outside every current code buffer,
+            // for a GuestRip that had resolved correctly moments earlier in the same session.
             HostPtr = BlockPointers[PageOffset].HostCode;
             L1Entry.HostCode = HostPtr;
             std::atomic_signal_fence(std::memory_order_seq_cst);
@@ -424,7 +429,8 @@ private:
 
     // Do L1
     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
-    // Data before tag: see FindBlock's L2-promotion write above.
+    // Data before tag -- see the matching comment in FindBlock's L2-promotion write above for why
+    // this order (and the fence holding it) is required, not just style.
     L1Entry.HostCode = Entry.HostCode;
     std::atomic_signal_fence(std::memory_order_seq_cst);
     L1Entry.GuestCode = Address;

@@ -276,8 +276,47 @@ public:
   // releases them, called once that memory is safe to run through again. Set by GuestEngine at
   // setup, same as OnBufferReusedInPlace, since it's the one place a full thread list (with
   // native OS thread handles) exists at all.
+  //
+  // "Safe to run through again" is stricter than it first looks: a thread paused mid-block
+  // (not at a link site) keeps executing forward through whatever bytes are physically at its
+  // resume PC once released, and those bytes are still the *original* ones right up until
+  // something actually overwrites them -- ClearCodeCache's NewCodeBuffer=false path (Core.cpp)
+  // only clears metadata (LookupCache/BlockLinks), it never itself touches the buffer's bytes.
+  // The caller that goes on to physically repopulate that buffer (JIT.cpp's CompileCode, via its
+  // post-clear memcpy) is therefore the one that must hold this pause open -- calling Begin
+  // before ClearCodeCache(..., false) and End only after that memcpy finishes, not just around
+  // the clear itself. Ending it too early was confirmed on-device to still let a just-resumed
+  // thread race that memcpy into the exact bytes it was already executing.
+  //
+  // Ordering relative to CodeInvalidationMutex matters too, and it's the opposite of what seems
+  // natural: the caller must acquire that mutex exclusively *before* calling Begin, not after.
+  // BeginBufferInvalidationSafepoint's pause signal can land on another guest thread at any point
+  // in its execution, including mid-way through CompileBlock or ExitFunctionLink while that thread
+  // holds this same mutex *shared* -- a signal handler can't run that thread's own unlock, so it
+  // stays frozen holding the shared reference for as long as the pause lasts. If the pausing
+  // thread then tries to acquire the mutex exclusively *after* pausing everyone, it can deadlock
+  // against exactly the thread it just froze mid-hold: confirmed on-device as a
+  // "BACHATA_BUFFER_REUSE: begin" with no matching completion ever following it, the session
+  // stuck indefinitely with zero further progress despite the safepoint's own accounting showing
+  // every other thread successfully paused. Acquiring the mutex first avoids this by construction
+  // -- a successful exclusive acquire already proves (via ordinary mutex semantics) that no thread
+  // currently holds it shared, so pausing everyone afterward can never catch one mid-hold of it.
   std::function<void(FEXCore::Core::InternalThreadState* CallingThread)> BeginBufferInvalidationSafepoint;
   std::function<void(FEXCore::Core::InternalThreadState* CallingThread)> EndBufferInvalidationSafepoint;
+
+  // Owned by GuestEngine (fex_guest_engine.cpp), set at the same setup point as the two members
+  // just above. Points at a process-wide std::atomic<uint64_t> incremented once per completed
+  // reuse-in-place cycle -- see JITPointers::ReuseGenerationCounterAddress and
+  // CpuStateFrame::ExitFunctionLinkValidatedGeneration for what this closes: the safepoint
+  // mechanism above protects every thread it successfully pauses *before* a reuse starts, but
+  // signal delivery has real, nonzero latency, and a thread whose own trip through
+  // ExitFunctionLinker's post-call window (Dispatcher.cpp) happens to finish faster than that
+  // latency can execute a stale branch before ever being signaled at all -- confirmed on-device
+  // as the actual remaining source of the reuse-in-place crash even with that redirect already
+  // in place. This generation counter is the fallback for exactly that gap: a live, lock-free
+  // check ExitFunctionLinker performs itself, right before trusting the value ExitFunctionLink
+  // (JIT.cpp) handed back, rather than relying solely on having been paused in time.
+  std::atomic<uint64_t>* ReuseGenerationCounter = nullptr;
 
   void ConfigureAOTGen(FEXCore::Core::InternalThreadState* Thread, fextl::set<uint64_t>* ExternalBranches, uint64_t SectionMaxAddress) override;
 

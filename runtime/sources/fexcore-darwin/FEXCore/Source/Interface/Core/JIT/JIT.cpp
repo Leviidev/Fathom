@@ -35,8 +35,10 @@ $end_info$
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <pthread.h>
 #include <unistd.h>
 
 namespace {
@@ -558,9 +560,33 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   uintptr_t HostCode {};
   auto GuestRip = Record->GuestRIP;
 
+  // Diagnostic-only, gated to the exact GuestRIP recorded in a 100%-reproducible Bloodborne
+  // SIGILL: the host fault PC landed at Record+0xc (the GuestRIP data field 4 bytes in) with
+  // Record->HostCode still 0 (this call site had never been linked before). Every static-code
+  // path from here through Dispatcher.cpp's ExitFunctionLinker trampoline (register convention,
+  // TMP1/TMP_ABIARGS mapping, FillStaticRegs's own scratch-register choice, the reuse-generation
+  // check) has been read and checked against this build's actual config and comes back
+  // consistent -- so the corruption is either in the *value* this function computes/returns, or
+  // it happens in the trampoline anyway despite that reading. Logging the real return value at
+  // each exit point, right where it's computed, distinguishes the two: a bad value logged here
+  // means FindBlock/CompileBlock returned garbage; a good value logged here with the crash still
+  // happening means the corruption is downstream of this function's return, in the assembly glue.
+  constexpr uint64_t BloodborneTraceGuestRip = 0x7002047b00ULL;
+  const bool TraceThisCall = GuestRip == BloodborneTraceGuestRip;
+  if (TraceThisCall) {
+    char trace_thread_name[64] = {};
+    pthread_getname_np(pthread_self(), trace_thread_name, sizeof(trace_thread_name));
+    { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::EFmt("BACHATA_BLOODBORNE_THUNK_TRACE: enter thread='{}' Record={:#x} Record->HostCode={:#x} "
+                      "Record->CallerOffset={} TFSet={}",
+                      trace_thread_name, reinterpret_cast<uintptr_t>(Record), Record->HostCode, Record->CallerOffset, TFSet); }
+  }
+
   if (TFSet) {
     // If TF is set, the cache must be skipped as different code needs to be generated.
     Frame->State.rip = GuestRip;
+    if (TraceThisCall) {
+      { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::EFmt("BACHATA_BLOODBORNE_THUNK_TRACE: return(TFSet) DispatcherLoopTop={:#x}", Frame->Pointers.DispatcherLoopTop); }
+    }
     return Frame->Pointers.DispatcherLoopTop;
   } else {
     {
@@ -574,9 +600,32 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
       auto CodeBuffer = static_cast<Arm64JITCore*>(Thread->CPUBackend.get())->CurrentCodeBuffer;
       HostCode = static_cast<Context::ContextImpl*>(Thread->CTX)->CompileBlock(Frame, GuestRip, 0);
       if (Thread->LookupCache->Shared != CodeBuffer->LookupCache.get()) {
+        // See the final return's own comment, below, for why this is set here too -- the
+        // caller's ExitFunctionLinker (Dispatcher.cpp) branches to whatever HostCode this
+        // function returns with no lock or synchronization of its own, and a safepoint-paused
+        // thread caught in that window needs State.rip to already reflect this target for a
+        // DispatcherLoopTop redirect to land anywhere sane. Also record the current
+        // reuse-generation (see the final return's comment) for the same caller's own,
+        // non-signal-dependent staleness check.
+        Frame->State.rip = GuestRip;
+        if (Frame->Pointers.ReuseGenerationCounterAddress) {
+          Frame->ExitFunctionLinkValidatedGeneration =
+            reinterpret_cast<std::atomic<uint64_t>*>(Frame->Pointers.ReuseGenerationCounterAddress)
+              ->load(std::memory_order_acquire);
+        }
+        if (TraceThisCall) {
+          { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::EFmt("BACHATA_BLOODBORNE_THUNK_TRACE: return(buffer-swap) HostCode={:#x} "
+                            "IsAddressInCodeBuffer={}",
+                            HostCode, static_cast<Context::ContextImpl*>(Thread->CTX)->IsAddressInCodeBuffer(Thread, HostCode)); }
+        }
         return HostCode;
       }
     }
+  }
+
+  if (TraceThisCall) {
+    { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::EFmt("BACHATA_BLOODBORNE_THUNK_TRACE: post-lookup HostCode={:#x} IsAddressInCodeBuffer={}", HostCode,
+                      HostCode != 0 ? static_cast<Context::ContextImpl*>(Thread->CTX)->IsAddressInCodeBuffer(Thread, HostCode) : false); }
   }
 
 #ifdef __APPLE__
@@ -600,6 +649,30 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
 
   // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking
   auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);
+
+  // Re-validate HostCode now that we hold CodeInvalidationMutex again -- it was captured earlier
+  // (either FindBlock's fast-path hit above, or CompileBlock's return value on the slow path)
+  // while that lock was held only briefly, and an iOS reuse-in-place cycle (NewCodeBuffer=false)
+  // could have run entirely within the gap since then. Unlike a NewCodeBuffer=true reuse,
+  // reuse-in-place clears BlockList/BlockLinks without swapping the LookupCache object itself,
+  // so it's invisible to the "Thread->LookupCache->Shared != CodeBuffer->LookupCache.get()" check
+  // the slow path already does above. Worse, neither that check nor the safepoint mechanism
+  // protects a value already captured into this function's own HostCode local: a thread can be
+  // safepoint-paused *after* reading a since-invalidated HostCode but *before* ever writing it
+  // anywhere, and on resume it has no way to know the value it's still holding went stale while
+  // it was frozen -- the pause only ever protected memory, not a local variable already sitting
+  // in a register. Confirmed on-device as the remaining source of the exact same
+  // "instruction-fetch fault, not inside any currently-live JIT allocation" crash even after the
+  // safepoint's own hold window and CodeInvalidationMutex acquisition ordering were separately
+  // fixed. A fresh FindBlock() here is cheap insurance (this must run before AcquireWriteLock()
+  // below -- FindBlock takes its own read lock on the same underlying mutex GuestToHostMap::Lock,
+  // which would deadlock against that write lock from this same thread); if it disagrees with
+  // what we're still holding, re-resolve properly instead of patching a branch to a target
+  // that's already gone.
+  if (auto Current = Thread->LookupCache->FindBlock(Thread, GuestRip); Current != HostCode) {
+    HostCode = Current ? Current : static_cast<Context::ContextImpl*>(Thread->CTX)->CompileBlock(Frame, GuestRip, 0);
+    BranchOffset = HostCode / 4 - CallerAddress / 4;
+  }
 
   // Lock here is necessary to prevent simultaneous linking and delinking
   auto lk = Thread->LookupCache->AcquireWriteLock();
@@ -656,6 +729,46 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);
   }
 
+  // The caller (ExitFunctionLinker, Dispatcher.cpp) takes this return value in TMP1 and, after a
+  // few more instructions (spilling regs, an isb, no further lock or synchronization of any
+  // kind), branches straight to it -- a second, separate instance of the same class of bug the
+  // HostCode re-validation above this function already fixed, just living in the assembly glue
+  // around this call instead of inside it. A thread safepoint-paused anywhere in that window
+  // resumes still holding this exact value with the branch to it still pending; the
+  // SafepointSignalHandler (fex_guest_engine.cpp) redirects such a thread back to
+  // DispatcherLoopTop, which needs State.rip to already be the real target -- match the TFSet
+  // branch above, which has done this from the start for exactly this reason.
+  //
+  // Being paused in time isn't guaranteed, though: signal delivery has real, nonzero latency,
+  // and if this whole window (from here to ExitFunctionLinker's own final branch) finishes
+  // faster than that latency, this thread executes the branch having never been signaled at
+  // all -- confirmed on-device as still crashing with the signal-based redirect alone in place.
+  // ExitFunctionLinkValidatedGeneration is the fallback: record the reuse-generation counter's
+  // value right now, at the moment HostCode is confirmed fresh, so ExitFunctionLinker can
+  // re-read the live counter right before its branch and catch a reuse that completed in that
+  // gap even if the signal missed it entirely.
+  Frame->State.rip = GuestRip;
+  if (Frame->Pointers.ReuseGenerationCounterAddress) {
+    Frame->ExitFunctionLinkValidatedGeneration =
+      reinterpret_cast<std::atomic<uint64_t>*>(Frame->Pointers.ReuseGenerationCounterAddress)
+        ->load(std::memory_order_acquire);
+  }
+  // Diagnostic-only, gated to one known-deterministic guest RIP: chasing a 100%-reproducible
+  // "instruction-fetch fault, not inside any currently-live JIT allocation" crash that always
+  // resolves this exact GuestRIP. The reuse-generation check above (Dispatcher.cpp's
+  // ExitFunctionLinker) already confirmed no buffer-reuse cycle happens around the fault --
+  // live_gen matched ExitFunctionLinkValidatedGeneration exactly -- so the HostCode this
+  // function is about to return is either wrong from the moment it was computed (a genuine
+  // CompileBlock/FindBlock correctness bug for this specific guest function) or gets corrupted
+  // somewhere between this return and ExitFunctionLinker's own branch, outside the reuse
+  // mechanism entirely. Logging the exact value right here, at the one point closest to its
+  // computation, settles which.
+  if (GuestRip == 0x70007b9cf0ULL) {
+    { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::EFmt("BACHATA_EXITFUNCTIONLINK_TARGET: GuestRip={:#x} HostCode={:#x} TFSet={} "
+                      "IsAddressInCodeBuffer={}",
+                      GuestRip, HostCode, TFSet,
+                      HostCode != 0 ? static_cast<Context::ContextImpl*>(Thread->CTX)->IsAddressInCodeBuffer(Thread, HostCode) : false); }
+  }
   return HostCode;
 }
 
@@ -1065,6 +1178,23 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   }
   PendingTargetLabel = nullptr;
 
+  // Diagnostic-only: collects the thunk-start address (and its offset-0x08 ldr instruction's own
+  // address) for every PendingJumpThunk targeting Bloodborne's traced GuestRIP compiled into this
+  // block, so their actual emitted bytes can be re-read and logged once the trailing loop's own
+  // shared l_ExitLink label (reused across every iteration below -- see AddLocationToLabel/Bind
+  // in CodeEmitter/Emitter.h, which never clears FirstInst/Insts between binds) gets its final,
+  // correct rebind to the real shared-linker symbol after the loop. Traced statically through
+  // Bind's own logic, every intermediate rebind inside the loop *should* get overwritten by that
+  // final one -- this dump is here to confirm that holds for real compiled output, since a
+  // Bloodborne SIGILL traced back to this same GuestRIP lands inside a *different*, never-linked
+  // thunk that never even entered ExitFunctionLink, which the static trace alone couldn't explain.
+  struct BloodborneTracedThunk {
+    uint64_t ThunkAddress;
+    uint64_t CallerAddress;
+  };
+  fextl::vector<BloodborneTracedThunk> BloodborneTracedThunks;
+  constexpr uint64_t BloodborneTraceGuestRip = 0x7002047b00ULL;
+
   ARMEmitter::ForwardLabel l_ExitLink;
   for (auto& PendingJumpThunk : PendingJumpThunks) {
     // Align as 64-bit atomics are used on the HostCode field.
@@ -1084,10 +1214,34 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     dc64(0);                                                                   // HostCode
     PlaceNamedSymbolLiteral(InsertGuestRIPLiteral(PendingJumpThunk.GuestRIP)); // GuestRIP
     dc64(PendingJumpThunk.CallerAddress - ThunkAddress);                       // CallerOffset
+
+    if (PendingJumpThunk.GuestRIP == BloodborneTraceGuestRip) {
+      BloodborneTracedThunks.push_back({ThunkAddress, PendingJumpThunk.CallerAddress});
+    }
   }
 
   BindOrRestart(&l_ExitLink);
   PlaceNamedSymbolLiteral(InsertNamedSymbolLiteral(RelocNamedSymbolLiteral::NamedSymbol::SYMBOL_LITERAL_EXITFUNCTION_LINKER));
+
+  // See BloodborneTracedThunks' own comment above, at this loop's declaration. Reading these back
+  // now, right after l_ExitLink's final rebind, shows whether every thunk's offset-0x08 ldr and
+  // offset-0x00 unlinked-entry instruction actually ended up correct at the moment this compile
+  // finishes -- if they're already wrong here, the bug is in this emission/labeling code; if
+  // they're correct here but Bloodborne still crashes on a later run, the corruption happens
+  // afterward (buffer reuse, a later compile overlapping this memory, or a runtime patch race).
+  for (const auto& Traced : BloodborneTracedThunks) {
+    const uint32_t Word00 = *reinterpret_cast<const uint32_t*>(Traced.ThunkAddress + 0x00);
+    const uint32_t Word04 = *reinterpret_cast<const uint32_t*>(Traced.ThunkAddress + 0x04);
+    const uint32_t Word08 = *reinterpret_cast<const uint32_t*>(Traced.ThunkAddress + 0x08);
+    const uint32_t Word0c = *reinterpret_cast<const uint32_t*>(Traced.ThunkAddress + 0x0c);
+    const uint64_t HostCodeField = *reinterpret_cast<const uint64_t*>(Traced.ThunkAddress + 0x10);
+    const uint32_t CallerWord = *reinterpret_cast<const uint32_t*>(Traced.CallerAddress);
+    { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::EFmt("BACHATA_BLOODBORNE_THUNK_TRACE: post-compile thunk ThunkAddress={:#x} "
+                      "CallerAddress={:#x} CallerWord={:#x} word00={:#x} word04={:#x} word08={:#x} "
+                      "word0c={:#x} HostCodeField={:#x}",
+                      Traced.ThunkAddress, Traced.CallerAddress, CallerWord, Word00, Word04, Word08, Word0c,
+                      HostCodeField); }
+  }
 
   // CodeSize not including the header or tail data.
   const uint64_t CodeOnlySize = GetCursorAddress<uint8_t*>() - CodeBegin;
@@ -1162,6 +1316,14 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   {
     auto CodeBufferLock = std::unique_lock {CodeBuffers.CodeBufferWriteMutex};
 
+    // Set below, on the iOS reuse-in-place path only, when this compile actually took
+    // CodeInvalidationMutex exclusively and opened a BeginBufferInvalidationSafepoint pause --
+    // see the matching unlock()/EndBufferInvalidationSafepoint call near this function's memcpy
+    // below, and BeginBufferInvalidationSafepoint's own comment (Context.h) for why both need to
+    // stay held that far past the metadata clear, and why the mutex must be acquired before the
+    // pause is opened rather than after.
+    bool HeldReuseSafepoint = false;
+
     // Query size of generated code
     const auto TempSize = GetCursorOffset();
 
@@ -1200,25 +1362,67 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
         // real bug underneath it is fixed, rather than working around it by avoiding this
         // path altogether.
         //
-        // ClearCodeCache's NewCodeBuffer=false branch (Core.cpp) now takes CodeInvalidationMutex
-        // exclusively for the duration of the clear, to exclude any other thread that might
-        // currently be *executing* out of the buffer being reused (not just compiling into it --
-        // execution of already-JIT'd code never touches this mutex at all, so this is the only
-        // guard available). This call site is reached from deep inside CompileBlock (Core.cpp),
-        // which already holds that same mutex *shared* for its entire duration
+        // ClearCodeCache's NewCodeBuffer=false branch (Core.cpp) requires the caller to already
+        // hold CodeInvalidationMutex exclusively before calling in, to exclude any other thread
+        // that might currently be *executing* out of the buffer being reused (not just compiling
+        // into it -- execution of already-JIT'd code never touches this mutex at all, so this is
+        // the only guard available). This call site is reached from deep inside CompileBlock
+        // (Core.cpp), which already holds that same mutex *shared* for its entire duration
         // (GuardSignalDeferringSection<std::shared_lock>) -- this mutex doesn't support
-        // recursive or shared-to-exclusive-upgrade locking, so calling in here without first
-        // releasing that shared lock would deadlock against the exclusive lock ClearCodeCache
-        // now takes. Release it manually here and restore it immediately after, bypassing the
+        // recursive or shared-to-exclusive-upgrade locking, so acquiring the exclusive lock
+        // without first releasing that shared reference would deadlock against ourselves.
+        // Release it manually here and restore it (see below, past the memcpy), bypassing the
         // RAII wrapper CompileBlock's local `lk` owns (its own eventual unlock_shared() in that
         // caller's destructor stays correctly balanced as long as this thread holds exactly one
         // shared reference again by the time this function returns, which the sequence below
         // guarantees) -- WritePriorityMutex::Mutex doesn't track *which* call site (de)acquired
         // it, only the net reader/writer counts, so this is safe purely at the mutex level.
+        //
+        // Acquire the exclusive lock BEFORE opening the safepoint pause, not after -- see
+        // BeginBufferInvalidationSafepoint's own comment (Context.h) for the deadlock this
+        // ordering avoids: pausing every other thread first can freeze one of them mid-hold of
+        // this same mutex (shared, from inside its own CompileBlock/ExitFunctionLink), and it can
+        // never release that hold until its pause lifts, which can't happen until we finish here
+        // -- confirmed on-device as an indefinite hang with the safepoint itself reporting every
+        // other thread successfully paused. Taking the exclusive lock first sidesteps this
+        // entirely: once acquired, no thread can currently hold it shared, so freezing everyone
+        // afterward can't catch one mid-hold.
+        //
+        // The pause itself (BeginBufferInvalidationSafepoint/EndBufferInvalidationSafepoint) is
+        // owned here, not inside ClearCodeCache, because clearing the LookupCache metadata alone
+        // doesn't make the buffer safe to resume into -- the bytes a paused-then-resumed thread
+        // was already executing stay physically unchanged until this function's memcpy below
+        // actually overwrites them. Releasing the pause right after the metadata clear (as
+        // ClearCodeCache used to do on its own) leaves a window where a just-resumed thread can
+        // race that memcpy into the exact memory it's still running through -- confirmed on-device
+        // as two different guest threads instruction-fetch-faulting at addresses only 0x80 apart,
+        // both landing in memory the LookupCache had already forgotten. Held open from here
+        // through the memcpy closes that window; see the matching End call below.
         auto& InvalidationMutex = CTX->GetCodeInvalidationMutex();
         InvalidationMutex.unlock_shared();
+        InvalidationMutex.lock();
+        if (CTX->BeginBufferInvalidationSafepoint) {
+          CTX->BeginBufferInvalidationSafepoint(ThreadState);
+          HeldReuseSafepoint = true;
+        }
         CTX->ClearCodeCache(ThreadState, false);
-        InvalidationMutex.lock_shared();
+        // ClearCodeCache(..., false) only clears the LookupCache's metadata (BlockList/
+        // BlockLinks) -- it never touches this Emitter's own write cursor, which is still
+        // sitting wherever it was when the overflow check above fired (at/near the buffer's
+        // usable end -- that's *why* the overflow fired). Left alone, this compile's memcpy
+        // below writes starting from that same near-end offset, past the buffer's actual
+        // bounds, and CodeBuffers.LatestOffset just below records that same out-of-bounds
+        // position as the new "latest" -- so every subsequent compile re-triggers this branch
+        // and drifts the offset even further past the allocation with each cycle. Downstream,
+        // the resulting EntryPoint (rebased via Delta below onto this already-out-of-range
+        // cursor) sits outside the buffer's tracked RW range, so GetExecutableAddress's table
+        // lookup (AllocatorHooks.h) falls back to returning it untranslated -- an RW-side value
+        // masquerading as the cached HostCode, which then fails every IsAddressInCodeBuffer
+        // check downstream. This is the root cause behind the "not inside any currently-live
+        // JIT allocation" crash chased across this whole investigation. SetBuffer resets the
+        // cursor to the buffer's start, matching what the NewCodeBuffer=true path already does
+        // via its own SetBuffer call inside Arm64JITCore::ClearCache() after allocating fresh.
+        SetBuffer(CurrentCodeBuffer->Ptr, CurrentCodeBuffer->AllocatedSize);
 #else
         CTX->ClearCodeCache(ThreadState);
 #endif
@@ -1237,7 +1441,22 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       // "Ptr = CTX->CompileBlock(RIP); Ptr();", and they're inserted into the LookupCache other
       // JIT'd code reads and branches to indirectly) -- unlike BlockBegin below, which is only
       // ever used for symbol/debug bookkeeping, never branched to, so it stays a write address.
+      auto* const WriteSideValue = EntryPoint.second;
       EntryPoint.second = reinterpret_cast<uint8_t*>(FEXCore::Allocator::GetExecutableAddress(EntryPoint.second));
+      // Diagnostic-only, gated to the same GuestRIP as ExitFunctionLink's BACHATA_BLOODBORNE_
+      // THUNK_TRACE (this function's `Entry` is that same GuestRIP for the block being compiled
+      // right now). GetExecutableAddress (Allocator.cpp) returns its input unchanged whenever the
+      // write-side address isn't inside any region this thread's JIT allocator has actually
+      // registered -- an already-confirmed root cause (see this file's ClearCodeCache/SetBuffer
+      // comment above, ~line 1373) for a write-side address masquerading as a valid HostCode,
+      // landing wherever that raw number happens to be executable-mapped once branched to. If
+      // this fires unchanged for Bloodborne's traced GuestRIP, this is the same bug through a
+      // different trigger than the one already fixed there.
+      if (Entry == 0x7002047b00ULL && EntryPoint.second == WriteSideValue) {
+        { if (::FEXCore::BachataTracesEnabled()) LogMan::Msg::EFmt("BACHATA_BLOODBORNE_THUNK_TRACE: CompileCode GuestRIP={:#x} WriteSideValue={:#x} "
+                          "GetExecutableAddress returned it UNCHANGED (untranslated -- likely bug)",
+                          Entry, reinterpret_cast<uintptr_t>(WriteSideValue)); }
+      }
     }
     CodeBegin += Delta;
 
@@ -1250,6 +1469,18 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     SetCursorOffset(CodeBuffers.LatestOffset + TempSize);
 
     CodeBuffers.LatestOffset = GetCursorOffset();
+
+    // Memory this compile reused is fully repopulated now -- safe for any thread paused above to
+    // resume into. See the matching BeginBufferInvalidationSafepoint call and its comment, above.
+    // Release CodeInvalidationMutex (acquired exclusive, above, before the pause was opened) only
+    // after ending the pause, then restore this thread's own shared reference to it, matching the
+    // shared reference it held on entry to this reuse-in-place branch.
+    if (HeldReuseSafepoint) {
+      CTX->EndBufferInvalidationSafepoint(ThreadState);
+      auto& InvalidationMutex = CTX->GetCodeInvalidationMutex();
+      InvalidationMutex.unlock();
+      InvalidationMutex.lock_shared();
+    }
   }
 
   TempAllocator.DelayedDisownBuffer();

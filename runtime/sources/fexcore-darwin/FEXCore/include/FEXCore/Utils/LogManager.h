@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <cstdlib>
+namespace FEXCore {
+// AetherPS4's investigation traces (BACHATA_*). Off unless FEX_BACHATA_TRACES is set: some fire on
+// every code invalidation, hundreds of thousands of times a minute under Wine.
+inline bool BachataTracesEnabled() {
+  static const bool Enabled = std::getenv("FEX_BACHATA_TRACES") != nullptr;
+  return Enabled;
+}
+} // namespace FEXCore
+
 #include <FEXCore/Utils/CompilerDefs.h>
 
 #include <cstdarg>

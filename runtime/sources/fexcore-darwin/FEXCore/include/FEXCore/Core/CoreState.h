@@ -364,10 +364,33 @@ struct JITPointers {
    * @name Dispatcher pointers
    * @{ */
   uint64_t DispatcherLoopTop {};
+  // End of DispatcherLoopTop's lock-free block-cache lookup routine (the hottest path in the
+  // JIT: read a cached guest->host mapping straight out of L1/L2 with no synchronization at
+  // all, then branch directly to the cached host address). A thread interrupted anywhere in
+  // [DispatcherLoopTop, DispatcherBlockLookupRangeEnd) may already hold that cached address in
+  // a register with the branch to it still pending -- see SafepointSignalHandler's own comment
+  // (fex_guest_engine.cpp) for why that's unsafe specifically during a JIT buffer reuse, and why
+  // redirecting back to DispatcherLoopTop from anywhere in this range is always safe (the
+  // routine has no observable side effect before its final branch, so redoing it from scratch
+  // loses nothing).
+  uint64_t DispatcherBlockLookupRangeEnd {};
   uint64_t DispatcherLoopTopFillSRA {};
   uint64_t DispatcherLoopTopEnterEC {};
   uint64_t DispatcherLoopTopEnterECFillSRA {};
   uint64_t ExitFunctionLinker {};
+  // Raw address of a process-wide std::atomic<uint64_t> (owned by GuestEngine, not FEXCore --
+  // see ExitFunctionLinkValidatedGeneration's own comment, above) that counts completed JIT
+  // buffer reuse-in-place cycles. Not a JIT code address -- this is plain data, so unlike every
+  // other pointer in this struct it is NOT translated through GetExecutableAddress() when
+  // populated (InitThreadPointers, Dispatcher.cpp). ExitFunctionLinker (Dispatcher.cpp) loads
+  // this address, dereferences it fresh right before its final branch, and compares against
+  // ExitFunctionLinkValidatedGeneration.
+  uint64_t ReuseGenerationCounterAddress {};
+  // End of ExitFunctionLinker's own routine -- a second window with the same lock-free
+  // read-cached-target-then-branch hazard as DispatcherBlockLookupRangeEnd above, see that
+  // field's comment. [ExitFunctionLinker, ExitFunctionLinkerRangeEnd) is the range
+  // SafepointSignalHandler checks and redirects out of, same as the block-lookup range.
+  uint64_t ExitFunctionLinkerRangeEnd {};
   uint64_t ThreadStopHandlerSpillSRA {};
   uint64_t ThreadPauseHandlerSpillSRA {};
   uint64_t GuestSignal_SIGILL {};
@@ -426,6 +449,23 @@ struct CpuStateFrame {
   } SynchronousFaultData;
 
   InternalThreadState* Thread;
+
+  // Set by ExitFunctionLink (JIT.cpp) right before every return, to the JIT-buffer-reuse
+  // generation counter's value at the moment it validated the HostCode it's returning.
+  // ExitFunctionLinker (Dispatcher.cpp) re-reads the live counter right before branching to
+  // that HostCode and compares against this -- if a reuse happened in the few instructions
+  // between the C++ call returning and that branch, this value is now stale relative to the
+  // live counter, and ExitFunctionLinker redirects to DispatcherLoopTop instead of trusting a
+  // host address that may no longer be valid. See ExitFunctionLink's own comment (JIT.cpp) and
+  // JITPointers::ReuseGenerationCounterAddress (below) for the full story -- this exists because
+  // that specific window has no lock of any kind (the C++ function's own CodeInvalidationMutex
+  // hold is already released by the time it returns), and the safepoint signal that protects
+  // every other such window can't help here either: signal delivery has real, nonzero latency,
+  // and a thread whose own trip through this narrow window happens to finish faster than that
+  // latency can execute the stale branch before ever being paused. Confirmed on-device as the
+  // actual remaining source of the "instruction-fetch fault, not inside any currently-live JIT
+  // allocation" crash even with the signal-based redirect already in place for this same range.
+  uint64_t ExitFunctionLinkValidatedGeneration {};
 
 #ifdef ARCHITECTURE_arm64ec
   // Set by the kernel on ARM64EC whenever the JIT should cooperatively suspend running guest code.

@@ -102,12 +102,16 @@ private:
   uint64_t ThreadStopHandlerAddress {};
   uint64_t ThreadStopHandlerAddressSpillSRA {};
   uint64_t AbsoluteLoopTopAddress {};
+  // See JITPointers::DispatcherBlockLookupRangeEnd (CoreState.h) for what this bounds.
+  uint64_t DispatcherBlockLookupRangeEndAddress {};
   uint64_t AbsoluteLoopTopAddressFillSRA {};
   uint64_t AbsoluteLoopTopAddressEnterEC {};
   uint64_t AbsoluteLoopTopAddressEnterECFillSRA {};
   uint64_t ThreadPauseHandlerAddress {};
   uint64_t ThreadPauseHandlerAddressSpillSRA {};
   uint64_t ExitFunctionLinkerAddress {};
+  // See JITPointers::DispatcherBlockLookupRangeEnd (CoreState.h) for what this bounds.
+  uint64_t ExitFunctionLinkerRangeEndAddress {};
   uint64_t SignalHandlerReturnAddress {};
   uint64_t SignalHandlerReturnAddressRT {};
   uint64_t GuestSignal_SIGILL {};

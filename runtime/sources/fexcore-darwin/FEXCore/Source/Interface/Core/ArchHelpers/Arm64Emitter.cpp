@@ -74,12 +74,20 @@ namespace x64 {
   };
 
 #if defined(__APPLE__)
-  // x18 is Apple's platform register: the kernel may change it at any moment (context
-  // switches, signal delivery), so a value the register allocator parks there can read back
-  // as something else -- typically zero -- an instruction later. Bachata-S4 caught this on a
-  // phone as a pointer computed into x18 and stored through as address 0; Fathom's guests see
-  // it as pointers and return addresses that turn into small numbers in busy, signal-heavy
-  // processes (Chromium). Leave it out of the pool on Apple hosts.
+  // On Apple platforms x18 is reserved by the OS as the "platform register": the kernel,
+  // signal delivery, and other system runtime code are documented as free to clobber it at any
+  // time, independent of anything the running code itself does. Upstream FEX includes it in this
+  // pool unconditionally (fine on Linux/Android, which impose no such reservation), so a value
+  // FEX's own register allocator assigns to x18 here can read back silently corrupted moments
+  // after being computed. Confirmed on-device via a 100%-reproducible Rocket League crash: a
+  // compiled RIP-relative-address computation (mov/movk/movk) into x18, immediately followed by
+  // a store through it (stlur), where the disassembled code at the fault is unambiguously
+  // correct -- x18 loaded with a valid non-null guest address right before the store -- yet the
+  // store faults writing to address 0. The block that triggers it executes this exact
+  // compute-into-x18-then-store pattern hundreds of times in a row, which is consistent with a
+  // rare, timing-dependent OS clobber rather than a compile-time miscalculation (the same
+  // pattern was byte-for-byte identical between compile time and crash time, ruling out a JIT
+  // buffer/memory bug). Excluding x18 from the allocatable pool entirely removes the exposure.
   constexpr std::array<ARMEmitter::Register, 6> RA = {
     // All these callee saved
     ARMEmitter::Reg::r20, ARMEmitter::Reg::r21, ARMEmitter::Reg::r22, ARMEmitter::Reg::r23,

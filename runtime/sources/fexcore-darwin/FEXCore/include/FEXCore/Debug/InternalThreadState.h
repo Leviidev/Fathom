@@ -109,8 +109,14 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   ///< Data pointer for exclusive use by the frontend
   void* FrontendPtr;
 
-  // 16 MB: one Rocket League session overflowed 4 MB (Bachata-S4), and every overflow is a guard-page signal.
-  // Untouched pages cost nothing.
+  // Confirmed on-device (AetherPS4-iOS, Rocket League): a genuinely long play session can
+  // exhaust the full 4MB of call-return prediction headroom -- once the guest's own main-thread
+  // stack overflow bug was fixed separately (letting sessions run much longer before that
+  // unrelated crash), this cache's own capacity became the next wall, faulting on its guard page
+  // exactly like a real stack overflow would. Since MakeWritable() only mprotects this region
+  // (real pages are still committed lazily/on first touch, not up front), a larger reservation
+  // costs address space, not RAM proportional to how deep the guest actually nests -- quadrupled
+  // for comfortable headroom.
   static constexpr size_t CALLRET_STACK_SIZE {0x1000000};
 
   // The low address of the call-ret stack allocation (not including guard pages)

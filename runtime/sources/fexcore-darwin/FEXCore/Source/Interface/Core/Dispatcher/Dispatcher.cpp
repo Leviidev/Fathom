@@ -220,6 +220,28 @@ void Dispatcher::EmitDispatcher() {
       // Shift the offset by the size of the block cache entry
       add(TMP1, TMP1, TMP2, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
 
+      // Snapshot the reuse-generation counter before reading the cached HostCode below, for the
+      // same reason and using the same mechanism as ExitFunctionLinker's own check (JITPointers::
+      // ReuseGenerationCounterAddress, see its comment, CoreState.h). This lookup is lock-free
+      // exactly like that one, but unlike it never calls into C++ at all -- there's no
+      // ExitFunctionLink-equivalent to piggyback a validated value on, so both the "before" and
+      // "after" reads have to happen entirely within this routine. TMP3 is unused elsewhere in
+      // this routine, so it's safe as a snapshot register across everything below.
+      //
+      // BlockLookupGenerationUnwired guards ONLY the dereference on the next line (can't safely
+      // dereference a null ReuseGenerationCounterAddress) -- it must never skip past the actual
+      // lookup logic below. An earlier version of this check used one label for both "unwired,
+      // skip the whole mechanism" and "skip just my own re-check at the end", which for the
+      // *unwired* case jumped straight past the entire original lookup (the ldp/sub/cbnz/cbz/L1
+      // update sequence below), leaving TMP4 completely uninitialized before the final `br` --
+      // confirmed on-device as a new, unrelated-looking crash (garbage register values, fault
+      // address 0x0) that had nothing to do with JIT reuse at all, introduced by this fix itself.
+      ARMEmitter::ForwardLabel BlockLookupGenerationUnwired;
+      ldr(TMP3, STATE_PTR(CpuStateFrame, Pointers.ReuseGenerationCounterAddress));
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP3, &BlockLookupGenerationUnwired);
+      ldr(TMP3, TMP3, 0);
+      (void)Bind(&BlockLookupGenerationUnwired);
+
       // The the full LookupCacheEntry with a single LDP.
       // Check the guest address first to ensure it maps to the address we are currently at.
       // This fixes aliasing problems
@@ -244,11 +266,45 @@ void Dispatcher::EmitDispatcher() {
 
         stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1);
 
+        // Re-check right before trusting TMP4: if the generation changed since the snapshot
+        // above, a reuse-in-place cycle completed while this thread was mid-lookup, and TMP4 may
+        // no longer point at valid code -- SafepointSignalHandler's own signal-based redirect for
+        // this exact range (fex_guest_engine.cpp) can miss this if this thread's own trip through
+        // the lookup finishes faster than signal delivery latency, same as ExitFunctionLinker's
+        // equivalent gap. Redirect to AbsoluteLoopTopAddress (this routine's own start) instead of
+        // trusting TMP4 -- safe unconditionally, since nothing above this point has any guest- or
+        // host-visible side effect (the L1 cache write just above is host-only bookkeeping,
+        // harmlessly stale/overwritten by whatever this retry finds).
+        //
+        // Re-loads and re-checks ReuseGenerationCounterAddress itself here rather than reusing
+        // TMP3's zero-ness, deliberately: TMP3 legitimately reads as 0 both when unwired (nothing
+        // to compare against) AND when wired but no reuse cycle has happened yet this session (a
+        // real, valid snapshot that just happens to be 0) -- conflating those would skip this
+        // whole check for that second, perfectly normal case.
+        ARMEmitter::ForwardLabel SkipBlockLookupRecheck;
+        ldr(TMP1, STATE_PTR(CpuStateFrame, Pointers.ReuseGenerationCounterAddress));
+        (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipBlockLookupRecheck);
+        ldr(TMP1, TMP1, 0);
+        sub(TMP1, TMP1, TMP3);
+        (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipBlockLookupRecheck);
+        ldr(TMP4, STATE_PTR(CpuStateFrame, Pointers.DispatcherLoopTop));
+
+        (void)Bind(&SkipBlockLookupRecheck);
         // Jump to the block
         br(TMP4);
       }
     }
   }
+
+  // This whole block-cache lookup routine (from AbsoluteLoopTopAddress, captured above, through
+  // here) is deliberately lock-free -- it's the hottest path in the entire JIT, executed on
+  // every guest dispatch. It reads a cached guest->host mapping and, on a hit, holds the cached
+  // host address in a register (TMP4 above) for the short window between that read and the
+  // `br(TMP4)` that consumes it. See SafepointSignalHandler's own comment
+  // (fex_guest_engine.cpp) for why a thread paused by this codebase's iOS JIT-buffer-reuse
+  // safepoint mechanism during that window is unsafe, and why it redirects such a thread back to
+  // AbsoluteLoopTopAddress using exactly this end boundary.
+  DispatcherBlockLookupRangeEndAddress = GetCursorAddress<uint64_t>();
 
   {
     ThreadStopHandlerAddressSpillSRA = GetCursorAddress<uint64_t>();
@@ -325,7 +381,44 @@ void Dispatcher::EmitDispatcher() {
     // an explicit ISB here is cheap, iOS-only-in-effect insurance against any remaining
     // instruction-fetch-vs-cache-maintenance ordering gap on the executing core.
     isb();
+
+    // SafepointSignalHandler (fex_guest_engine.cpp) redirects a thread caught anywhere in this
+    // routine IF it gets signaled in time -- but signal delivery has real, nonzero latency, and
+    // a thread whose own trip through this window finishes faster than that latency executes
+    // the branch below having never been signaled at all. This is the fallback: a live,
+    // lock-free check performed right here, comparing the reuse-generation counter's current
+    // value against what ExitFunctionLink (JIT.cpp) recorded as current when it validated the
+    // HostCode now in TMP1. Confirmed on-device as the actual remaining source of the
+    // reuse-in-place crash even with the signal-based redirect alone covering this range.
+    //
+    // ReuseGenerationCounterAddress is plain data (not a JIT code address, see its own comment,
+    // CoreState.h) -- 0 if never wired up (this reuse-in-place mechanism is iOS-only), in which
+    // case this check is skipped entirely and TMP1 is trusted exactly as before this fix, with
+    // no other change in behavior.
+    ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.ReuseGenerationCounterAddress));
+    ARMEmitter::ForwardLabel ProceedToExitFunctionLinkerBranch;
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP2, &ProceedToExitFunctionLinkerBranch);
+    ldr(TMP2, TMP2, 0); // Dereference: TMP2 = current live generation.
+    ldr(TMP3, STATE_PTR(CpuStateFrame, ExitFunctionLinkValidatedGeneration));
+    sub(TMP2, TMP2, TMP3);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP2, &ProceedToExitFunctionLinkerBranch);
+
+    // Mismatch: a reuse completed since ExitFunctionLink validated this HostCode. Redirect to
+    // DispatcherLoopTop instead of trusting it -- safe unconditionally, since ExitFunctionLink
+    // already set State.rip to the real target on every return path specifically for this case.
+    ldr(TMP1, STATE_PTR(CpuStateFrame, Pointers.DispatcherLoopTop));
+
+    (void)Bind(&ProceedToExitFunctionLinkerBranch);
     br(TMP1);
+
+    // See JITPointers::DispatcherBlockLookupRangeEnd's own comment (CoreState.h) and
+    // ExitFunctionLink's final-return comment (JIT.cpp) for the full story: this whole
+    // ExitFunctionLinkerAddress routine, from its start above through this point, is a second
+    // window with the exact same class of hazard as the block-cache lookup below -- it takes
+    // ExitFunctionLink's C++ return value in TMP1 and branches straight to it (the `br` just
+    // above) with no lock or synchronization of its own. A thread safepoint-paused anywhere in
+    // this range may already be holding that value with the branch still pending.
+    ExitFunctionLinkerRangeEndAddress = GetCursorAddress<uint64_t>();
   }
 
   // Need to create the block
@@ -2680,6 +2773,8 @@ void Dispatcher::InitThreadPointers(FEXCore::Core::InternalThreadState* Thread) 
     // branched to must be translated through GetExecutableAddress() first (identity elsewhere).
     Ptrs.DispatcherLoopTop = reinterpret_cast<uint64_t>(
         FEXCore::Allocator::GetExecutableAddress(reinterpret_cast<void*>(AbsoluteLoopTopAddress)));
+    Ptrs.DispatcherBlockLookupRangeEnd = reinterpret_cast<uint64_t>(FEXCore::Allocator::GetExecutableAddress(
+        reinterpret_cast<void*>(DispatcherBlockLookupRangeEndAddress)));
     Ptrs.DispatcherLoopTopFillSRA = reinterpret_cast<uint64_t>(FEXCore::Allocator::GetExecutableAddress(
         reinterpret_cast<void*>(AbsoluteLoopTopAddressFillSRA)));
     Ptrs.DispatcherLoopTopEnterEC = reinterpret_cast<uint64_t>(FEXCore::Allocator::GetExecutableAddress(
@@ -2689,6 +2784,11 @@ void Dispatcher::InitThreadPointers(FEXCore::Core::InternalThreadState* Thread) 
             reinterpret_cast<void*>(AbsoluteLoopTopAddressEnterECFillSRA)));
     Ptrs.ExitFunctionLinker = reinterpret_cast<uint64_t>(
         FEXCore::Allocator::GetExecutableAddress(reinterpret_cast<void*>(ExitFunctionLinkerAddress)));
+    Ptrs.ExitFunctionLinkerRangeEnd = reinterpret_cast<uint64_t>(FEXCore::Allocator::GetExecutableAddress(
+        reinterpret_cast<void*>(ExitFunctionLinkerRangeEndAddress)));
+    // Plain data address, not JIT code -- deliberately NOT translated through
+    // GetExecutableAddress() (see ReuseGenerationCounterAddress's own comment, CoreState.h).
+    Ptrs.ReuseGenerationCounterAddress = reinterpret_cast<uint64_t>(CTX->ReuseGenerationCounter);
     Ptrs.ThreadStopHandlerSpillSRA = reinterpret_cast<uint64_t>(FEXCore::Allocator::GetExecutableAddress(
         reinterpret_cast<void*>(ThreadStopHandlerAddressSpillSRA)));
     Ptrs.ThreadPauseHandlerSpillSRA = reinterpret_cast<uint64_t>(FEXCore::Allocator::GetExecutableAddress(

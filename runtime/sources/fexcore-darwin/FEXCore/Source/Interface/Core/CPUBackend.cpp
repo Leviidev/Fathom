@@ -427,7 +427,23 @@ namespace CPU {
     }
 #else
     Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
-    LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
+    // LOGMAN_THROW_A_FMT compiles to a complete no-op ((void)(pred);) unless
+    // ASSERTIONS_ENABLED, which this build doesn't set -- so a failed VirtualAlloc here
+    // previously went entirely unnoticed: no log, no crash, execution just continued with
+    // Ptr == nullptr as the base address of a brand new JIT code buffer, and every guest
+    // instruction subsequently "compiled" into it got written to whatever real memory
+    // happened to sit near address zero (or wherever null-pointer arithmetic landed),
+    // silently corrupting it instead of failing cleanly. Confirmed as a real, reachable
+    // failure mode on-device: on iOS, VirtualAlloc(Execute=true) routes through
+    // iOSJITAlloc(), which depends on StikDebug (an external process) servicing a signal-
+    // trap handshake for every request -- and a captured system log showed StikDebug
+    // getting killed by the OS mid-session for violating a background wake-rate limit,
+    // after which every subsequent request of this kind fails. ERROR_AND_DIE_FMT
+    // (unconditional, matching the macOS branch just above) turns that into an immediate,
+    // attributable failure instead.
+    if (Ptr == nullptr) {
+      ERROR_AND_DIE_FMT("Couldn't allocate code buffer");
+    }
 
     // Protect the last page of the allocated buffer to trigger SIGSEGV on write access.
     uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);

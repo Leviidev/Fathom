@@ -646,6 +646,20 @@ if (BUILD_FEXCORE_ONLY)
       install(TARGETS fexcore-smoke RUNTIME DESTINATION bin)
     endif()
   endif()
+  if (FEXCORE_ASM_TESTS_SOURCE AND FEXCORE_ASM_TESTS_JSON_INCLUDE_DIR)
+    if (NOT IS_ABSOLUTE "${FEXCORE_ASM_TESTS_SOURCE}")
+      message(FATAL_ERROR "FEXCORE_ASM_TESTS_SOURCE must be an absolute path")
+    endif()
+    add_executable(fexcore-asm-tests "${FEXCORE_ASM_TESTS_SOURCE}")
+    target_compile_features(fexcore-asm-tests PRIVATE cxx_std_20)
+    target_include_directories(fexcore-asm-tests PRIVATE
+      "${CMAKE_BINARY_DIR}/generated"
+      "${CMAKE_SOURCE_DIR}/Source/Tools/CommonTools"
+      "${FEXCORE_ASM_TESTS_JSON_INCLUDE_DIR}")
+    target_link_libraries(fexcore-asm-tests PRIVATE
+      FEXCore Common CommonTools JemallocLibs ${PTHREAD_LIB})
+    install(TARGETS fexcore-asm-tests RUNTIME DESTINATION bin)
+  endif()
   return()
 endif()
 

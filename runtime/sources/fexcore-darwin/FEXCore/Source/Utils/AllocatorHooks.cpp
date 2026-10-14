@@ -16,6 +16,7 @@
 #endif
 #endif
 
+#include <cstddef>
 #include <cstdint>
 #ifdef __APPLE__
 #include <malloc/malloc.h>
@@ -200,12 +201,23 @@ void* malloc(size_t size) {
 void* calloc(size_t n, size_t size) {
   return ::calloc(n, size);
 }
-void* memalign(size_t align, size_t s) {
 #ifdef __APPLE__
-  // Darwin's libc doesn't declare memalign() at all (glibc-only extension) -- posix_memalign
-  // covers the same alignment-guarantee, just via an out-parameter instead of a return value.
+// Darwin's aligned_alloc() and posix_memalign() refuse alignments below sizeof(void*), which
+// fextl's allocator asks for with byte-sized types (a fextl::string's buffer, alignment 1);
+// malloc() already returns blocks aligned for any fundamental type, so it serves those.
+static void* DarwinAlignedAlloc(size_t align, size_t s) {
+  if (align <= alignof(std::max_align_t)) {
+    return ::malloc(s);
+  }
   void* ptr {};
   return ::posix_memalign(&ptr, align, s) == 0 ? ptr : nullptr;
+}
+#endif
+
+void* memalign(size_t align, size_t s) {
+#ifdef __APPLE__
+  // Darwin's libc doesn't declare memalign() at all (glibc-only extension).
+  return DarwinAlignedAlloc(align, s);
 #else
   return ::memalign(align, s);
 #endif
@@ -221,6 +233,11 @@ void* valloc(size_t size) {
 #endif
 }
 int posix_memalign(void** r, size_t a, size_t s) {
+#ifdef __APPLE__
+  if (a < sizeof(void*)) {
+    a = sizeof(void*);
+  }
+#endif
   return ::posix_memalign(r, a, s);
 }
 void* realloc(void* ptr, size_t size) {
@@ -239,7 +256,11 @@ size_t malloc_usable_size(void* ptr) {
 #endif
 }
 void* aligned_alloc(size_t a, size_t s) {
+#ifdef __APPLE__
+  return DarwinAlignedAlloc(a, s);
+#else
   return ::aligned_alloc(a, s);
+#endif
 }
 void aligned_free(void* ptr) {
   return ::free(ptr);

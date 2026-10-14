@@ -171,6 +171,22 @@ bool iOSJITFreeIfOwned(void* WriteAddr, size_t Size);
 void* GetExecutableAddress(void* WriteAddr);
 void* GetWritableAddress(void* ExecAddr);
 
+// A host that owns one JIT region (Husk) hands it to FEXCore through these hooks before the
+// first context is created. From then on iOSJITAlloc/iOSJITFreeIfOwned go to the host and never
+// trap to a debugger, and the translations above become one addition plus a range check over the
+// region (no table, no lock: safe inside a signal handler). Alloc returns the writable address
+// and stores the executable one; for every allocation exec = write + Delta, and the region spans
+// [RWBase, RWBase + Size) on the writable side.
+struct JITHostHooks {
+  void* (*Alloc)(size_t Size, void** ExecOut);
+  int (*Free)(void* WriteAddr, size_t Size);
+  intptr_t Delta;
+  uintptr_t RWBase;
+  size_t Size;
+};
+FEX_DEFAULT_VISIBILITY void SetJITHostHooks(const JITHostHooks& Hooks);
+bool JITHostPresent();
+
 enum class iOSJITAddressKind {
   NotTracked, // Not inside any currently-live JIT allocation.
   LiveAllocation,

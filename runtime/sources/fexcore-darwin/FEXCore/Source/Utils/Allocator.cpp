@@ -457,13 +457,40 @@ void* TranslateAddressLocked(const std::map<uintptr_t, MappedRegion>& Table, voi
 }
 } // namespace
 
+static JITHostHooks g_JITHost {};
+static std::atomic<bool> g_HasJITHost {false};
+
+static bool HasJITHost() {
+  return g_HasJITHost.load(std::memory_order_acquire);
+}
+
+bool JITHostPresent() {
+  return HasJITHost();
+}
+
+void SetJITHostHooks(const JITHostHooks& Hooks) {
+  g_JITHost = Hooks;
+  g_HasJITHost.store(Hooks.Alloc != nullptr && Hooks.Free != nullptr && Hooks.Size != 0, std::memory_order_release);
+  LogMan::Msg::IFmt("JIT host: region rw {:#x} size {} MiB delta {:#x}", Hooks.RWBase, Hooks.Size >> 20,
+                    static_cast<uint64_t>(Hooks.Delta));
+}
+
 void* GetExecutableAddress(void* WriteAddr) {
+  if (HasJITHost()) {
+    const auto A = reinterpret_cast<uintptr_t>(WriteAddr);
+    return A - g_JITHost.RWBase < g_JITHost.Size ? reinterpret_cast<void*>(A + g_JITHost.Delta) : WriteAddr;
+  }
   auto& Table = GetJITMappingTable();
   std::lock_guard<std::mutex> Lock(Table.Mutex);
   return TranslateAddressLocked(Table.WriteToExec, WriteAddr);
 }
 
 void* GetWritableAddress(void* ExecAddr) {
+  if (HasJITHost()) {
+    const auto A = reinterpret_cast<uintptr_t>(ExecAddr);
+    const auto RXBase = g_JITHost.RWBase + g_JITHost.Delta;
+    return A - RXBase < g_JITHost.Size ? reinterpret_cast<void*>(A - g_JITHost.Delta) : ExecAddr;
+  }
   auto& Table = GetJITMappingTable();
   std::lock_guard<std::mutex> Lock(Table.Mutex);
   return TranslateAddressLocked(Table.ExecToWrite, ExecAddr);
@@ -480,6 +507,16 @@ std::atomic<uint64_t> AllocationCounter{0};
 
 void* iOSJITAlloc(size_t Size) {
   const uint64_t RequestNumber = AllocationCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (HasJITHost()) {
+    void* Exec = nullptr;
+    void* Write = g_JITHost.Alloc(Size, &Exec);
+    if (Write == nullptr) {
+      LogMan::Msg::EFmt("iOSJITAlloc #{}: the host refused {} KiB of JIT memory", RequestNumber, Size >> 10);
+      return nullptr;
+    }
+    LogMan::Msg::IFmt("iOSJITAlloc #{}: host gave {} KiB (rw {}, rx {})", RequestNumber, Size >> 10, Write, Exec);
+    return Write;
+  }
   const auto& Symbols = GetBreakpointJITSymbols();
   if (Symbols.get_jit_mapping == nullptr) {
     LogMan::Msg::EFmt("iOSJITAlloc #{}: BreakpointJIT symbols unavailable", RequestNumber);
@@ -536,6 +573,12 @@ void* iOSJITAlloc(size_t Size) {
 }
 
 bool iOSJITFreeIfOwned(void* WriteAddr, size_t Size) {
+  if (HasJITHost()) {
+    if (reinterpret_cast<uintptr_t>(WriteAddr) - g_JITHost.RWBase >= g_JITHost.Size) {
+      return false;
+    }
+    return g_JITHost.Free(WriteAddr, Size) != 0;
+  }
   auto& Table = GetJITMappingTable();
   std::lock_guard<std::mutex> Lock(Table.Mutex);
   const auto It = Table.WriteToExec.find(reinterpret_cast<uintptr_t>(WriteAddr));
@@ -555,6 +598,19 @@ bool iOSJITFreeIfOwned(void* WriteAddr, size_t Size) {
 // either) so a SIGSEGV/SIGBUS handler can log what it actually was, rather than just its raw
 // bytes.
 iOSJITAddressKind iOSJITDescribeAddress(void* Addr, uintptr_t* OutRegionBase, size_t* OutOffset, size_t* OutSize) {
+  if (HasJITHost()) {
+    // The host's whole region: which pages are live is the host's to know.
+    const auto A = reinterpret_cast<uintptr_t>(Addr);
+    for (const uintptr_t Base : {g_JITHost.RWBase, g_JITHost.RWBase + g_JITHost.Delta}) {
+      if (A - Base < g_JITHost.Size) {
+        if (OutRegionBase) *OutRegionBase = Base;
+        if (OutOffset) *OutOffset = A - Base;
+        if (OutSize) *OutSize = g_JITHost.Size;
+        return iOSJITAddressKind::LiveAllocation;
+      }
+    }
+    return iOSJITAddressKind::NotTracked;
+  }
   auto& Table = GetJITMappingTable();
   std::lock_guard<std::mutex> Lock(Table.Mutex);
   const auto A = reinterpret_cast<uintptr_t>(Addr);

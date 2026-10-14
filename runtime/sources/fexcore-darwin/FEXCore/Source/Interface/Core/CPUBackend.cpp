@@ -20,6 +20,12 @@
 namespace FEXCore {
 namespace CPU {
 
+#if defined(FEX_APPLE_DUAL_MAPPED_JIT)
+  // With a host-owned JIT region (Husk's arena, AllocatorHooks.h SetJITHostHooks) nothing traps
+  // to StikDebug, so the cap below does not apply: one 64 MiB buffer, refilled in place when full
+  // (JIT.cpp), keeps refills rare. ARM64 branches reach +-128 MiB, so it is still in range.
+  static constexpr size_t HOSTED_CODE_SIZE = 1024 * 1024 * 64;
+#endif
   static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
 #if defined(FEX_APPLE_DUAL_MAPPED_JIT)
   // Every JIT allocation on iOS has to be individually granted execute permission by
@@ -508,7 +514,11 @@ namespace CPU {
         // code loaded from caches
         AllocateNew(MAX_CODE_SIZE);
       } else {
+#if defined(FEX_APPLE_DUAL_MAPPED_JIT)
+        AllocateNew(FEXCore::Allocator::JITHostPresent() ? HOSTED_CODE_SIZE : INITIAL_CODE_SIZE);
+#else
         AllocateNew(INITIAL_CODE_SIZE);
+#endif
       }
     }
     return Latest;
@@ -521,7 +531,12 @@ namespace CPU {
     }
 
     auto NewCodeBufferSize = GetLatest()->AllocatedSize;
+#if defined(FEX_APPLE_DUAL_MAPPED_JIT)
+    NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2,
+                                         FEXCore::Allocator::JITHostPresent() ? HOSTED_CODE_SIZE : MAX_CODE_SIZE);
+#else
     NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2, MAX_CODE_SIZE);
+#endif
     return AllocateNew(NewCodeBufferSize);
   }
 

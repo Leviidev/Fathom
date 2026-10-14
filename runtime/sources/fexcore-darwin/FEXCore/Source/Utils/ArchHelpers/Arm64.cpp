@@ -2117,6 +2117,16 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
     }
   }
 
+  // A byte-sized acquire load or release store is always naturally aligned, so a SIGBUS on one is
+  // not an alignment fault: on Darwin it is a protection fault (PROT_NONE and read-only pages
+  // report SIGBUS there). The JIT also reserves no barrier slot around them (MemoryOps.cpp emits
+  // ldaprb/ldarb/ldapurb/stlrb/stlurb without the nop), so backpatching one would write a barrier
+  // over the live instruction next to it. Leave it to the ordinary fault path.
+  if (Size == 0 && ((Instr & LDAXR_MASK) == LDAR_INST || (Instr & LDAXR_MASK) == LDAPR_INST || (Instr & LDAXR_MASK) == STLR_INST ||
+                    (Instr & RCPC2_MASK) == LDAPUR_INST || (Instr & RCPC2_MASK) == STLUR_INST)) {
+    return std::nullopt;
+  }
+
   // Lock code mutex during any SIGBUS handling that potentially changes code.
   // Due to code buffer sharing between threads, code must be carefully backpatched from last to first.
   // Multiple threads can be attempting to handle the SIGBUS or even be executing the code being backpatched.

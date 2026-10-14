@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 #include "Interface/Context/Context.h"
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/SHMStats.h>
 #include <FEXCore/Utils/WritePriorityMutex.h>
@@ -497,7 +498,13 @@ private:
   constexpr static size_t MIN_L1_ENTRIES = 8 * 1024;        // Must be a power of 2
   constexpr static size_t MAX_L1_ENTRIES = 1 * 1024 * 1024; // Must be a power of 2
 
+#ifdef FEX_APPLE_DUAL_MAPPED_JIT
+  // Each thread reserves this for its L2 block pages, out of iOS's one 64GB window for large
+  // mappings. A thread that fills it clears its L2 and refills it (CacheBlockMapping).
+  constexpr static size_t CODE_SIZE = 32 * 1024 * 1024;
+#else
   constexpr static size_t CODE_SIZE = 128 * 1024 * 1024;
+#endif
   constexpr static size_t SIZE_PER_PAGE = FEXCore::Utils::FEX_PAGE_SIZE * sizeof(LookupCacheEntry);
   constexpr static size_t MAX_L1_SIZE = MAX_L1_ENTRIES * sizeof(LookupCacheEntry);
 

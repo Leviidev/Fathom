@@ -1343,6 +1343,13 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       Align16B();
       if ((GetCursorOffset() + TempSize) > CurrentCodeBuffer->UsableSize()) {
 #if defined(FEX_APPLE_DUAL_MAPPED_JIT)
+        // A host-owned region (Husk's arena) can hand out a fresh buffer every time, so take
+        // FEX's normal path: threads move to the new buffer at their next dispatch and the old
+        // one is freed once none is left in it. Refilling in place cannot be made safe here: a
+        // thread paused mid-block, or returning from an HLE call, resumes into overwritten code.
+        if (FEXCore::Allocator::JITHostPresent()) {
+          CTX->ClearCodeCache(ThreadState);
+        } else {
         // NewCodeBuffer=true (the default) requests a brand new dual-mapped allocation from
         // StikDebug's external BreakpointJIT mechanism every time the cache fills, which fails
         // on a session's 3rd+ such request (confirmed on-device, independent of the requested
@@ -1423,6 +1430,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
         // cursor to the buffer's start, matching what the NewCodeBuffer=true path already does
         // via its own SetBuffer call inside Arm64JITCore::ClearCache() after allocating fresh.
         SetBuffer(CurrentCodeBuffer->Ptr, CurrentCodeBuffer->AllocatedSize);
+        }
 #else
         CTX->ClearCodeCache(ThreadState);
 #endif
